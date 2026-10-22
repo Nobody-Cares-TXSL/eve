@@ -1,21 +1,40 @@
 # 源码审计报告 — SOURCE_AUDIT
 
-> 版本：v1.1
-> 状态：阶段 0 交付物
+> 版本：v1.2
+> 状态：阶段 0 交付物（待确认）
 > 审计对象：`douyin-bot/`（popohuan）、`douyin-robot/`（crazyants）
 > 审计日期：2026-10-22
-> 审计方法：逐文件阅读 + 实际运行验证（结论标注了证据来源）
+> 审计方法：逐文件阅读 + 实际运行验证
+
+## 证据类型说明
+
+本报告的结论分两类，**必须区分**：
+
+| 标记 | 含义 | 可信度 |
+|---|---|---|
+| **[运行]** | 实际执行命令验证过，附命令与输出 | 高——证明代码确实这样运行 |
+| **[静态]** | 仅阅读代码，未运行 | 中——只能证明代码这样写，未证明运行时后果 |
+
+> **为什么要区分**：初版把两类混在一起，让整份审计的可信度被高估。
+> 复现方法见 `AC.md` AC-0.2 的证据表。
+
+**统计**：P0/P1 共 7 条 —— [运行] 4 条（2.1、2.2、2.3、3.2），[静态] 3 条（2.4、2.5、3.1）。
 
 ---
 
 ## 0. 结论速览
 
-| 项目 | 许可证 | 能否复制代码 | 建议定位 |
+| 项目 | 许可证 | 能否复制代码 | 本项目是否复制 |
 |---|---|---|---|
-| `douyin-bot` | **MIT**（`douyin-bot/LICENSE`） | ✅ 可以，需保留版权声明 | 借鉴数据层与产品化经验 |
-| `douyin-robot` | **无 LICENSE 文件** | ❌ **不可以**，默认保留所有权利 | **只借鉴设计，独立实现** |
+| `douyin-bot` | **MIT**（`douyin-bot/LICENSE`） | ✅ 法律上可以，需保留声明 | ❌ **不复制**（见 D-010） |
+| `douyin-robot` | **无 LICENSE 文件** | ❌ 不可以，默认保留所有权利 | ❌ 不复制 |
 
-**技术主干选 `douyin-robot` 是指选它的架构分层，不是选它的代码。** 它的代码一行都不能复制进新项目。这一点直接影响阶段 5 的开发方式。
+**本项目对两个仓库都采用独立实现，只借鉴设计（D-010）。**
+
+`douyin-bot` 虽然 MIT 允许复制，但它的实现带有已识别缺陷（见 §3），
+复制会把缺陷一起带进来。统一为「都不复制」也更容易执行和检查。
+
+**技术主干选 `douyin-robot` 是指选它的架构分层，不是选它的代码。**
 
 ---
 
@@ -50,7 +69,7 @@ Copyright (c) 2026 popohuan
 
 ## 2. douyin-robot 审计
 
-### 2.1 🔴 P0 — 项目当前无法启动
+### 2.1 🔴 P0 [运行] — 项目当前无法启动
 
 **现象**（实测）：
 
@@ -71,7 +90,7 @@ AttributeError: module 'selectors' has no attribute 'SelectSelector'
 - 禁止任何模块名与标准库同名（`selectors`、`types`、`queue`、`logging`、`json`、`email`、`code`、`parser`、`platform`、`token`、`copy`、`signal`、`socket`、`random`、`statistics`、`secrets`、`typing`、`enum`、`abc`、`io`、`os`、`re`、`time`、`uuid`、`hashlib`、`datetime`、`pathlib`、`tempfile`、`shutil`、`subprocess`、`threading`、`asyncio`、`sqlite3`）；
 - 提交前加一条自动检查（阶段 1 的 `cli doctor`）。
 
-### 2.2 🔴 P0 — 轮询间隔配置完全失效
+### 2.2 🔴 P0 [运行] — 轮询间隔配置完全失效
 
 **证据**：`src/runner.py:377` 调用 `_random_range(cfg["poll"])`，而 `_random_range` 读的是 `min`/`max` 键，配置里是 `cycle_min_seconds`/`cycle_max_seconds`。
 
@@ -85,7 +104,7 @@ _random_range({'cycle_min_seconds': 15, 'cycle_max_seconds': 35})  # → 1.31 �
 
 **新项目要求**：配置读取必须有类型化 schema 校验，禁止用 `.get(key, 默认值)` 静默兜底——缺失键必须在启动时**报错**，而不是悄悄用一个无关的默认值。
 
-### 2.3 🟠 P1 — 每日限额从未生效
+### 2.3 🟠 P1 [运行] — 每日限额从未生效
 
 **证据**：`rg 'replied_at_day'` 全仓库只有 `reply_engine.py:85` 一处**读取**，`runner.py` 只写 `replied_at`，从不写 `replied_at_day`。
 
@@ -93,7 +112,7 @@ _random_range({'cycle_min_seconds': 15, 'cycle_max_seconds': 35})  # → 1.31 �
 
 **新项目要求**：任何「限额」必须有对应测试，证明它真的会拦截。
 
-### 2.4 🟠 P1 — 消息身份依赖纯文本哈希
+### 2.4 🟠 P1 [静态] — 消息身份依赖纯文本哈希
 
 **证据**：`reply_engine.py:144` `fp = msg_fingerprint(newest_text)`，`state_store.py:19` 对文本做 SHA256。
 
@@ -103,7 +122,7 @@ _random_range({'cycle_min_seconds': 15, 'cycle_max_seconds': 35})  # → 1.31 �
 
 **影响**：阶段 2 的 Contract 不能假设「有稳定消息 ID」，这是**待验证的前置假设**。
 
-### 2.5 🟠 P1 — 示例配置无法通过校验
+### 2.5 🟠 P1 [静态] — 示例配置无法通过校验
 
 **证据**：`config/config.example.json` 的 `whitelist.friends[0]` 的 `name`/`douyin_id` 为空，`ai.api_key` 为空，`ai.base_url` 为空。
 
@@ -147,7 +166,7 @@ _random_range({'cycle_min_seconds': 15, 'cycle_max_seconds': 35})  # → 1.31 �
 
 ## 3. douyin-bot 审计
 
-### 3.1 🟠 P1 — 身份核验比 douyin-robot 弱
+### 3.1 🟠 P1 [静态] — 身份核验比 douyin-robot 弱
 
 **证据**：`bot_manager.py:344`
 
@@ -159,7 +178,7 @@ return !!header && header.innerText.includes('{nickname}');
 
 **新项目**：必须按抖音号核验，昵称只用于定位。
 
-### 3.2 🟠 P1 — SQLite 连接泄漏
+### 3.2 🟠 P1 [运行] — SQLite 连接泄漏
 
 **证据**：`database.py` 全文使用 `with get_connection() as conn:`。
 
@@ -266,14 +285,17 @@ conn.execute('select 1')   # 成功 → 连接未被关闭
 
 | 审计发现 | 影响的阶段 | 必须采取的行动 |
 |---|---|---|
-| douyin-robot 无许可证 | 全部 | 独立实现，不复制代码 |
+| douyin-robot 无许可证 | 全部 | 独立实现，不复制代码（D-010） |
 | `selectors` 命名冲突 | 阶段 1 | 模块命名规范 + `doctor` 自检 |
 | 配置静默兜底 | 阶段 1 | 强类型 schema，缺键即报错 |
-| 日限额未生效 | 阶段 2 | 计数表 + 拦截测试 |
-| 消息无稳定 ID | **阶段 2/3** | **阶段 3 前置验证；阶段 2 的 Contract 需按「可能无 ID」设计** |
+| **日限额未生效** | **阶段 2（数据层）+ 阶段 4（行为层）** | 阶段 2 建计数表并验证读写（AC-2.11a）；**拦截行为移至阶段 4** |
+| 消息无稳定 ID | **阶段 2/3** | 阶段 2 的 Contract 原生支持 `id_mode` / `no_id_mode`（D-003）；阶段 3 只验证能否拿到 ID，不阻塞阶段 2 |
 | 昵称匹配可串话 | 阶段 3 | 抖音号核验，不匹配即拒绝 |
 | SQLite 连接泄漏 | 阶段 2 | 显式关闭 + 连接使用约定 |
 | 无测试 | 阶段 2 起 | 每个 Slice 必须带测试 |
+
+> **修正**：初版把「日限额未生效」整体归到阶段 2，但阶段 2 不实现发送，
+> 无法验收「拒绝发送」。已拆分为数据层（阶段 2）与行为层（阶段 4）。
 
 ---
 

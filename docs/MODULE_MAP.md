@@ -1,9 +1,28 @@
 # 基础模块地图 — MODULE_MAP
 
-> 版本：v1.0
+> 版本：v1.1
 > 状态：阶段 1 交付物（待确认）
 > 范围：**仅阶段 1**。只划分 CLI、配置、运行状态、日志、进程控制。
 > 归档、身份核验、AI、发送**本阶段不创建文件**，只在架构图中占位。
+
+## 审查记录
+
+| 日期 | 版本 | 范围 | 结论 |
+|---|---|---|---|
+| 2026-10-23 | v1.0 | 全文 | 发现 6 处问题（3 处阻断），**不确认** |
+| 2026-10-23 | v1.1 | 全文 | 已修复全部 6 处 |
+| 2026-10-23 | v1.1 | 复审 | 修复过程中发现 CLI_SPEC §4.2 的 `run` 流程缺少挂起步骤，已同步；**复审通过** |
+
+### v1.0 审查问题与处置
+
+| 编号 | 问题 | 处置 |
+|---|---|---|
+| P1 | 文件数量写 17，实际 18 | 已修复：改为 18，见 §2 |
+| P2 | `run_loop` 接口无法表达「挂起等待」 | 已修复：改为返回 `LoopAction` 三态（`CONTINUE` / `SUSPEND` / `EXIT`），见 §4.2 |
+| P3 | `Settings` 字段与 CLI_SPEC §7.1 不对齐 | 已修复：字段补全并交叉引用，见 §4.3 |
+| P4 | 状态机纯函数无法区分 `stop` 在 running / paused_manual 下的语义 | 已修复：新增 `STOP_IMMEDIATE` 事件，见 §4.1 |
+| P5 | `lock.py` 无「只读探测」能力，D7 无法实现 | 已修复：`lock.py` 增加 `probe()`，见 §3 |
+| P6 | §8 依赖一段自相矛盾（FAIL/WARN 改到一半） | 已修复：删除残留，见 §8 |
 
 ---
 
@@ -76,7 +95,18 @@ src/dac/
     └── log_setup.py        # 日志配置（含脱敏）
 ```
 
-**共 17 个文件**（含 `__init__.py`）。这是阶段 1 的全部。
+**共 18 个文件**（含 4 个 `__init__.py`）。
+
+> 计数（以树为准）：
+> - `src/dac/`：`__init__.py` + `cli.py` = **2**
+> - `commands/`：`__init__.py` + doctor/status/run/control/logs = **6**
+> - `core/`：`__init__.py` + state_machine/loop = **3**
+> - `infra/`：`__init__.py` + settings/paths/state_file/control_file/lock/log_setup = **7**
+>
+> 合计 2 + 6 + 3 + 7 = **18**。
+>
+> 初版把 `commands/` 误记为「4 个模块 + 1 个 `__init__.py`」（实为 5 + 1），
+> 导致算式得 17 而结论写 18。已按树更正。
 
 ---
 
@@ -96,7 +126,7 @@ src/dac/
 | `infra/paths.py` | 路径解析、目录创建 | 业务 | 单测 |
 | `infra/state_file.py` | 原子读写状态、**PID 存活校验**（唯一实现，供 status/run/control 共用） | 状态合法性 | 单测 |
 | `infra/control_file.py` | 原子读写控制意图、`request_id` 幂等消费 | 意图合法性 | 单测 |
-| `infra/lock.py` | 单实例锁（文件锁） | — | 单测（双进程） |
+| `infra/lock.py` | 单实例锁（文件锁）、**只读探测 `probe()`**（供 doctor D7 使用，不获取锁、不阻塞） | 判断能否运行 | 单测（双进程） |
 | `infra/log_setup.py` | 日志 handler、脱敏 filter | — | 单测（脱敏规则） |
 
 ---
@@ -117,6 +147,7 @@ class RunState(str, Enum):
     PAUSED_MANUAL = "paused_manual"
     PAUSED_AUTH = "paused_auth"
     PAUSED_RISK = "paused_risk"
+    PAUSED_ENV = "paused_env"
     PAUSED_UNKNOWN = "paused_unknown"
     ERROR = "error"
 
@@ -124,7 +155,8 @@ class Event(str, Enum):
     START = "start"
     PAUSE = "pause"
     RESUME = "resume"
-    STOP = "stop"
+    STOP = "stop"                    # 运行中收到停止：当前轮结束后退出
+    STOP_IMMEDIATE = "stop_now"      # 挂起中收到停止：立即退出，无「当前轮」
     CYCLE_END = "cycle_end"
     AUTH_LOST = "auth_lost"
     FATAL = "fatal"
@@ -135,20 +167,77 @@ def transition(state: RunState, event: Event) -> RunState:
 
 **非法转换必须是错误，不是静默忽略。** 例：`stopped + RESUME` → `InvalidTransition`。
 
+#### 为什么需要 `STOP_IMMEDIATE`
+
+初版只有一个 `STOP` 事件，但 `stop` 在两种状态下的语义不同：
+
+| 当前状态 | 收到 stop | 行为 |
+|---|---|---|
+| `running` | 当前轮**结束后**退出 | 需要等一轮 |
+| `paused_manual` | **立即**退出 | 没有「当前轮」可等 |
+
+纯函数 `transition(state, event)` 只知道状态，不知道进程是否正在执行一轮。
+若用同一个 `STOP`，实现方只能自行判断——那就把语义漏到了调用方。
+
+**拆成两个事件后**，调用方按「当前是否在轮次中」选择事件，状态机保持纯粹：
+
+```
+running        + STOP           → stopped
+paused_manual  + STOP_IMMEDIATE → stopped
+```
+
+> `STOP_IMMEDIATE` 在 `running` 下是**非法转换**（有当前轮却要求立即退出，
+> 会破坏「只在轮次边界改变状态」的约束）。
+
 ### 4.2 循环（可注入）
 
 ```python
 # core/loop.py
 
-Tick = Callable[[], None]          # 一轮要做什么（阶段 1 只记心跳）
-ShouldContinue = Callable[[], bool]
+class LoopAction(str, Enum):
+    CONTINUE = "continue"    # 继续下一轮
+    SUSPEND = "suspend"      # 挂起：不退出、不做业务，轮询控制文件
+    EXIT = "exit"            # 退出循环
 
-def run_loop(tick: Tick, should_continue: ShouldContinue, interval: float) -> None:
-    """每轮：tick() → 检查控制信号 → 休眠。只在轮次边界检查信号。"""
+Tick = Callable[[], LoopAction]    # 一轮做什么，并决定本轮结束后如何走
+OnSuspend = Callable[[], LoopAction]  # 挂起期间每次轮询后的判断
+Sleep = Callable[[float], None]    # 可注入，便于测试
+
+def run_loop(
+    tick: Tick,
+    on_suspend: OnSuspend,
+    interval: float,
+    pause_poll_seconds: float,
+    sleep: Sleep = time.sleep,
+) -> None:
+    """循环骨架：
+       CONTINUE → 休眠 interval 后进入下一轮
+       SUSPEND  → 转入挂起，每 pause_poll_seconds 调用 on_suspend()
+                  on_suspend 返回 CONTINUE 则回到正常轮次，返回 EXIT 则退出
+       EXIT     → 立即返回
+       只在轮次边界改变状态。"""
 ```
 
-> 阶段 1 的 `tick` 只写心跳日志；阶段 3 起换成「读→归档」；阶段 4 再加「生成→发送」。
-> **循环本身不感知业务**，这是后续所有阶段能复用的前提。
+#### 为什么必须有三态
+
+初版只有「继续 / 退出」两种出路，无法表达 `paused_manual` 的要求：
+
+> 进程进入 `paused_manual` 后，**不退出、不做业务**，只做一件事：轮询控制文件（CLI_SPEC §4.4）
+
+用 `should_continue` 返回 `False` 会让进程**退出**——但 `paused_manual` 要求进程存活。
+在 `tick` 里自己死循环会违反「循环不感知业务」。
+
+`SUSPEND` 是第三种出路：**循环交出控制权但保留进程**。
+
+| 出路 | 进程 | 谁决定下一步 |
+|---|---|---|
+| `CONTINUE` | 存活，跑下一轮 | 循环自己 |
+| `SUSPEND` | 存活，空转 | `on_suspend` 每次轮询返回 |
+| `EXIT` | 退出 | — |
+
+> 阶段 1 的 `tick` 只写心跳日志并返回 `CONTINUE`；`on_suspend` 读控制文件。
+> 阶段 3 起 `tick` 换成「读→归档」；阶段 4 再加「生成→发送」。
+> **循环本身不感知业务**，这是后续所有阶段能复用同一套暂停逻辑的前提。
 
 ### 4.3 配置（强校验）
 
@@ -157,10 +246,13 @@ def run_loop(tick: Tick, should_continue: ShouldContinue, interval: float) -> No
 
 @dataclass(frozen=True)
 class Settings:
-    target_douyin_id: str          # 可为空 → WARN
-    cycle_seconds: int             # 必填，缺失即报错
-    log_level: str
-    ...
+    # ── 阶段 1 全部字段，与 CLI_SPEC §7.1 一一对应，不得省略 ──
+    cycle_seconds: int             # 必填，缺失即报错（无默认值）
+    pause_poll_seconds: int = 2    # 挂起时轮询控制文件的间隔
+    status_watch_seconds: int = 3  # status --watch 的刷新间隔
+    log_level: str = "INFO"
+    target_douyin_id: str = ""     # 为空 → D8 WARN，run 退出码 3
+    login_credentials_file: str = ""  # 为空 → D9 WARN
 
 class ConfigError(Exception):
     """携带字段路径与原始原因，供 CLI 精确输出。"""
@@ -177,6 +269,35 @@ def inspect_settings(path: Path) -> list[CheckResult]:
 def check_runtime_ready(s: Settings) -> list[str]:
     """返回运行条件缺失项（如 target_douyin_id 为空）。空列表 = 可运行。"""
 ```
+
+> **字段清单以 `CLI_SPEC §7.1` 为准**，本节只做类型映射。
+> 新增配置字段时必须同时更新两处。
+
+#### 外部字段路径 → 内部字段名的映射
+
+配置文件的字段路径是**带点的层级路径**，内部 `Settings` 用**下划线平铺名**。
+两者**不是同一组字符串**，不能直接比较。
+
+| 配置文件路径（§7.1） | `Settings` 字段 |
+|---|---|
+| `cycle_seconds` | `cycle_seconds` |
+| `pause_poll_seconds` | `pause_poll_seconds` |
+| `status_watch_seconds` | `status_watch_seconds` |
+| `log_level` | `log_level` |
+| `target.douyin_id` | `target_douyin_id` |
+| `login.credentials_file` | `login_credentials_file` |
+
+**映射规则**：点号 `.` → 下划线 `_`。
+
+> **测试定义修正**：初版说「测试断言 `Settings` 字段集合与 §7.1 表格一致」——
+> 这个断言不成立，因为 `target.douyin_id` ≠ `target_douyin_id`。
+>
+> 正确的测试应断言：
+> 1. `Settings` 的字段集合 == **映射表右列**的集合；
+> 2. 映射表左列 == §7.1 表格的字段路径集合；
+> 3. 每条路径按规则映射后，都能在 `Settings` 中找到。
+>
+> 映射表本身应作为代码中的常量（`FIELD_MAP`），测试直接读它。
 
 **两类校验分开**（D-007）：
 
@@ -266,9 +387,13 @@ tests/
 
 `playwright`、`httpx` 在阶段 1 **不需要安装**。
 但 `doctor` 的 D2 检查需要检测它们是否存在——**检测 ≠ 依赖**。
-若未安装，D2 报 `FAIL` 并说明「阶段 3 才需要，可暂不安装」时，应降级为 `WARN`。
 
-> 修正：D2 在阶段 1 应为 `WARN`，阶段 3 起升为 `FAIL`。已在 CLI_SPEC 中同步。
+| 阶段 | D2 级别 | 未安装时的输出 |
+|---|---|---|
+| 阶段 1 | `WARN` | 「阶段 3 才需要，可暂不安装」 |
+| 阶段 3 起 | `FAIL` | 「缺少运行依赖，请 pip install -r requirements.txt」 |
+
+> 与 `CLI_SPEC §2.2` 一致。
 
 ---
 
@@ -276,7 +401,9 @@ tests/
 
 全部满足才算完成：
 
-- [ ] 17 个文件按职责就位，无空文件
+- [ ] 模块职责已就位，无空文件
+      （**不强制 18 个文件**：结构是建议，允许按 Slice 实际需要合并或拆分，
+       前提是 §1.2 的依赖边界与 §3 的职责划分不变）
 - [ ] `core/state_machine.py` 单测覆盖所有合法与非法转换
 - [ ] `dac doctor` 在干净目录、半配置目录、完整配置目录三种情况下行为正确
 - [ ] `dac run` 能被 `pause` / `resume` / `stop` 可靠控制
