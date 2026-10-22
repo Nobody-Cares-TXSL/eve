@@ -115,7 +115,7 @@ src/dac/
 | 模块 | 职责 | 不负责 | 测试方式 |
 |---|---|---|---|
 | `cli.py` | 解析参数、分发命令、统一异常→退出码 | 任何业务逻辑 | 集成测试 |
-| `commands/doctor.py` | 执行 D1～D9 检查、汇总、格式化输出 | 修复问题；**不得 import `load_settings`** | 注入检查函数，单测 |
+| `commands/doctor.py` | 执行 D1～D11 检查、汇总、格式化输出 | 修复问题；**不得 import `load_settings`** | 注入检查函数，单测 |
 | `commands/status.py` | 读状态文件 → **校验 PID** → 输出状态 + 建议 | 修改状态 | 单测（构造状态文件 + fake pid） |
 | `commands/run.py` | 组装依赖、启动循环、处理退出 | 具体每轮做什么 | 集成测试 |
 | `commands/control.py` | 校验当前状态 → 写控制文件 | 操作进程 | 单测 |
@@ -251,8 +251,10 @@ class Settings:
     pause_poll_seconds: int = 2    # 挂起时轮询控制文件的间隔
     status_watch_seconds: int = 3  # status --watch 的刷新间隔
     log_level: str = "INFO"
-    target_douyin_id: str = ""     # 为空 → D8 WARN，run 退出码 3
+    target_douyin_id: str = ""  # 为空 → D8 WARN，run 退出码 3
     login_credentials_file: str = ""  # 为空 → D9 WARN
+    runtime_mode: str | None = None  # 缺失 → D10 WARN；阶段 1 仅 L3 为 OK
+    risk_acceptance: str | None = None  # 缺失/拒绝 → D11 WARN
 
 class ConfigError(Exception):
     """携带字段路径与原始原因，供 CLI 精确输出。"""
@@ -286,6 +288,8 @@ def check_runtime_ready(s: Settings) -> list[str]:
 | `log_level` | `log_level` |
 | `target.douyin_id` | `target_douyin_id` |
 | `login.credentials_file` | `login_credentials_file` |
+| `runtime.mode` | `runtime_mode` |
+| `risk.acceptance` | `risk_acceptance` |
 
 **映射规则**：点号 `.` → 下划线 `_`。
 

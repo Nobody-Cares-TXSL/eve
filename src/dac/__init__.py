@@ -1,0 +1,1 @@
+"""Douyin AI Companion CLI."""

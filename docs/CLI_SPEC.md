@@ -1,6 +1,6 @@
 # CLI 行为规范 — CLI_SPEC
 
-> 版本：v1.1
+> 版本：v1.2
 > 状态：阶段 1 交付物（已确认）
 > 适用阶段：阶段 1。阶段 3 起新增的命令在对应阶段补充。
 > 对应 AC：AC-1.1 ～ AC-1.7
@@ -13,6 +13,7 @@
 | 2026-10-23 | v1.1 | 全文 | 已修复全部 8 处 |
 | 2026-10-23 | v1.1 | 复审 | 修复过程中新引入 1 处矛盾（`stop` 在状态文件不存在时的退出码），已修复 |
 | 2026-10-23 | v1.1 | 二次复审 | 又发现 1 处（P10：状态文件损坏时，§5.1 写 `2`、§8 写 `1`），已按调用方区分并修复；**复审通过** |
+| 2026-10-23 | v1.2 | Slice 1 前置对齐 | 统一 D1～D11 顺序，补齐 `runtime.mode` / `risk.acceptance` 字段及缺失值语义；与 AC、MODULE_MAP 同步 |
 
 ### v1.0 审查问题与处置
 
@@ -93,14 +94,14 @@ dac <command> [options]
 | D1 | Python 版本 | ≥ 3.11 | `FAIL` |
 | D2 | 依赖可用 | `playwright`、`httpx` 可导入 | `WARN`（阶段 1）→ `FAIL`（阶段 3 起） |
 | D3 | 模块命名 | **`src/` 下**无 `.py` 文件名与 `sys.stdlib_module_names` 冲突 | `FAIL` |
-| D4 | 配置结构 | 配置文件存在且字段合法 | `FAIL` |
+| D4 | 配置结构 | 配置文件存在且字段合法 | `FAIL`（存在未知字段时可 `WARN`） |
 | D5 | 数据目录 | 目录**已存在且可写**，或可创建 | `FAIL` |
 | D6 | 日志目录 | 目录**已存在且可写**，或可创建 | `FAIL` |
-| D7 | 单实例锁 | 无其他实例占用 | `WARN` |
-| D10 | 运行模式 | 不超过当前工程阶段允许的上限 | `FAIL`（不一致时） |
-| D11 | 风险接受 | 已记录为 `accepted` | `WARN`（未记录时） |
-| D8 | 目标账号 | `target.douyin_id` 已填写 | `WARN` |
-| D9 | 登录凭证 | 凭证文件存在 | `WARN` |
+| D7 | 单实例锁 | 无其他实例占用；只读探测，不获取锁 | `WARN`（发现占用或残留锁文件时） |
+| D8 | 目标账号 | `target.douyin_id` 已填写 | `WARN`（未配置） |
+| D9 | 登录凭证 | `login.credentials_file` 指向存在的文件 | `WARN`（未配置或文件不存在） |
+| D10 | 运行模式 | `runtime.mode` 是合法模式，且不超过当前工程阶段上限 | `FAIL`（非法或超过上限）；`WARN`（未声明） |
+| D11 | 风险接受 | `risk.acceptance` 已声明为 `accepted` | `WARN`（未声明或为 `not-accepted`） |
 
 **级别语义**：
 
@@ -172,19 +173,29 @@ dac <command> [options]
 
 人类可读的表格，每行一项：
 
-```
-[OK]   D1 Python 版本         3.12.3 (>= 3.11)
-[OK]   D2 依赖可用            playwright, httpx
-[OK]   D3 模块命名            无冲突
-[FAIL] D4 配置结构            config/config.json 不存在
-                              → 修复：cp config/config.example.json config/config.json
-[OK]   D5 数据目录            /home/user/.local/share/dac
-[OK]   D6 日志目录            /home/user/.local/share/dac/logs
-[WARN] D8 目标账号            未配置 target.douyin_id
-                              → 说明：阶段 3 前无需填写，不影响只读命令
+**场景一：干净目录，配置缺失**（实际运行输出）
 
-结论：存在 1 项 FAIL，无法运行。
 ```
+[OK]   D1  Python 版本      3.12.3 (要求 >= 3.11)
+[WARN] D2  依赖可用         缺少 playwright、httpx（阶段 1 暂不阻塞）
+[OK]   D3  模块命名         无标准库同名模块
+[FAIL] D4  配置结构         配置文件不存在：/path/to/config.json
+                            → 修复：按 docs/CLI_SPEC.md §7.1 创建配置，并填写必需字段 cycle_seconds
+[OK]   D5  数据目录         /path/to/data
+[OK]   D6  日志目录         /path/to/data/logs
+[OK]   D7  单实例锁         未发现运行锁文件
+[WARN] D8  目标账号         配置不可用，未检查目标账号（见 D4）
+[WARN] D9  登录凭证         配置不可用，未检查登录凭证（见 D4）
+[WARN] D10 运行模式         配置不可用，未检查 runtime.mode（见 D4）
+[WARN] D11 风险接受         配置不可用，未检查 risk.acceptance（见 D4）
+
+结论：1 项 FAIL、5 项 WARN、5 项 OK；doctor 退出码 2。
+```
+
+**场景二：配置合法但可选字段未填**
+
+D4 为 `OK`；D8/D9 报「未配置…（阶段 3 前无需填写）」；D10/D11 报「未声明…」。
+四项均为 `WARN`，退出码 `0`。
 
 ### 2.4 退出码
 
@@ -200,12 +211,35 @@ dac <command> [options]
 ```json
 {
   "checks": [
-    {"id": "D1", "level": "ok", "detail": "3.12.3"},
-    {"id": "D4", "level": "fail", "detail": "config/config.json 不存在", "fix": "cp ..."}
+    {"id": "D1", "level": "ok", "detail": "3.12.3 (要求 >= 3.11)"},
+    {"id": "D2", "level": "warn", "detail": "缺少 playwright、httpx（阶段 1 暂不阻塞）", "fix": "阶段 3 起安装 requirements.txt"},
+    {"id": "D3", "level": "ok", "detail": "无标准库同名模块"},
+    {"id": "D4", "level": "fail", "detail": "配置文件不存在：/path/to/config.json", "fix": "按 docs/CLI_SPEC.md §7.1 创建配置，并填写必需字段 cycle_seconds"},
+    {"id": "D5", "level": "ok", "detail": "/path/to/data"},
+    {"id": "D6", "level": "ok", "detail": "/path/to/data/logs"},
+    {"id": "D7", "level": "ok", "detail": "未发现运行锁文件"},
+    {"id": "D8", "level": "warn", "detail": "配置不可用，未检查目标账号（见 D4）"},
+    {"id": "D9", "level": "warn", "detail": "配置不可用，未检查登录凭证（见 D4）"},
+    {"id": "D10", "level": "warn", "detail": "配置不可用，未检查 runtime.mode（见 D4）"},
+    {"id": "D11", "level": "warn", "detail": "配置不可用，未检查 risk.acceptance（见 D4）"}
   ],
-  "summary": {"fail": 1, "warn": 0, "ok": 8}
+  "summary": {"fail": 1, "warn": 5, "ok": 5}
 }
 ```
+
+**JSON 契约（测试依赖）**：
+
+| 项 | 保证 |
+|---|---|
+| `checks` 顺序 | 严格 `D1` → `D11`，共 11 项，不增不减 |
+| `checks[].id` | `D1`…`D11` |
+| `checks[].level` | `ok` / `warn` / `fail` |
+| `checks[].detail` | 非空字符串 |
+| `checks[].fix` | 仅在有修复建议时出现，可为空 |
+| `summary` | 三个键 `fail` / `warn` / `ok`，各自计数**必须**与 `checks` 逐条统计一致 |
+
+> 配置缺失或损坏时，D8～D11 **仍然输出**，内容为「配置不可用，未检查…（见 D4）」，
+> 级别为 `warn`——不得因 D4 失败而让这四项消失或抛异常。
 
 > AC-1.1、AC-1.2、AC-1.3 的自动化测试**只依赖 `--json`**，不解析人类可读输出。
 
@@ -243,25 +277,29 @@ D5/D6 的检查目的是「`run` 时能不能用」。若只检查父目录权�
 
 ### 2.7 `doctor` 与运行模式
 
-`doctor` 报告当前**运行模式**与**风险接受**：
+`doctor` 报告配置中声明的**运行模式**与**风险接受**。这两项是独立诊断，即使配置文件缺失或损坏，也必须输出 D10、D11；此时它们分别报告 `WARN`，不得让 `doctor` 抛异常。
 
-```
-[OK]   D10 运行模式           L3（本地模拟，开发阶段）
-[OK]   D11 风险接受           accepted —— 见 DECISIONS D-011
-```
+配置路径与允许值：
 
-> D10 是**一致性检查**：运行模式不得超过当前工程阶段具备的能力。
->
-> | 阶段 | 可运行的最高模式 |
-> |---|---|
-> | 阶段 1～2 | L3 |
-> | 阶段 3 | L2 |
-> | 阶段 4 起 | L1 |
->
-> 若配置写了 L1 但代码还没有发送状态机，`doctor` 必须报 `FAIL`。
-> **这是工程一致性检查，不是许可检查。**
->
-> **阶段 1 的实现范围**：D10/D11 只读取配置声明值并报告，不实现真实平台能力。
+| 字段 | 合法值 | 未声明 | 非法值 |
+|---|---|---|---|
+| `runtime.mode` | `L0` / `L1` / `L2` / `L3` | D10 `WARN` | D4、D10 `FAIL` |
+| `risk.acceptance` | `accepted` / `not-accepted` | D11 `WARN` | D4、D11 `FAIL` |
+
+D10 是**工程一致性检查**，不是许可检查：
+
+| 阶段 | 可运行的最高模式 |
+|---|---|
+| 阶段 1～2 | L3 |
+| 阶段 3 | L2 |
+| 阶段 4 | L1 |
+| 阶段 6 起 | L0 |
+
+阶段 1 中，只有 `runtime.mode = L3` 为 `OK`；声明其他合法模式均为 `FAIL`，因为当前代码尚不具备对应能力。未声明时为 `WARN`，不擅自推断配置值。
+
+D11 在 `risk.acceptance = accepted` 时为 `OK`；未声明或为 `not-accepted` 时为 `WARN`。D11 是风险记录，不作为阶段 1 本地 CLI 的运行许可开关。
+
+**阶段 1 的实现范围**：只校验并报告这两个声明，不连接真实平台、不执行登录或消息操作。
 
 ---
 
@@ -773,16 +811,19 @@ dac logs --level WARN    # 只看 WARN 及以上
 | `status_watch_seconds` | int | `3` | 否 | `status --watch` 的刷新间隔（§3.5） |
 | `log_level` | str | `"INFO"` | 否 | 日志级别 |
 | `target.douyin_id` | str | `""` | 否 | 目标账号。为空 → D8 `WARN`，`run` 退出码 `3` |
-| `login.credentials_file` | str | `""` | 否 | 凭证文件路径。为空 → D9 `WARN` |
+| `login.credentials_file` | str | `""` | 否 | 凭证文件路径。为空或文件不存在 → D9 `WARN` |
+| `runtime.mode` | enum | — | 否 | `L0` / `L1` / `L2` / `L3`。未声明 → D10 `WARN`；阶段 1 仅 `L3` 为 `OK` |
+| `risk.acceptance` | enum | — | 否 | `accepted` / `not-accepted`。未声明或为 `not-accepted` → D11 `WARN` |
 
 **配置校验规则**：
 
 1. 类型错误 → `ConfigError`，指出字段路径与期望类型；
 2. 必填字段缺失 → `ConfigError`；
 3. 整数字段 ≤ 0 → `ConfigError`（间隔不能为 0 或负数）；
-4. 未知字段 → **忽略并记 WARN**，不报错（向前兼容）。
+4. `target`、`login`、`runtime`、`risk` 若存在必须是对象；`runtime.mode` / `risk.acceptance` 若存在，必须属于上表合法值；
+5. 未知字段 → **忽略并记 WARN**，不报错（向前兼容）。
 
-> `cycle_seconds` 是唯一必填项。这一条直接对应 AC-1.2 的证据①。
+> `cycle_seconds` 是唯一必填项。`runtime.mode` / `risk.acceptance` 是可选声明字段，缺失由 D10/D11 分别报告 `WARN`，不导致 D4 失败。
 
 ---
 
