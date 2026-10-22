@@ -187,16 +187,25 @@ doctor 通过结构校验
 
 ```
 启动
-  → 读取状态文件
-  → 状态为 running / pause_requested（说明上次非正常退出）
-      → 记录 WARN：检测到上次非正常退出
+  → 读取状态文件，校验 pid 存活（CLI_SPEC §5.4）
+  → 状态为 running / pause_requested / paused_manual
+      → 这三者的定义都要求「进程存活」
+      → 能走到这一步说明进程已死（否则会撞单实例锁）
+      → 记录 WARN：检测到上次非正常退出（状态=<旧状态>，pid=<旧pid> 已不存在）
       → 状态重置为 stopped
       → 继续正常启动流程
-  → 状态为 paused_*（预期退出）
-      → 保持原状态，提示用户
+  → 状态为 paused_auth / paused_risk / paused_unknown
+      → 这三个状态的定义是「进程已退出，等人工介入」
+      → 保持原状态，提示用户下一步
   → 状态文件损坏 / 不存在
       → 视为 stopped，记录 WARN
 ```
+
+**为什么 `paused_manual` 归入「重置为 stopped」**：
+
+`paused_manual` 的语义是**进程存活、挂起等待 resume**（ARCHITECTURE §8）。
+启动时读到它，只可能是进程已经死了却来不及改状态——**它不可能是「预期退出」**。
+若保持原状态，`status` 会报告「进程仍在运行（PID xxx）」，而那个 PID 可能已被系统复用。
 
 **不做的**：不尝试「猜测」崩溃前在做什么。状态文件只记**结果**，不记**过程**。
 

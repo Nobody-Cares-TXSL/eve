@@ -85,8 +85,8 @@ src/dac/
 | 模块 | 职责 | 不负责 | 测试方式 |
 |---|---|---|---|
 | `cli.py` | 解析参数、分发命令、统一异常→退出码 | 任何业务逻辑 | 集成测试 |
-| `commands/doctor.py` | 执行 D1～D9 检查、汇总、格式化输出 | 修复问题 | 注入检查函数，单测 |
-| `commands/status.py` | 读状态文件 → 输出状态 + 建议 | 修改状态 | 单测（构造状态文件） |
+| `commands/doctor.py` | 执行 D1～D9 检查、汇总、格式化输出 | 修复问题；**不得 import `load_settings`** | 注入检查函数，单测 |
+| `commands/status.py` | 读状态文件 → **校验 PID** → 输出状态 + 建议 | 修改状态 | 单测（构造状态文件 + fake pid） |
 | `commands/run.py` | 组装依赖、启动循环、处理退出 | 具体每轮做什么 | 集成测试 |
 | `commands/control.py` | 校验当前状态 → 写控制文件 | 操作进程 | 单测 |
 | `commands/logs.py` | 读取/跟随日志文件 | 写日志 | 单测 |
@@ -94,8 +94,8 @@ src/dac/
 | `core/loop.py` | 轮次循环、边界检查控制信号 | 业务动作 | 注入 fake tick，单测 |
 | `infra/settings.py` | 加载、校验、默认值 | 判断能否运行 | **单测** |
 | `infra/paths.py` | 路径解析、目录创建 | 业务 | 单测 |
-| `infra/state_file.py` | 原子读写状态 | 状态合法性 | 单测 |
-| `infra/control_file.py` | 原子读写控制意图 | 意图合法性 | 单测 |
+| `infra/state_file.py` | 原子读写状态、**PID 存活校验**（唯一实现，供 status/run/control 共用） | 状态合法性 | 单测 |
+| `infra/control_file.py` | 原子读写控制意图、`request_id` 幂等消费 | 意图合法性 | 单测 |
 | `infra/lock.py` | 单实例锁（文件锁） | — | 单测（双进程） |
 | `infra/log_setup.py` | 日志 handler、脱敏 filter | — | 单测（脱敏规则） |
 
@@ -162,8 +162,17 @@ class Settings:
     log_level: str
     ...
 
+class ConfigError(Exception):
+    """携带字段路径与原始原因，供 CLI 精确输出。"""
+    field: str
+    reason: str
+
 def load_settings(path: Path) -> Settings:
     """缺失必需字段 → ConfigError(字段路径)。不做静默兜底。"""
+
+def inspect_settings(path: Path) -> list[CheckResult]:
+    """不抛异常。逐项检查并返回结果列表，供 doctor 使用。
+    文件不存在、JSON 损坏、字段缺失都作为 CheckResult 返回，不中断。"""
 
 def check_runtime_ready(s: Settings) -> list[str]:
     """返回运行条件缺失项（如 target_douyin_id 为空）。空列表 = 可运行。"""
@@ -173,8 +182,13 @@ def check_runtime_ready(s: Settings) -> list[str]:
 
 | 函数 | 失败时 | 影响 |
 |---|---|---|
-| `load_settings` | 抛 `ConfigError` | 所有命令退出码 `2` |
+| `load_settings` | 抛 `ConfigError` | **除 `doctor` 外**的命令退出码 `2` |
+| `inspect_settings` | 返回 `FAIL` 项 | 只有 `doctor` 使用；`doctor` 永不因配置问题抛异常 |
 | `check_runtime_ready` | 返回缺失项列表 | 只有 `run` 退出码 `3` |
+
+> **`doctor` 不走 `load_settings`。** 它调用 `inspect_settings`，因为 `doctor` 的存在意义
+> 恰恰是诊断「配置坏了」的情况——若它自己因配置异常退出，就失去了作用。
+> 这条规则是 `MODULE_MAP` 的硬约束，`commands/doctor.py` 不得 import `load_settings`。
 
 ---
 
