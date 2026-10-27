@@ -45,6 +45,7 @@ douyin-im/          平台接入 SDK（独立仓库，真实账号验证 7/7 通
 | 文档 | 何时读 |
 |---|---|
 | `docs/AC.md` | 每个 Slice 开始前——验收标准 |
+| `docs/TODO.md` | 当前任务顺序、复用边界、交付与 Gate |
 | `docs/CLI_SPEC.md` | 实现命令、退出码、配置字段时 |
 | `docs/MODULE_MAP.md` | 决定文件放哪、依赖方向时 |
 | `docs/FAILURE_RULES.md` | 处理错误、状态转换时 |
@@ -74,7 +75,7 @@ douyin-im/          平台接入 SDK（独立仓库，真实账号验证 7/7 通
 3. **发送三态** `sent` / `failed` / `unknown`，`unknown` 绝不自动重试——会导致对方收到两条。
 4. **聊天正文可发 DeepSeek，但不进 git、不进日志、不发第三方**。凭证永不出本机。
 5. **AI 不主动披露身份，被直接追问时承认**；不编造设定外的现实经历；不声称执行了现实动作。
-6. **不复制两个参考项目的代码**（D-010），只借鉴设计。
+6. **优先合规复用**（D-016）：`douyin-im`（MIT）直接以依赖接入；`douyin-bot`（MIT）可复用经过审计的片段并保留许可证/归属；`douyin-robot` 当前无明确 LICENSE，不复制源码。具体清单见 `docs/TODO.md`。
 7. **不超前创建模块**。阶段 1 不建 `archive`/`page`/`identity`/`ai`/`send`/`memory`，含空文件。
 
 ## 架构
