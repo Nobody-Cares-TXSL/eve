@@ -258,6 +258,9 @@ conn.execute('select 1')   # 成功 → 连接未被关闭
 
 ## 4. 交叉对比
 
+> **历史候选方案评估**（§4–§7）：两参考项目的浏览器路线对比，
+> 保留作选型依据；现行方案见 §8 与 D-014。
+
 | 维度 | douyin-bot | douyin-robot | 新项目选择 |
 |---|---|---|---|
 | 身份核验 | 昵称子串（弱） | 抖音号（强） | **抖音号** |
@@ -305,4 +308,249 @@ conn.execute('select 1')   # 成功 → 连接未被关闭
 - **必须重新实现的**：配置系统、状态存储、去重、频率限制、发送状态机。
 - **必须放弃的**：douyin-robot 的全部代码（许可证）、douyin-bot 的昵称匹配与坐标点击。
 
-**下一步**：进入阶段 1，先建立可诊断的 CLI 骨架。
+---
+
+## 8. douyin-im 验证（2026-10-27）
+
+第三个候选接入方案：`zhinjs/douyin-im` v1.1.0，TypeScript，MIT，纯 Node 走 WebSocket。
+
+### 8.1 验证结果
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| 登录真实账号 | ✅ **通过** | 扫码 + mobile-sms 二次验证，约 3 分钟上线 |
+| 消息标识可靠 | ✅ **通过** | `serverMessageId` 唯一，见 §8.2 |
+| 收发消息 | ✅ 通过 | 收 50+ 条，发 1 条，回执见 §8.6 |
+| Session 持久化 | ✅ 已落盘 | `account.json` + `im-state.sqlite` |
+| **重启恢复** | ✅ **通过**（优雅退出后；早期 `kill -9` 误判已纠正，见 §8.4） | SIGINT 退出后重启，直接上线无需扫码 |
+| **断线重连** | ✅ **通过** | 1.2 秒重连、补收无重复；半开窗口有固有漏收窗口，需 `getHistory` 对账兜底（§8.5） |
+| 发送状态语义 | ✅ **通过** | `statusCode` + `serverMessageId` 可判三态（回执层级=服务端接收，见 §8.6） |
+| 平台风险接受 | ✅ **操作者已接受**（2026-10-27） | 两个号均属操作者本人；接受限流/封禁风险 |
+
+**七项技术检查记录通过，另有一项风险接受声明（不是技术测试）。** 成功分支有真实联调证据，异常与长期运行分支尚未全面覆盖。已发现的遗留风险：
+凭据失效时需人工删凭据重扫（§8.4）；半开窗口漏消息靠重连后对账找回（§8.5）。
+
+### 8.2 消息标识（关键发现）
+
+**存储层**（`im-state.sqlite` 的 `messages` 表）：`conversation_id` / `message_key` / `create_time` / `payload`。
+
+**事件层**（`MessageEvent`，见 `src/sdk/events/message.ts:19`）：
+
+| 事件字段 | 落盘字段 | 示例 | 稳定性 |
+|---|---|---|---|
+| `serverMessageId` | `payload.msgId` | `7701247709714892345` | ⭐ **服务端唯一** |
+| `clientMessageId` | `payload.clientMessageId` | `3024bcd1-e258-...` | 客户端 UUID |
+| `indexInConversation` | 同名字段 | `1672502401420000` | 会话内单调递增 |
+| `senderUid` | 同名字段 | `10000000000002` | 判断方向 |
+| `messageType` | `payload.msgType` | `7`=文本 | 枚举未穷举 |
+| `content.kind` | — | `'text'` / `'image'` / ... | 语义分类，比数字可靠 |
+
+> **注意字段名不一致**：落盘是原始协议 JSON（`msgId`/`msgType`），
+> 事件对象是 SDK 包装后的（`serverMessageId`/`messageType`）。
+> **接入层必须做映射，不能让原始结构渗透到业务层**——这正是 Platform Adapter 的职责。
+
+**同文异事件验证**（关键）：
+
+对方连续发的多条消息，`serverMessageId` 各不相同：
+
+```
+s:7701258778709001787  idx=...1330000
+s:7701258806836479525  idx=...1350000
+s:7701258832983262769  idx=...1360000
+```
+
+**这证明 `serverMessageId` 能区分「内容相同但事件不同」**——
+正是 `douyin-bot` 用文本哈希解决不了的问题。
+
+**结论**：`(conversationId, serverMessageId)` 可直接做复合主键，去重无需文本比对。
+
+### 8.3 发现的缺陷
+
+**退出时 `database is not open`**：
+
+```
+WARN WebSocket error: Error: database is not open
+    at SqliteImStateStore.getFrontierCursors (state-store.ts:1062)
+```
+
+SQLite 连接先关闭，WS 回调仍在读 `frontier` 游标。
+正常退出无害；异常断线时可能影响游标落盘。
+
+> **实测未复现影响**：§8.5 的两次断线重连均无重复投递，游标恢复正常。
+> 该缺陷的严重性降级为「退出路径的日志噪音」。
+
+### 8.4 重启恢复（通过——修正早期误判）
+
+**最终结论：优雅退出后重启，Session 正常恢复。**
+
+```
+[20:44:58] ✓ WebSocket 已连接
+           qrRequired: false
+           note: 'Session 已恢复，无需扫码'
+```
+
+**早期误判的根因（记录以免重蹈覆辙）**：
+
+最初三轮测试都报 `code=13 rejected session`，据此得出「重启恢复失败」——**错了**。
+那三轮的共同点是用 `kill -9` 强杀进程：
+
+| 退出方式 | 下次启动 |
+|---|---|
+| `kill -9`（无 logout，服务端 session 未注销但本地凭据与最后刷新的 ticket 绑定失效） | ❌ `code=13` |
+| SIGINT / 正常流程退出 | ✅ Session 直接恢复 |
+
+**教训**：验证「重启恢复」必须模拟真实退出路径（systemd 会发 SIGTERM），
+不能只 `kill -9` 再下结论。本次差点把可用能力误判为阻断项。
+
+**仍存在的两个真实问题**：
+
+1. **`code=13` 不降级扫码**（`src/sdk/account.ts:853`）：session 真过期时，SDK 直接抛异常，
+   不会自动回到扫码流程。触发概率低（需异常退出），但发生后**必须人工删凭据**。
+2. **账号目录扫描不过滤**（`src/store/account-store.ts:57`）：`accounts/` 下任意子目录
+   都被当账号读取。备份/迁移凭据时**不能靠改名**，必须移出该目录。
+
+**对项目的影响**：正常运维（systemd 重启、崩溃后重启）均可自动恢复；
+仅在「凭据彻底失效」时需要一次人工扫码。
+
+### 8.5 断线重连（通过，但有一个必须兜底的窗口）
+
+**重连机制**（两轮 SIGSTOP 实测，模拟网络中断）：
+
+```
+[16:40:31] WARN WebSocket 断开 code=3003 reason=ping timeout
+[16:40:33] INFO ✓ WebSocket 已连接     ← 1.2 秒重连
+```
+
+| 项 | 实测结果 |
+|---|---|
+| 断线检测延迟 | 30s 挂起不触发，70s 触发 → 心跳超时约 60s |
+| 重连耗时 | ~1.2 秒 |
+| 退避策略 | 指数退避封顶 30s，**永不放弃**（读源码 `reconnect.ts` 确认） |
+| 事件 | `system.reconnecting`（attempt/delayMs）→ `system.online` |
+| 重复投递 | 全量消息 53 条 / 唯一 key 53，**0 重复** |
+
+**完全断线期间的消息补收**：✅ 正常（142-144 三条在重连后完整补收，序号连续）。
+
+**⚠️ 半开窗口会漏消息**（实测发现）：
+
+对方在「进程挂起恢复后、ping timeout 检测到断线前」发的 5 条消息（序号 137-141），
+旧 socket 已被服务端 FIN（CLOSE-WAIT，4963 字节滞留内核缓冲区），消息进了 TCP 缓冲
+但从未到达应用层；重连后的服务端补推**也不覆盖这几条**。
+本地序号 `...136 → ...142` 出现跳号。
+
+显式调用 `friend.getHistory({count:50})` 拉取服务端历史后，5 条全部补回，0 重复。
+
+**规律**：重连补得了「连接死透期间」的消息，补不了「半开窗口（最长约 60s）」期间的。
+这是 WebSocket 接入的固有窗口，不是 SDK 缺陷。
+
+**对 dac 架构的要求**（Platform Adapter 必须实现）：
+
+1. **缺口线索**：`indexInConversation` 只作顺序参考；数值差不等同于消息条数，不能只凭跳号断言缺失。
+2. **重连后对账**：每次 `system.online`（含重连）后按游标分页执行 `getHistory()`，直到验证覆盖已保存的同步水位；单次 `count:50` 成功不代表长时间断线的完整补收。
+   按 `(conversationId, serverMessageId)` 去重合并——本次验证证明该手段能完整找回漏网消息；
+3. 对账是兜底不是常规路径，WS 推送仍是主通道。
+
+> **`node:sqlite` 实验性警告**：每次启动都有 `ExperimentalWarning: SQLite is an experimental feature`，
+> 与 Node 24 文档一致（RC 状态）。若迁移 TS，需评估锁版本或换 `better-sqlite3`。
+
+### 8.6 发送状态（通过）
+
+实测 `/ping` 的回复回执：
+
+```
+statusCode: 0
+statusMsg: 'OK'
+serverMessageId: '7701258784303302181'   ← 服务端分配
+clientMessageId: 'f33d5791-2683-...'     ← 客户端生成
+checkCode: undefined
+elapsedMs: 889
+```
+
+SDK 已有判定函数 `src/services/im/content.ts:351`：
+
+```typescript
+export function isMessageDelivered(res: SendMessageResponse): boolean {
+  return res.statusCode === 0
+    && Boolean(res.serverMessageId)
+    && res.serverMessageId !== '0'
+    && res.checkCode !== 8610;
+}
+```
+
+**三态映射**：
+
+| 状态 | 判定 |
+|---|---|
+| `sent` | `statusCode=0` 且 `serverMessageId` 有效 —— **只证明服务端接收**，不证明对端已显示/已读 |
+| `failed` | 服务端明确拒绝（`statusCode≠0`，或 `checkCode=8610` 内容审核拦截）。**是否可重试按错误分类决定**，不一律重试 |
+| `unknown` | 已提交但无法确认回执（超时、断连） |
+
+> 注意：`checkCode` 是内容安全审核状态（0=通过），`8610` 表示被拦截。
+> SDK 提供了 `isMessageDelivered()` 判定「送达」，但它覆盖的是「服务端接收」层级。
+> 三态语义的权威定义在 `PRD.md §6.1`（D-015 后已按证据强度收紧）。
+
+### 8.7 对现有设计的影响
+
+**§2.4 的结论需要更新**：原文说「消息无稳定 ID，阶段 2 的 Contract 不能假设有 ID」。
+
+两个参考项目拿不到 ID，是因为它们**走浏览器 DOM 抓取**——是方法限制，不是平台限制。
+纯 Node SDK 能拿到服务端 `msgId`。
+
+→ `DECISIONS.md` D-003 已更新：`id_mode` 升为主路径，`no_id_mode` 降为兜底。
+
+**§5 的「共同缺陷」不适用于 douyin-im**：它有测试（jest）、有 `pnpm-lock.yaml`、有 CI 配置。
+
+### 8.8 与 Playwright 方案对比
+
+| 维度 | Playwright | douyin-im |
+|---|---|---|
+| 消息获取 | DOM 抓取 | WebSocket 事件 |
+| 消息 ID | ❌ | ✅ |
+| 平台改版影响 | 前端改版即失效 | 协议层，影响较小 |
+| 风控/协议兼容机制 | 浏览器方案可能调整自动化特征 | SDK 内含签名、browserInfo 兼容与设备相关实现；**不能认定不需要** |
+| 语言 | Python | TypeScript |
+
+**最后一行是设计原则问题**：`PRD.md §2.1` 硬性边界 4 要求「不绕过风控」。
+Playwright 需要 `--disable-blink-features=AutomationControlled` 这类伪装，本质上是在规避检测；
+SDK 走桌面协议但仍包含签名、browserInfo 兼容模板等机制；不能仅凭“不用 Playwright”就断言不存在风控兼容行为。D-014 已划分 SDK 内部与 dac 自身的技术约束。
+
+### 8.9 迁移建议（验证完成后更新）
+
+**7 项验证全部通过。阻断项不存在（早期误判），迁移 douyin-im 的主要顾虑只剩两个可兜底项：**
+
+| 遗留风险 | 概率 | 兜底 |
+|---|---|---|
+| 凭据失效时不自动降级扫码（§8.4） | 低（需异常退出路径） | 人工删除凭据重扫；或向 SDK 提 PR |
+| 半开窗口漏消息（§8.5） | 每次断线都可能出现（≤60s 窗口） | **Platform Adapter 重连后 `getHistory()` 对账**，已实测有效 |
+
+**建议：采纳 douyin-im 作为平台接入层，整体迁移 TypeScript。**
+
+理由：
+- 消息 ID、断线重连、发送三态都实测可用，且**架构上单语言单进程**；
+- 当前 Python 代码仅 Slice 1（667 行），迁移成本处于最低点；
+- SDK 的真实消息 ID 与 WebSocket 接收能力适合作为接入层依据，但长期稳定性及协议风险仍需单独验收。
+
+**D-014 / D-015 均已正式确认。**
+
+**不因迁移而推翻**：`PRD.md` 全部边界、`AC.md` 验收语义、`ARCHITECTURE.md` 分层、
+`FAILURE_RULES.md` 故障分类、SQLite 数据模型、发送三态、Slice 工作流。
+
+> **迁移时需注意**：`node:sqlite` 在 Node 24 为实验特性（每次启动有 ExperimentalWarning）。
+> 验证会话中未观察到数据问题，但样本有限；正式实现前评估锁 Node 补丁版本或换 `better-sqlite3`。
+
+---
+
+## 9. 结论
+
+> 本节以 §8 验证完成后的状态为准（2026-10-27），技术选型已由 D-014 落定。
+
+- **平台接入层**：`douyin-im` 验证 **7/7 全部通过**。早期「5/7、重启需人工扫码」
+  是 `kill -9` 误判，已纠正（§8.4）。**D-014：采用该 SDK，技术栈迁移 TypeScript。**
+- **借鉴的 SDK 路线设计**：WS 事件 + `serverMessageId` 幂等、优雅退出刷新 Session、
+  重连后 `getHistory()` 对账（§8.5）、发送回执 `isMessageDelivered` 三态判定（§8.6）。
+- **借鉴的参考项目设计**（语言无关）：身份核验流程、滑动窗口归档思路、Prompt 分层、
+  审计日志、故障现场保存。
+- **随迁移作废的（Playwright 特有）**：选择器集中管理、DOM 气泡提取、坐标点击、
+  风控伪装参数。其中「选择器改版维护」被 §8.5 的对账机制取代。
+- **必须重新实现的**：配置系统、状态存储、去重、频率限制、发送状态机（语义不变，TS 实现）。
+- **必须放弃的**：douyin-robot 的全部代码（许可证）、douyin-bot 的昵称匹配与坐标点击。

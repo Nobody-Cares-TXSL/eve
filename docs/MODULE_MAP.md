@@ -1,51 +1,22 @@
 # 基础模块地图 — MODULE_MAP
 
-> 版本：v1.1
+> 版本：v2.0
 > 状态：阶段 1 交付物（已确认）
-> 范围：**仅阶段 1**。只划分 CLI、配置、运行状态、日志、进程控制。
+> 范围：**已冻结 Python 阶段 1 基线**，记录原 CLI、配置、运行状态、日志与进程控制设计。D-014 后 TypeScript 模块地图须在迁移 Slice 另定，不能照搬 `.py` 文件树或同步 `tick`。
 > 归档、身份核验、AI、发送**本阶段不创建文件**，只在架构图中占位。
-
-## 审查记录
-
-| 日期 | 版本 | 范围 | 结论 |
-|---|---|---|---|
-| 2026-10-23 | v1.0 | 全文 | 发现 6 处问题（3 处阻断），**不确认** |
-| 2026-10-23 | v1.1 | 全文 | 已修复全部 6 处 |
-| 2026-10-23 | v1.1 | 复审 | 修复过程中发现 CLI_SPEC §4.2 的 `run` 流程缺少挂起步骤，已同步；**复审通过** |
-
-### v1.0 审查问题与处置
-
-| 编号 | 问题 | 处置 |
-|---|---|---|
-| P1 | 文件数量写 17，实际 18 | 已修复：改为 18，见 §2 |
-| P2 | `run_loop` 接口无法表达「挂起等待」 | 已修复：改为返回 `LoopAction` 三态（`CONTINUE` / `SUSPEND` / `EXIT`），见 §4.2 |
-| P3 | `Settings` 字段与 CLI_SPEC §7.1 不对齐 | 已修复：字段补全并交叉引用，见 §4.3 |
-| P4 | 状态机纯函数无法区分 `stop` 在 running / paused_manual 下的语义 | 已修复：新增 `STOP_IMMEDIATE` 事件，见 §4.1 |
-| P5 | `lock.py` 无「只读探测」能力，D7 无法实现 | 已修复：`lock.py` 增加 `probe()`，见 §3 |
-| P6 | §8 依赖一段自相矛盾（FAIL/WARN 改到一半） | 已修复：删除残留，见 §8 |
-
----
 
 ## 1. 设计约束
 
 ### 1.1 命名规则（来自 SOURCE_AUDIT §2.1）
 
-**禁止**任何模块名与 Python 标准库同名。已知高危名称：
+**禁止**任何模块名与 Python 标准库同名。
 
-```
-selectors  types    queue    logging   json     email
-code       parser   platform token     copy     signal
-socket     random   statistics secrets typing enum
-abc        io       os       re        time     uuid
-hashlib    datetime pathlib  tempfile  shutil   subprocess
-threading  asyncio  sqlite3  config    storage  state
-```
+**判定方式**：`sys.stdlib_module_names` 求交集，结果必须为空。
+不要依赖手写黑名单——它容易漏，也容易写错（`config` / `storage` / `state` 并非标准库模块）。
 
-> 注意最后三个：`config`、`storage`、`state` **不在标准库中**，但 `douyin-bot` 用了 `config.py`/`storage.py`，
-> 容易与第三方包或未来扩展冲突。本项目统一加前缀或用领域词。
+**风格建议**（非硬规则）：避免 `config`、`storage`、`state` 这类过于通用的名字，加领域前缀更清晰。
 
-**约束**：所有内部模块名必须带领域前缀 `dac_`，或使用明确不属于标准库的词。
-阶段 1 的自动检查（AC-1.3）会对 `sys.stdlib_module_names` 求交集，交集必须为空。
+自动检查见 `AC-1.3`。
 
 ### 1.2 分层规则
 
@@ -222,7 +193,7 @@ def run_loop(
 
 初版只有「继续 / 退出」两种出路，无法表达 `paused_manual` 的要求：
 
-> 进程进入 `paused_manual` 后，**不退出、不做业务**，只做一件事：轮询控制文件（CLI_SPEC §4.4）
+> 进程进入 `paused_manual` 后，**不退出、不做业务**，只做一件事：轮询控制文件（CLI_SPEC §4.2）
 
 用 `should_continue` 返回 `False` 会让进程**退出**——但 `paused_manual` 要求进程存活。
 在 `tick` 里自己死循环会违反「循环不感知业务」。
@@ -246,7 +217,7 @@ def run_loop(
 
 @dataclass(frozen=True)
 class Settings:
-    # ── 阶段 1 全部字段，与 CLI_SPEC §7.1 一一对应，不得省略 ──
+    # ── 阶段 1 全部字段，与 CLI_SPEC §3.2 一一对应，不得省略 ──
     cycle_seconds: int             # 必填，缺失即报错（无默认值）
     pause_poll_seconds: int = 2    # 挂起时轮询控制文件的间隔
     status_watch_seconds: int = 3  # status --watch 的刷新间隔
@@ -272,7 +243,7 @@ def check_runtime_ready(s: Settings) -> list[str]:
     """返回运行条件缺失项（如 target_douyin_id 为空）。空列表 = 可运行。"""
 ```
 
-> **字段清单以 `CLI_SPEC §7.1` 为准**，本节只做类型映射。
+> **字段清单以 `CLI_SPEC §3.2` 为准**，本节只做类型映射。
 > 新增配置字段时必须同时更新两处。
 
 #### 外部字段路径 → 内部字段名的映射
@@ -280,7 +251,7 @@ def check_runtime_ready(s: Settings) -> list[str]:
 配置文件的字段路径是**带点的层级路径**，内部 `Settings` 用**下划线平铺名**。
 两者**不是同一组字符串**，不能直接比较。
 
-| 配置文件路径（§7.1） | `Settings` 字段 |
+| 配置文件路径（CLI_SPEC §3.2） | `Settings` 字段 |
 |---|---|
 | `cycle_seconds` | `cycle_seconds` |
 | `pause_poll_seconds` | `pause_poll_seconds` |
@@ -293,12 +264,12 @@ def check_runtime_ready(s: Settings) -> list[str]:
 
 **映射规则**：点号 `.` → 下划线 `_`。
 
-> **测试定义修正**：初版说「测试断言 `Settings` 字段集合与 §7.1 表格一致」——
+> **测试定义修正**：初版说「测试断言 `Settings` 字段集合与 CLI_SPEC §3.2 表格一致」——
 > 这个断言不成立，因为 `target.douyin_id` ≠ `target_douyin_id`。
 >
 > 正确的测试应断言：
 > 1. `Settings` 的字段集合 == **映射表右列**的集合；
-> 2. 映射表左列 == §7.1 表格的字段路径集合；
+> 2. 映射表左列 == CLI_SPEC §3.2 表格的字段路径集合；
 > 3. 每条路径按规则映射后，都能在 `Settings` 中找到。
 >
 > 映射表本身应作为代码中的常量（`FIELD_MAP`），测试直接读它。
@@ -322,7 +293,7 @@ def check_runtime_ready(s: Settings) -> list[str]:
 | 不创建 | 原因 | 何时创建 |
 |---|---|---|
 | `archive.py` / `db.py` | 阶段 2 | 阶段 2 |
-| `page.py` / `page_selectors.py` | 阶段 3 | 阶段 3 |
+| `platform/`（douyin-im Adapter） | 阶段 3（D-014） | 阶段 3 |
 | `identity.py` | 阶段 3 | 阶段 3 |
 | `ai.py` | 阶段 4 | 阶段 4 |
 | `send.py` | 阶段 4 | 阶段 4 |
@@ -343,7 +314,7 @@ def check_runtime_ready(s: Settings) -> list[str]:
                          │ 后续阶段插入
 ┌────────────────────────▼────────────────────────────┐
 │ 阶段 2   archive ─────────────────┐                  │
-│ 阶段 3   page ── identity ────────┤                  │
+│ 阶段 3   platform ── identity ─────┤
 │ 阶段 4   ai ── send ──────────────┤                  │
 │ 阶段 5   memory ──────────────────┤                  │
 │ 阶段 6   proactive ───────────────┘                  │
@@ -412,6 +383,6 @@ tests/
 - [ ] `dac doctor` 在干净目录、半配置目录、完整配置目录三种情况下行为正确
 - [ ] `dac run` 能被 `pause` / `resume` / `stop` 可靠控制
 - [ ] 双实例启动被拒绝
-- [ ] 所有退出码与 CLI_SPEC §8 一致
+- [ ] 所有退出码与 CLI_SPEC §5 一致
 - [ ] 日志中无凭证、无聊天正文
 - [ ] 你能完整讲出「一条 `pause` 命令从输入到状态变更」的执行链（Understanding Gate）
