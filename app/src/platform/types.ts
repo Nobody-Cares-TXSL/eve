@@ -7,7 +7,7 @@
 
 /** 归一化后的入站私信事件。字段全部为 Eve 拥有的类型，SDK 对象不越过 platform/ 边界。 */
 export interface InboundMessage {
-  /** 会话标识（SDK conversationShortId 字符串化；绝不转 number——超出安全整数范围） */
+  /** 会话标识（SDK threadId 原样保留；绝不转 number——超出安全整数范围） */
   readonly conversationId: string;
   /** 服务端消息 ID。缺省时为 null——由归档层走 no_id_mode 兜底（ARCHITECTURE §5.1） */
   readonly serverMessageId: string | null;
@@ -25,6 +25,14 @@ export interface InboundMessage {
   readonly createTime: string | null;
   /** 会话内序号，仅作顺序线索（TODO T4-2），不做漏数推断 */
   readonly indexInConversation: string | null;
+}
+
+export interface HistoryPage {
+  readonly statusCode: number;
+  readonly hasMore: boolean;
+  readonly cursor: string;
+  readonly direction: 'older' | 'newer';
+  readonly messages: readonly InboundMessage[];
 }
 
 /** 登录/会话状态机所需的平台侧事件（T1 消费，T0 仅定义）。 */
@@ -53,6 +61,6 @@ export interface PlatformPort {
   stop(): Promise<void>;
   /** 订阅；必须在 start() 前注册，避免早期事件竞态 */
   subscribe(sink: PlatformSink): void;
-  /** 只读拉取目标会话历史（T4 对账用）。T0 仅定义，不连接真实平台。 */
-  readHistory(conversationId: string, cursor?: string | null): Promise<readonly InboundMessage[]>;
+  /** 只读拉取历史；保留分页水位，不能丢失 hasMore/cursor/statusCode。 */
+  readHistory(conversationId: string, cursor?: string | null): Promise<HistoryPage>;
 }

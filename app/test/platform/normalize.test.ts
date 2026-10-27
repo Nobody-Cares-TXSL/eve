@@ -14,6 +14,7 @@ function base(over: Partial<RawMessageLike> = {}): RawMessageLike {
     senderUid: PEER,
     serverMessageId: '7701260499833538097',
     text: '你好',
+    content: { kind: 'text' },
     messageType: 7,
     createTime: '1793089447211',
     indexInConversation: '1672502401420000',
@@ -33,11 +34,12 @@ test('权威会话键用 threadId，不是 conversationShortId', () => {
   assert.equal(ok(base()).conversationId, `0:1:${SELF}:${PEER}`);
 });
 
-test('threadId 缺失时回退 conversationShortId', () => {
-  assert.equal(ok(base({ threadId: undefined })).conversationId, '7701260499833538097');
+test('threadId 缺失即拒绝：shortId 不是同一命名空间的替代键', () => {
+  const result = normalizeInboundMessage(base({ threadId: undefined }), SELF_UIDS);
+  assert.equal(result.ok, false);
 });
 
-test('两者都缺 → 拒绝归一化，不猜测归属', () => {
+test('threadId/shortId 都缺 → 拒绝归一化，不猜测归属', () => {
   const result = normalizeInboundMessage(base({ threadId: undefined, conversationShortId: '' }), SELF_UIDS);
   assert.equal(result.ok, false);
 });
@@ -87,4 +89,13 @@ test('序号优先 V2，缺失回退 v1（仅透传，不做步长推断）', ()
 
 test('messageType 未提供 → -1 透传哨兵，不冒充文本 7', () => {
   assert.equal(ok(base({ messageType: undefined })).messageType, -1);
+});
+
+test('非文本分享/链接/评论即使带标题也不得判成 text', () => {
+  for (const kind of ['share', 'link', 'comment', 'image', 'unknown']) {
+    assert.equal(ok(base({ content: {kind}, text: '标题', messageType: 8 })).kind, 'non_text');
+  }
+});
+test('没有 SDK content.kind 时保守判为 non_text，不根据 text 猜测', () => {
+  assert.equal(ok(base({ content: undefined, text: '文字' })).kind, 'non_text');
 });

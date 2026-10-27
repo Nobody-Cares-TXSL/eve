@@ -47,14 +47,30 @@ test('readHistory 只返回目标会话（跨会话隔离的端口级预演）',
   port.pushMessage(inbound({ conversationId: '0:1:self:peer' }));
   port.pushMessage(inbound({ conversationId: '0:1:self:other', serverMessageId: '999' }));
   const history = await port.readHistory('0:1:self:peer');
-  assert.equal(history.length, 1);
-  assert.equal(history[0]?.conversationId, '0:1:self:peer');
+  assert.equal(history.statusCode, 0);
+  assert.equal(history.hasMore, false);
+  assert.equal(history.messages.length, 1);
+  assert.equal(history.messages[0]?.conversationId, '0:1:self:peer');
 });
 
-test('start/stop 幂等计数：优雅停机路径存在（SIGTERM 语义的端口锚点）', async () => {
+test('start/stop 各被调用一次（仅测试 mock 计数，不证明幂等或优雅停机）', async () => {
   const port = new MockPlatformPort();
   await port.start();
   await port.stop();
   assert.equal(port.startCount, 1);
   assert.equal(port.stopCount, 1);
+});
+
+test('readHistory 保留历史分页游标与 hasMore', async () => {
+  const port = new MockPlatformPort();
+  for (let i = 0; i < 5; i++) port.pushMessage(inbound({serverMessageId: String(i)}));
+  const first = await port.readHistory('0:1:self:peer');
+  assert.equal(first.hasMore, true);
+  assert.equal(first.cursor, '3');
+  assert.equal(first.messages.length, 2);
+  const second = await port.readHistory('0:1:self:peer', first.cursor);
+  assert.equal(second.hasMore, true);
+  const third = await port.readHistory('0:1:self:peer', second.cursor);
+  assert.equal(third.hasMore, false);
+  assert.equal(third.cursor, '0');
 });

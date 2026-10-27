@@ -41,8 +41,8 @@
 
 | 项 | 内容 |
 |---|---|
-| 条件 | 会话键以 `threadId` 为权威；一切 ID 以字符串保留（19 位值超 double 安全整数，转 number 必损坏）；缺失字段归 `null`/`non_text`/`-1`，不猜测 |
-| 证据 | `pnpm test` 中 normalize 的 11 项断言（含反向断言：`String(Number(id)) !== id`） |
+| 条件 | 会话键必须有 `threadId`，禁止用 shortId 回退；一切 ID 以字符串保留（19 位值超 double 安全整数，转 number 必损坏）；缺失字段归 `null`/`non_text`/`-1`，不猜测；文本事件必须由 SDK `content.kind=text` 明确确认 |
+| 证据 | `pnpm test` 中 normalize 的 13 项断言（含反向断言：非文本带标题仍 `non_text`、缺 `content.kind` 不判 text、threadId 缺失即拒绝、`String(Number(id)) !== id`）；全套 ≥20 |
 | 失败状态 | AC 失败 → T1 不得开始（幂等键建立在归一化正确之上） |
 | 类型 | 自动测试 |
 

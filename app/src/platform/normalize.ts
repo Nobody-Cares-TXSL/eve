@@ -14,8 +14,10 @@ import type { InboundMessage } from './types.ts';
 export interface RawMessageLike {
   /** 权威会话键，形如 "0:1:{uidA}:{uidB}"（jumpbyte 私信格式，mappers.ts 确认） */
   readonly threadId?: string | undefined;
-  /** 数字短 ID，可能为空串；仅作 threadId 缺失时的回退 */
+  /** 数字短 ID，与 threadId **不同命名空间**（实测两者值不同）；不得用作会话键的替代 */
   readonly conversationShortId?: string | number | undefined;
+  /** SDK parsed event.content.kind; absent/unknown must not be classified as text. */
+  readonly content?: { readonly kind: string } | undefined;
   readonly serverMessageId?: string | undefined;
   readonly clientMessageId?: string | undefined;
   readonly senderUid?: string | undefined;
@@ -53,10 +55,10 @@ export function normalizeInboundMessage(
   raw: RawMessageLike,
   selfUids: ReadonlySet<string>,
 ): NormalizeResult {
-  // 权威键优先 threadId；conversationShortId 仅在其缺失时回退（可能为空串）
-  const conversationId = asId(raw.threadId) ?? asId(raw.conversationShortId);
+  // 只接受权威 threadId；shortId 属另一命名空间，不可用作业务主键
+  const conversationId = asId(raw.threadId);
   if (conversationId === null) {
-    return { ok: false, reason: '缺少 threadId/conversationShortId，无法归属会话' };
+    return { ok: false, reason: '缺少 threadId，不能用 shortId 冒充会话主键' };
   }
 
   const senderUid = asId(raw.senderUid);
@@ -77,9 +79,10 @@ export function normalizeInboundMessage(
       senderUid,
       fromSelf: selfUids.has(senderUid),
       text,
-      // msgType 枚举未穷举（SOURCE_AUDIT §8.2），故只按「是否拿到文本」分类，
-      // 不硬编码 7=text；发送前检查阶段会按 kind 决定是否处理
-      kind: text.length > 0 ? 'text' : 'non_text',
+      // 文本身份只认 SDK 解析结论（content.kind==='text' 且有正文）；
+      // 缺 kind、kind 未知、或仅带标题/描述的富媒体，一律 non_text——
+      // 宁可对真实文本沉默，也不让 AI 误回非文本消息（保守方向的不对称性）
+      kind: raw.content?.kind === 'text' && text.length > 0 ? 'text' : 'non_text',
       messageType,
       createTime: asId(raw.createTime),
       // 序号只是顺序线索，不做「步长固定」推断（TODO T4-2）

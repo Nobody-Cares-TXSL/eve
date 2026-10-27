@@ -9,8 +9,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test \"test/**/*.test.ts\"",
-    "dac": "node src/cli.ts"
+    "test": "node --test \"test/**/*.test.ts\""
   },
   "dependencies": {
     "douyin-im": "1.1.0"

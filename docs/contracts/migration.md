@@ -16,7 +16,7 @@
 | 语言 | TypeScript **严格模式** + `erasableSyntaxOnly`（禁止 enum/namespace 等不可擦除语法，保证原生直跑） |
 | 模块系统 | ESM（`"type": "module"`，`moduleResolution: nodenext`，导入写 `.ts` 扩展名） |
 | 测试 | `node --test`（零测试框架依赖），目录 `app/test/`，与被测代码镜像分层 |
-| CLI 入口 | `dac <command>` = `node app/src/cli.ts <command>`（安装脚本入口待 T2） |
+| CLI 入口 | `dac <command>` = `node app/src/cli.ts <command>`（**T2 才创建入口；T0 不暴露 dac 脚本**） |
 
 **验证命令**（T0 Gate 的可复现证据）：
 
@@ -95,4 +95,4 @@ infra/          配置、日志、db 连接、路径
 |---|---|
 | T0-2 固定版本依赖 + 导出检查 | `app/package.json`、`pnpm-lock.yaml`、`test/platform/sdk-public-api.test.ts` |
 | T0-3 mock smoke test | `test/platform/normalize.test.ts`、`test/platform/adapter-port.test.ts` |
-| T0-4 TS 版 doctor AC | `docs/AC.md` AC-T0.4 一节（诊断思想继承 D1～D11，扫描对象换成 Node/SDK/凭据） |
+| T0-4 TS 版 doctor AC | `docs/AC-TS.md` AC-T0.4 一节（诊断思想继承 D1～D11，扫描对象换成 Node/SDK/凭据） |
