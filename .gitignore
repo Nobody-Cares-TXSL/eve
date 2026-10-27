@@ -1,10 +1,12 @@
-# ── 参考项目（只读，不纳入本仓库）────────────────────────────
-# 两个上游项目各自有独立的 .git，仅作为设计参考：
-#   douyin-bot/   MIT，popohuan/douyin-bot
-#   douyin-robot/ 无 LICENSE，crazyants/douyin-robot
-# 详见 docs/SOURCE_AUDIT.md
+# ── 上游项目（独立仓库，不纳入本仓库）──────────────────────────
+# 各自有独立的 .git：
+#   douyin-bot/   MIT，popohuan/douyin-bot        参考项目
+#   douyin-robot/ 无 LICENSE，crazyants/douyin-robot 参考项目
+#   douyin-im/    MIT，zhinjs/douyin-im           候选接入 SDK（含登录凭证）
+# 详见 docs/human/SOURCE_AUDIT.md
 /douyin-bot/
 /douyin-robot/
+/douyin-im/
 
 # ── Python ──────────────────────────────────────────────
 __pycache__/
