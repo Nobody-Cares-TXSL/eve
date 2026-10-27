@@ -8,6 +8,20 @@
 /douyin-robot/
 /douyin-im/
 
+# ── Node（app/ TypeScript 迁移产物）────────────────────────
+node_modules/
+.pnpm-store/
+# SDK 登录与会话数据（凭证级敏感物，D-017）
+state/
+data/
+login-qr.png
+login.png
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+verify-out/
+*.tsbuildinfo
+
 # ── Python ──────────────────────────────────────────────
 __pycache__/
 *.py[cod]

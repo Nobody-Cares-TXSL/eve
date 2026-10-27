@@ -1,0 +1,22 @@
+{
+  "name": "dac",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Douyin AI Companion — L0 全自动私信助手（D-014/D-015）",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "dac": "node src/cli.ts"
+  },
+  "dependencies": {
+    "douyin-im": "1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

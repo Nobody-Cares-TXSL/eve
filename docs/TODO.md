@@ -1,6 +1,6 @@
 # Eve 开发 TODO（D-014 / D-015 生效）
 
-> 状态：规划中，尚未完成新 TypeScript Slice 的验收。
+> 状态：T0 已验收（2026-10-28，证据见 `docs/TODO-GATES.md`）；T1～T9 未开始。
 > 基线：主仓库 3112198；douyin-im f6eee669c39094224e00c6b877e1964d9da4e393；douyin-bot 8c84980584d555b18eef3dc78daa4e35a121c905；douyin-robot b8eef83c3db7dcb4534f6ce6de93e3b092416403。
 > 总目标：Ubuntu 本地、单目标账号、只发文字、L0 AI 自主回复和主动聊天；由程序强制白名单、频率、暂停、幂等及 unknown 禁重发。
 > 工作方式：**单 Agent、单工作区、一个 Slice 一次交付**。先 Contract/AC/测试，再写最小实现；不能为了让测试通过而修改已确认 AC。
@@ -14,10 +14,10 @@
 | douyin-bot（popohuan，本地 8c84980） | MIT | **允许直接选用**适合的 SQL、文本模板、纯逻辑片段并迁移为 TypeScript | 先审计具体片段、留下来源及 MIT 声明；Python 代码不得为了复用而新增常驻 Python 服务 |
 | douyin-robot（crazyants，本地 b8eef83） | 未找到 LICENSE/COPYING | **只参考设计**：身份核验、限流、日志、配置、运维，不能复制函数体或注释 | 取得作者有效授权或发现明确许可后再重新评估直接复用 |
 
-- [ ] R-01：明确 SDK 接入方式：固定来源和 commit、pnpm 锁文件、构建/导出可用；不能仅依赖被根仓库忽略的本地 douyin-im/ 目录。审查 README、docs/guide.md、LICENSE、THIRD_PARTY_NOTICES.md。
-- [ ] R-02：整理复用清单（来源路径、commit、许可证、采纳/舍弃原因、需要保留的版权声明）。先检查 douyin-bot/database.py、storage.py、llm_service.py；不照搬已知 SQLite 连接泄漏、昵称匹配、文本哈希去重及浏览器坐标代码。
-- [ ] R-03：建立 NOTICE.md 并执行**逐片段登记制**（D-018）：每段 MIT 来源代码登记 `eve 文件:行 | 来源仓库@commit | 源文件:行 | 许可证 | 处理 | 理由`，代码头注释指向条目；改译（Python→TS）同样保留原声明。**NOTICE.md 在 T3 开始前建立**，T6 结束全量对账。不要提交上游凭证、真实消息正文、二维码、原始测试报告。
-- [ ] R-04：D-010 与 CLAUDE.md 同步本复用原则；D-001 对无许可证 douyin-robot 的禁止复制继续有效。
+- [x] R-01：明确 SDK 接入方式：固定来源和 commit、pnpm 锁文件、构建/导出可用；不能仅依赖被根仓库忽略的本地 douyin-im/ 目录。审查 README、docs/guide.md、LICENSE、THIRD_PARTY_NOTICES.md。
+- [x] R-02：整理复用清单（来源路径、commit、许可证、采纳/舍弃原因、需要保留的版权声明）。先检查 douyin-bot/database.py、storage.py、llm_service.py；不照搬已知 SQLite 连接泄漏、昵称匹配、文本哈希去重及浏览器坐标代码。
+- [x] R-03：建立 NOTICE.md 并执行**逐片段登记制**（D-018）：每段 MIT 来源代码登记 `eve 文件:行 | 来源仓库@commit | 源文件:行 | 许可证 | 处理 | 理由`，代码头注释指向条目；改译（Python→TS）同样保留原声明。**NOTICE.md 在 T3 开始前建立**，T6 结束全量对账。不要提交上游凭证、真实消息正文、二维码、原始测试报告。
+- [x] R-04：D-010 与 CLAUDE.md 同步本复用原则；D-001 对无许可证 douyin-robot 的禁止复制继续有效。
 
 ## 开发顺序与依赖
 
@@ -27,10 +27,10 @@
 
 ### T0 — TypeScript 项目骨架与第三方依赖（第一步）
 
-- [ ] T0-1：定义迁移 Contract：新目录、模块依赖方向、Node 24 / pnpm / TS 严格模式、CLI 启动命令；明确 SDK 自身缓存库与 Eve 业务库的独立职责。
-- [ ] T0-2：接入固定版本的 douyin-im 作为依赖，检查 Client/Account/MessageEvent/ChatContact 公开导出，保留上游许可证与第三方说明；避免引用其 src/ 私有路径。
-- [ ] T0-3：建立仅本地 mock 的 SDK Adapter smoke test、类型检查、测试脚本；不连接真实抖音、不发送消息。
-- [ ] T0-4：定义 TS 版 doctor 的 AC，继承旧 D1～D11 的诊断思想，替换 Python、Playwright、.py 扫描为 Node、SDK、目录与凭据边界检查。
+- [x] T0-1：定义迁移 Contract：新目录、模块依赖方向、Node 24 / pnpm / TS 严格模式、CLI 启动命令；明确 SDK 自身缓存库与 Eve 业务库的独立职责。
+- [x] T0-2：接入固定版本的 douyin-im 作为依赖，检查 Client/Account/MessageEvent/ChatContact 公开导出，保留上游许可证与第三方说明；避免引用其 src/ 私有路径。
+- [x] T0-3：建立仅本地 mock 的 SDK Adapter smoke test、类型检查、测试脚本；不连接真实抖音、不发送消息。
+- [x] T0-4：定义 TS 版 doctor 的 AC，继承旧 D1～D11 的诊断思想，替换 Python、Playwright、.py 扫描为 Node、SDK、目录与凭据边界检查。
 - **Gate**：在干净 checkout 中按锁文件安装并执行 typecheck/test 成功；引用 SDK 的公开 API；凭证与测试输出不被 Git 跟踪。
 
 ### T1 — Platform Adapter 最小只读纵切
@@ -108,6 +108,6 @@
 
 ## 当前下一步
 
-**先执行 R-01～R-04 与 T0-1，后续只推进 T0，不并行开启 T1～T9。** 下一次开始编程前先完成：本 Slice 的四问、Contract、可重复 AC、测试设计、理解关口。通过后才勾选，未完成任务不提前标记完成。
+**R-01～R-04 与 T0 已完成（证据见 docs/TODO-GATES.md）。下一步：T1 Platform Adapter，仍一次一个 Slice。** 下一次开始编程前先完成：本 Slice 的四问、Contract、可重复 AC、测试设计、理解关口。通过后才勾选，未完成任务不提前标记完成。
 
 **当前最重要的边界**：SDK 已验证的是可行性，不是 Eve 整体完成；不修改上游账号凭证，不在未经准备的情况下触发真实自动发送。
