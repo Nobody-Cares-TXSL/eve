@@ -9,7 +9,9 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test \"test/**/*.test.ts\""
+    "test": "node --test \"test/**/*.test.ts\"",
+    "t1:readonly": "node scripts/t1-readonly.ts",
+    "t1:identify": "node scripts/t1-identify.ts"
   },
   "dependencies": {
     "douyin-im": "1.1.0"
