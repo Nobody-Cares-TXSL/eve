@@ -3,10 +3,22 @@ import { createClient, configureLogger, type Client, type Account, type MessageE
   type Friend, type Stranger, PrivateMessageEvent, StrangerMessageEvent } from 'douyin-im';
 import { LocalQrFile } from './qr.ts';
 import { normalizeInboundMessage } from './normalize.ts';
-import { normalizeHistoryMessage } from './history.ts';
+import { projectHistoryPage } from './history.ts';
 import type { HistoryPage, PlatformPort, PlatformSink, PlatformStatus } from './types.ts';
 
 type Contact = Friend | Stranger;
+
+export type HistoryDiagnosticCode =
+  | 'history_cached_contact'
+  | 'history_local_contact_lookup'
+  | 'history_local_contact_missing'
+  | 'history_local_lookup_failed'
+  | 'history_contact_bound'
+  | 'history_short_id_missing'
+  | 'history_sdk_start'
+  | 'history_sdk_nonzero'
+  | 'history_sdk_throw'
+  | 'history_success';
 
 export interface ReadOnlyOptions {
   readonly dataDir: string;
@@ -19,6 +31,8 @@ export interface ReadOnlyOptions {
   readonly notifyQrPath?: (path: string) => void;
   /** 仅由本机交互式验收显式开启；不自动完成挑战。 */
   readonly allowLocalVerification?: boolean;
+  /** Safe stage codes only; never pass SDK objects, IDs, messages or raw exceptions. */
+  readonly onHistoryDiagnostic?: (code: HistoryDiagnosticCode) => void;
 }
 
 function validUid(uid: string): boolean { return /^\d+$/.test(uid); }
@@ -38,6 +52,7 @@ export class DouyinReadOnlyPort implements PlatformPort {
   private readonly selfUid: string;
   private readonly notifyQrPath: (path: string) => void;
   private readonly allowLocalVerification: boolean;
+  private readonly onHistoryDiagnostic: (code: HistoryDiagnosticCode) => void;
   private sink?: PlatformSink;
   private active: Account | undefined;
   private verified = false;
@@ -55,6 +70,7 @@ export class DouyinReadOnlyPort implements PlatformPort {
     this.qr = new LocalQrFile(options.dataDir);
     this.notifyQrPath = options.notifyQrPath ?? (() => {});
     this.allowLocalVerification = options.allowLocalVerification === true;
+    this.onHistoryDiagnostic = options.onHistoryDiagnostic ?? (() => undefined);
     // SDK 默认 silent；不得允许 SDK 将原始事件或挑战 token 打到日志。
     configureLogger({ level: 'silent', maskSensitive: true, color: false });
     this.client = options.client ?? createClient({ dataDir: options.dataDir, autoLoad: true });
@@ -229,21 +245,58 @@ export class DouyinReadOnlyPort implements PlatformPort {
     if (!this.started || !this.verified || !this.active) throw new Error('平台未验证上线');
     const ownUids = this.identities(this.active);
     if (!belongsToTarget(conversationId, ownUids, this.targetUid)) throw new Error('拒绝查询非白名单会话');
-    const contact = this.contacts.get(conversationId) ??
-      [this.active.pickFriend(this.targetUid), this.active.pickStranger(this.targetUid)]
+    const account = this.active;
+    let contact = this.contacts.get(conversationId) ??
+      [account.pickFriend(this.targetUid), account.pickStranger(this.targetUid)]
         .find((c): c is Contact => !!c && c.threadId === conversationId);
-    if (!contact) throw new Error('目标会话尚未由 SDK 绑定，不允许手工拼接地址');
-    const page = await contact.getHistory({ ...(cursor != null ? { cursor } : {}), count: 50, direction: 'older' });
-    if (page.statusCode !== 0) throw new Error('历史查询返回非成功状态');
-    const messages = page.messages.flatMap(raw => {
-      if (raw.threadId !== conversationId || raw.senderUid !== this.targetUid &&
-          !ownUids.has(raw.senderUid)) return [];
-      const m = normalizeHistoryMessage(raw, ownUids);
-      return m ? [m] : [];
-    });
-    return {
+    if (contact) this.onHistoryDiagnostic('history_cached_contact');
+    if (!contact) {
+      // Only project SDK-owned local state; never synthesize a thread or short ID.
+      // 目标既可能是好友也可能是陌生人：只刷新 stranger 列表会漏掉好友会话
+      // （曾导致真实探针报 history_local_contact_missing）。两类都必须查。
+      this.onHistoryDiagnostic('history_local_contact_lookup');
+      try { await account.getFriendList(); }
+      catch { this.onHistoryDiagnostic('history_local_lookup_failed'); throw new Error('history_local_lookup_failed'); }
+      if (!this.started || !this.verified || this.active !== account) throw new Error('平台会话状态已变化');
+      contact = account.pickFriend(this.targetUid);
+      if (contact?.threadId !== conversationId || contact.uid !== this.targetUid) contact = undefined;
+      if (!contact) {
+        try { await account.getStrangerList(); }
+        catch { this.onHistoryDiagnostic('history_local_lookup_failed'); throw new Error('history_local_lookup_failed'); }
+        if (!this.started || !this.verified || this.active !== account) throw new Error('平台会话状态已变化');
+        contact = account.pickStranger(this.targetUid);
+        if (contact?.threadId !== conversationId || contact.uid !== this.targetUid) contact = undefined;
+      }
+    }
+    if (!contact) {
+      this.onHistoryDiagnostic('history_local_contact_missing');
+      throw new Error('目标会话尚未由 SDK 绑定，不允许手工拼接地址');
+    }
+    if (contact.threadId !== conversationId || contact.uid !== this.targetUid ||
+        contact.conversationType !== 1) throw new Error('历史联系人身份校验失败');
+    this.onHistoryDiagnostic('history_contact_bound');
+    // A missing hint is diagnostic only: the installed SDK may resolve a local
+    // short ID within getHistory(). Do not fabricate or enforce unpublished SDK APIs.
+    if (!contact.conversationShortId || contact.conversationShortId === '0')
+      this.onHistoryDiagnostic('history_short_id_missing');
+    this.onHistoryDiagnostic('history_sdk_start');
+    let page;
+    try {
+      page = await contact.getHistory({ ...(cursor != null ? { cursor } : {}), count: 50, direction: 'older' });
+    } catch {
+      this.onHistoryDiagnostic('history_sdk_throw');
+      throw new Error('history_sdk_throw');
+    }
+    if (page.statusCode !== 0) {
+      this.onHistoryDiagnostic('history_sdk_nonzero');
+      throw new Error('history_sdk_nonzero');
+    }
+    this.onHistoryDiagnostic('history_success');
+    return projectHistoryPage(page.messages, {
+      conversationId, targetUid: this.targetUid, ownUids,
       statusCode: page.statusCode, hasMore: page.hasMore,
-      cursor: page.cursor, direction: page.direction, messages,
-    };
+      cursor: page.cursor, direction: page.direction,
+      requestedCursor: cursor ?? null, requestedDirection: 'older',
+    });
   }
 }

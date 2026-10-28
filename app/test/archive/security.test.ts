@@ -59,7 +59,7 @@ test('错误账号或更高版本在数据库预检阶段拒绝',()=>{
   const file=join(dir,'eve.sqlite');
   const a=EveArchive.open(file,identity);a.close();
   assert.throws(()=>EveArchive.open(file,{...identity,targetUid:'444'}),/account_mismatch/);
-  const db=new DatabaseSync(file);db.exec('PRAGMA user_version=2');db.close();
+  const db=new DatabaseSync(file);db.exec('PRAGMA user_version=99');db.close();
   assert.throws(()=>EveArchive.open(file,identity),/schema_unsupported/);
  }finally{rmSync(dir,{recursive:true,force:true});}
 });

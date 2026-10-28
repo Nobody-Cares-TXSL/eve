@@ -34,7 +34,14 @@ export class MockPlatformPort implements PlatformPort {
     const start = cursor == null ? messages.length : Math.min(Number(cursor), messages.length);
     if (!Number.isSafeInteger(start) || start < 0) throw new Error('invalid mock cursor');
     const end = Math.max(0, start - 2);
-    return { statusCode: 0, direction: 'older', cursor: String(end), hasMore: end > 0, messages: messages.slice(end, start) };
+    const page = messages.slice(end,start);
+    return {
+      statusCode:0, direction:'older', requestedDirection:'older',
+      requestedCursor:cursor??null, cursor:String(end), hasMore:end>0,
+      rawCount:page.length,acceptedCount:page.length,excludedCount:0,
+      exclusions:{foreignConversation:0,foreignSender:0,deleted:0,unrepresentable:0},
+      missingIdCount:page.filter(m=>m.serverMessageId===null).length,messages:page,
+    };
   }
 
   // ── 测试驱动接口 ──

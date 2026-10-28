@@ -27,11 +27,27 @@ export interface InboundMessage {
   readonly indexInConversation: string | null;
 }
 
+export interface HistoryExclusions {
+  readonly foreignConversation: number;
+  readonly foreignSender: number;
+  readonly deleted: number;
+  readonly unrepresentable: number;
+}
 export interface HistoryPage {
   readonly statusCode: number;
   readonly hasMore: boolean;
+  /** Returned pagination cursor, never coerced into number. */
   readonly cursor: string;
   readonly direction: 'older' | 'newer';
+  readonly requestedCursor: string | null;
+  readonly requestedDirection: 'older' | 'newer';
+  /** Count of the SDK-visible page before the Eve security filter. */
+  readonly rawCount: number;
+  readonly acceptedCount: number;
+  readonly excludedCount: number;
+  readonly exclusions: HistoryExclusions;
+  /** Accepted records with a missing server ID are ambiguous, never proof. */
+  readonly missingIdCount: number;
   readonly messages: readonly InboundMessage[];
 }
 

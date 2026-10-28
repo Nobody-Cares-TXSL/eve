@@ -3,6 +3,7 @@ import {readFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {readState,writeState,paths,initDirs,processStart,BLOCKED,readJson,listRequests,atomicJson,removeFile,type RuntimeState,type Phase,type Paths} from './state.ts';
 import {BoundedQueue} from './queue.ts';
+import {reconcileOnce} from './reconcile.ts';
 import {EveArchive,type ArchiveIdentity} from '../archive/store.ts';
 import type {InboundMessage} from '../platform/types.ts';
 import type {PlatformPort,PlatformSink} from '../platform/types.ts';
@@ -29,6 +30,14 @@ export class Runner {
   private archive: EveArchive | undefined;
   private trustedIdentity:ArchiveIdentity | undefined;
   private readonly archivePath: string | undefined;
+  private readonly reconcileEnabled:boolean;
+  private reconciliationGeneration=0;
+  private reconciliationRequested=false;
+  private reconciliationRunning:Promise<void>|undefined;
+  private reconciliationAbort:AbortController|undefined;
+  private platformOnline=false;
+  private coverageInvalidationPending=false;
+  private confirmedConversationId:string|undefined;
   private stopping=false;
   private faulted=false;
   private active=false;
@@ -38,7 +47,8 @@ export class Runner {
   private wake: (()=>void)|undefined;
   private readonly port:PlatformPort;
   private readonly config:RuntimeConfig;
-  constructor(root:string, port:PlatformPort, config:RuntimeConfig, archivePath?:string) {
+  constructor(root:string, port:PlatformPort, config:RuntimeConfig, archivePath?:string, reconcileEnabled=false) {
+    this.reconcileEnabled=reconcileEnabled;
     this.archivePath=archivePath;
     this.port=port;this.config=config;
     this.p=paths(root);
@@ -75,6 +85,15 @@ export class Runner {
       if(this.archivePath && (!this.archive||!this.trustedIdentity)) {
         void this.block('paused_env','archive_identity_unverified');return;
       }
+      if(this.reconcileEnabled){
+        if(this.confirmedConversationId&&this.confirmedConversationId!==message.conversationId){
+          void this.block('paused_env','conversation_identity_changed');return;
+        }
+        if(!this.confirmedConversationId){
+          this.confirmedConversationId=message.conversationId;
+          this.reconciliationRequested=true;
+        }
+      }
       this.q.push(message);
     },
     onStatus:status=>{
@@ -89,6 +108,21 @@ export class Runner {
         }
         this.trustedIdentity={ownerUid:this.config.selfUid,targetUid:this.config.targetUid,
           ownUids:[...new Set([status.uid,status.imUid])]};
+        this.platformOnline=true;
+        if(this.reconcileEnabled){
+          this.reconciliationGeneration++;
+          this.reconciliationAbort?.abort();
+          this.reconciliationRequested=true;
+          this.wake?.();
+        }
+      }
+      if((status.type==='offline'||status.type==='reconnecting')&&this.reconcileEnabled){
+        this.platformOnline=false;
+        this.coverageInvalidationPending=true;
+        this.reconciliationGeneration++;
+        this.reconciliationAbort?.abort();
+        this.reconciliationRequested=true;
+        this.wake?.();
       }
       if (status.type==='session_rejected') void this.block('paused_auth','session_rejected');
       else if (status.type==='verification_required' && !this.config.allowLocalVerification)
@@ -123,13 +157,13 @@ export class Runner {
       this.processed.add(req.id);
       if (this.stopping) {await this.ack(req,false,'stopping');continue;}
       if (req.action==='stop') {
-        this.stopping=true;this.q.pause();await this.set('stopping','stop_requested');
+        this.stopping=true;this.q.pause();this.reconciliationAbort?.abort();await this.set('stopping','stop_requested');
         await this.ack(req,true);this.wake?.();
       } else if (this.faulted) await this.ack(req,false,'blocked');
       else if (req.action==='pause') {
-        this.q.pause();await this.set('paused_manual','manual');await this.ack(req,true);
+        this.q.pause();this.reconciliationGeneration++;this.reconciliationAbort?.abort();await this.set('paused_manual','manual');await this.ack(req,true);
       } else if (this.s.phase==='paused_manual') {
-        await this.set('running');this.q.resume();await this.ack(req,true);
+        await this.set('running');this.q.resume();if(this.reconcileEnabled)this.reconciliationRequested=true;await this.ack(req,true);
       } else await this.ack(req,false,'not_paused');
     }
   }
@@ -140,7 +174,7 @@ export class Runner {
     this.port.subscribe(this.sink);
     let closeFail=false;
     let pendingAtStop=0;
-    const signal=()=>{if (this.stopping) return;this.stopping=true;this.q.pause();this.wake?.();};
+    const signal=()=>{if (this.stopping) return;this.stopping=true;this.q.pause();this.reconciliationAbort?.abort();this.wake?.();};
     process.on('SIGINT',signal);
     process.on('SIGTERM',signal);
     try {
@@ -152,7 +186,16 @@ export class Runner {
       if(this.archivePath && !this.faulted && !this.stopping){
         if(!this.trustedIdentity){await this.block('paused_env','archive_identity_unverified');}
         else {
-          try{this.archive=EveArchive.open(this.archivePath,this.trustedIdentity);}
+          try{
+            this.archive=EveArchive.open(this.archivePath,this.trustedIdentity);
+            if(this.reconcileEnabled){
+              this.archive.upgradeToV2();
+              this.archive.invalidateCurrentCoverage();
+              const known=this.archive.knownConversations();
+              // An Eve-authenticated, already archived thread is evidence; a guessed thread is not.
+              if(known.length===1) this.confirmedConversationId=known[0];
+            }
+          }
           catch{await this.block('paused_env','archive_open_failed');}
         }
       }
@@ -160,6 +203,28 @@ export class Runner {
       while(!this.stopping && !this.faulted) {
         await this.controls();
         if(this.stopping || this.faulted) break;
+        if(this.reconcileEnabled&&this.coverageInvalidationPending&&this.archive){
+          this.coverageInvalidationPending=false;
+          this.archive.invalidateCurrentCoverage();
+        }
+        if(this.reconcileEnabled&&this.archive&&this.trustedIdentity&&this.platformOnline&&
+           this.reconciliationRequested&&this.confirmedConversationId&&!this.reconciliationRunning&&this.q.isIdle&&
+           this.s.phase==='running'){
+          this.reconciliationRequested=false;
+          const generation=this.reconciliationGeneration;
+          const controller=new AbortController();
+          this.reconciliationAbort=controller;
+          const archive=this.archive,imUid=this.trustedIdentity.ownUids.at(-1)!;
+          this.reconciliationRunning=reconcileOnce({
+            port:this.port,archive,conversationId:this.confirmedConversationId!,
+            imUid,instanceId:this.id,signal:controller.signal,
+            isSafe:()=>!this.stopping&&!this.faulted&&this.s.phase==='running'&&
+              generation===this.reconciliationGeneration&&this.platformOnline&&this.q.isIdle,
+          }).then(result=>{
+            if(result.state!=='verified')return; // remain read-only if coverage cannot be proved
+          }).catch(()=>{void this.block('paused_env','reconcile_runtime_failed');})
+            .finally(()=>{this.reconciliationRunning=undefined;if(this.reconciliationAbort===controller)this.reconciliationAbort=undefined;this.wake?.();});
+        }
         this.s={...this.s,updatedAt:Date.now()};await writeState(this.p,this.s);
         await new Promise<void>(resolve=>{
           this.wake=resolve;
@@ -174,11 +239,16 @@ export class Runner {
     } finally {
       process.off('SIGINT',signal);process.off('SIGTERM',signal);
       this.stopping=true;
+      this.reconciliationAbort?.abort();
       // 故障阻塞的落盘可能仍在飞行中（溢出/拒登录都是同步触发）：
       // 必须等它完成，否则返回码与状态文件会读到落盘前的 phase。
       await this.blockPending?.catch(()=>undefined);
       pendingAtStop=this.q.length;
+      await this.reconciliationRunning?.catch(()=>undefined);
       await this.q.stop();
+      if(this.reconcileEnabled&&this.archive){
+        try{this.archive.invalidateCurrentCoverage();}catch{closeFail=true;}
+      }
       try{this.archive?.close();}catch{closeFail=true;}
       this.archive=undefined;
       // SDK offline after rejected logout is still a completed shutdown: T1 observed this case.

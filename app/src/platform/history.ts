@@ -50,3 +50,46 @@ export function normalizeHistoryMessage(
   }, ownUids);
   return result.ok ? result.message : null;
 }
+
+/** T4-1: retain evidence about discarded rows; never log raw messages. */
+export function projectHistoryPage(
+  rawMessages: readonly HistoryMessageLike[],
+  meta: {
+    conversationId: string;
+    targetUid: string;
+    ownUids: ReadonlySet<string>;
+    statusCode: number;
+    hasMore: boolean;
+    cursor: string;
+    direction: 'older' | 'newer';
+    requestedCursor: string | null;
+    requestedDirection: 'older' | 'newer';
+  },
+): import('./types.ts').HistoryPage {
+  const exclusions = {
+    foreignConversation: 0, foreignSender: 0, deleted: 0, unrepresentable: 0,
+  };
+  const messages: InboundMessage[] = [];
+  let missingIdCount = 0;
+  for (const raw of rawMessages) {
+    if (raw.threadId !== meta.conversationId || raw.conversationType === 2) {
+      exclusions.foreignConversation++; continue;
+    }
+    if (raw.senderUid !== meta.targetUid && !meta.ownUids.has(raw.senderUid)) {
+      exclusions.foreignSender++; continue;
+    }
+    if (raw.deleted) { exclusions.deleted++; continue; }
+    const message = normalizeHistoryMessage(raw, meta.ownUids);
+    if (message === null) { exclusions.unrepresentable++; continue; }
+    if (message.serverMessageId === null) missingIdCount++;
+    messages.push(message);
+  }
+  const excludedCount = Object.values(exclusions).reduce((sum, count) => sum + count, 0);
+  return {
+    statusCode: meta.statusCode, hasMore: meta.hasMore,
+    cursor: meta.cursor, direction: meta.direction,
+    requestedCursor: meta.requestedCursor, requestedDirection: meta.requestedDirection,
+    rawCount: rawMessages.length, acceptedCount: messages.length,
+    excludedCount, exclusions, missingIdCount, messages,
+  };
+}

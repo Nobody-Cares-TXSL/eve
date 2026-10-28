@@ -14,6 +14,7 @@ export class BoundedQueue<T> {
     if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error('queue capacity 必须为正数');
   }
   get length():number {return this.pending.length;}
+  get isIdle():boolean {return this.pending.length===0 && !this.busy;}
   get isPaused():boolean{return this.paused;}
   get isFaulted():boolean{return this.failed;}
   push(item:T):boolean {

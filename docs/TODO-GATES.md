@@ -249,3 +249,107 @@ pnpm test
 - 真实账号与凭据不进入任何测试；现场只做了 1 条消息的单次验收，未做持续运行观察。
 
 **判定：T3 核心归档能力（含真实现场）与崩溃恢复已验收；T4 对账能力尚未开始，不得混入。T3 可标记完成并提交。**
+
+## T4 — 分页对账 Contract 草案（未冻结，尚未实现）
+
+- 以 T3 提交 `c77425b` 为干净基线，已核对 SDK 的 `ChatContact.getHistory`：older/newer/cursor/count/includeCurrent 可用；返回消息经排序，指定 cursor 且未 includeCurrent 时可过滤掉锚点行。
+- 新增 `docs/contracts/reconciliation.md`，定义：重连 epoch、旧锚点重叠或初次全量终点、头页闭合、分页无前进/过滤失败保守处理、SQLite v2 预期迁移、coverageProof 与持久 eligible 门控；`docs/AC-TS.md` 增加 AC-T4.1～T4.9 草案。
+- 发现 T1 `readHistory()` 只返回过滤后的 messages，没有原始/排除计数；**必须先补可观测性**，否则不允许对账宣称 verified。
+- **状态**：只完成 T4 Contract/AC 草案，未修改 T1/T2/T3 实现，没有真实历史分页联调、没有 T4 自动测试，没有 Git 提交。不得提前勾选 T4 或进入 T5。
+
+### T4 实施增量：T4-1 历史页证据、T4-2 v2 schema（尚未完成 T4）
+
+- 以 T3 提交 c77425b 为实现基线，仅更改 PlatformPort 历史页返回结构、mock 与 T1 只读 Adapter，不接触 SDK 内部缓存库、不发送消息。
+- T4-1：新增 requestedCursor/requestedDirection、rawCount、acceptedCount、excludedCount、exclusions（foreignConversation/foreignSender/deleted/unrepresentable）与 missingIdCount。rawCount 以 SDK ChatHistory.messages 最终对外返回的列表为口径（SDK 已可能自行排除 cursor anchor），不宣称网络包原始条数。被排除行不能静默假装完整。
+- T4-1 mock 负例覆盖：六条中四条过滤、群/删除被过滤但不等于空页、19 位消息 ID 与高位索引字符串精度、hasMore=true 空页保留以供恢复器判断。原只读权限与私信白名单不变。
+- T4-2：新增独立 schema-v2.sql（reconcile_epochs/reconcile_pages/eligible_events）。EveArchive.upgradeToV2() 为显式调用、事务升级，保留 T3 原生 v1 默认开库行为；升级后 v2 可再次正常打开。迁移故障注入证明 DDL/版本号同时回滚，已有消息和归档批次不受损。
+- **未完成**：T4-2 还未实现对账页与归档批次的同事务业务 API；T4-3 分页恢复器、头页闭合、有效 proof 复核/verified 更新、eligible 事务发布、断线 epoch 取消、T4-4 的 >50 条恢复和真实历史对账尚未进行。不得把 schema 和 page 原始计数当成 coverageProof；不得勾选 T4 全部完成。
+
+### T4-3 第一轮：有界分页恢复器、页事务及可信门控
+
+- 新增 runtime/reconcile.ts 与 archive/store.ts 的 epoch/page/eligible 原子业务 API，保留前期 T4-1/T4-2 的历史页证据和 SQLite v2 迁移。
+- 专项 mock：首次 120 条、51 条重连增量、无旧锚点、过滤行、头部变化、游标循环、空历史、超时、旧 epoch、页事务失败，以及最终 head_close 与 verified/eligible 同事务回滚。
+- Runner 的显式实验模式测试：可信会话完成初始对账并在重连后产生唯一资格；未知会话不会凭猜测 threadId 放行；没有发送或模型行为。
+- **待补 Gate**：真实 SDK 多页历史现场、T4 页事务 SIGKILL 前后真实子进程恢复、异步请求超时/断开细节、长期压力及风险限制。仍不勾 T4 完成，不提交 Git。
+
+### T4-4 补强：真实 SIGKILL、SDK 请求取消、恢复栅栏（2026-10-29）
+
+- 真正由 `spawnSync` 启动 Node 子进程并向自己发 SIGKILL；三个新场景：页 COMMIT 后强杀 → 页及消息存活、旧 epoch 不能续签；页事务中途强杀 → 消息/批次/页证据全部回滚；verified COMMIT 后强杀 → 锚点、页及 eligible 唯一约束存活，重启重扫不重复。
+- SDK 的 `readHistory` 没有可传入 AbortSignal 的真实取消接口。恢复器改为 `AbortSignal` 立即撤销 epoch 等待，但保留每个 Port 的 outstandingHistory 栅栏直到 SDK 请求实际 settle；新 epoch 在旧请求仍悬挂时返回 `history_request_still_pending`，绝不重叠拉历史，迟到响应只清空栅栏、不再写 SQLite。
+- Runner 在 Session offline/reconnecting、pause、stop、SIGINT/SIGTERM 时 abort 当前 epoch；stop 测试证明即使 SDK 历史 Promise 永不 resolve，运行进程仍能有界停止，迟到返回无法写入已关闭的库。
+- 头部闭合进一步要求 ID 序列、返回 cursor、hasMore 三者一致；同页重复 serverMessageId 拒绝 coverageProof。之前 Mock 集成测试把同一个事件重复塞进历史页，新的拒绝是正确行为；已修正 fixture，不降低 Contract。
+- 增加 `EveArchive.invalidateCurrentCoverage()`：仅 T4 v2 模式下在启动、重连及停止时将当前 `verified/reconciling` 状态关闭为 `unverified`，取消未完成 epoch，同时保留历史已验证锚点及已归档消息；重启必须重新对账才能恢复当前放行。
+- 自动测试新增 T4 SIGKILL 3、SDK 超时/停止 2、头部元数据/重复 ID 2、重启栅栏 1。全部只使用临时 SQLite、虚构 UID，不触及真实 SDK 账号，不发送私信。
+- **剩余 Gate**：未执行真实平台 T4 多页历史现场验收；SDK 网络底层不可取消，悬挂请求可能需要平台连接断开或重启进程，需验证持续性/资源压力；首轮边界证明依赖 SDK 可检索历史，不能保证平台已删除或不可见消息绝对可恢复；正式启用前应备份真实业务库并检查 v2 升级影响。不宣布 T4 结束。
+
+### T4-4 全量回归结果（2026-10-29）
+
+- `cd app && pnpm typecheck`：0 错；`pnpm test`：**99/99 全绿，fail=0**（从上轮 91/91 增加 8 项故障/边界测试）；`git diff --check`：通过。
+- 覆盖的三类本轮新增负例：真正 SIGKILL 的对账页提交前/后与 verified 后恢复（3）；SDK 悬挂请求 abort/旧请求拒重叠、Runner stop 后迟到响应（2）；头页返回 cursor/hasMore 变化、单页重复 ID、跨重启保留锚点但关闭当前 verified 栅栏（3）。
+- 有一次集成测试失败源于旧 Mock 将同一 serverMessageId 同时放入两条历史行；新增唯一性检查拒绝该页是正确结果。已修正历史 fixture，保持历史页检查严格，完整回归全绿。
+- **T4 仍未通过全部现场 Gate**：真实 SDK 多页历史联调及高负载/长期资源压力尚未量化；仍只提供实验开关，运行前需备份真实业务库；没有模型、没有发送。工作区未提交。
+
+### T4-5：资源上限、SDK 本地会话回退与现场只读探针（2026-10-29）
+
+- 新增 `app/test/archive/reconcile-load.test.ts` 4 项：600 条/12 个 older 页加头页闭合可完整归档，重扫消息不重复；`maxPages=3` 最多发 3 次请求且旧数据保留、gate=gap；`maxMessages=105` 在第三页入库前拒绝、只留下已提交的 100 条；`maxDurationMs` 超时不能推进水位。仅用 100% 虚构历史数据。
+- 新增 `app/test/platform/douyin-readonly.test.ts` 两项：SDK `getStrangerList()` 本地联系人投影可恢复目标线程的 Contact；返回错误 thread 或非白名单线程必须拒绝，不调用其 getHistory。仅在 Contact 已由 SDK 提供且 UID/threadId 都匹配时读取；不拼造地址。
+- 新增 `app/scripts/t4-live-history.ts`：默认禁用，须 `EVE_T4_READONLY_PROBE=1` 且在单实例 flock 与 26 秒超时保护下运行。只读打开原 Eve SQLite 获取唯一已归档会话；最多历史 3 页、页间隔 750ms、不输出 UID/游标/正文、不写 Eve 库，不执行消息发送、已读或 AI。
+- 真实现场探针：账号登录/身份核验已通过，无 QR、session_rejected、verification_required；**readHistory 阶段失败**（脱敏为 `sdk_or_session_failure`/`Error`），未成功读到任何可证明的历史分页。加入 SDK 本地陌生人投影后再次现场检查仍在 history 阶段失败。根因尚不能确定：可能是目标 Contact 未绑定，或底层 SDK 会话地址 / 历史接口拒绝，**不把猜测写成证据**。已停止进一步真实网络重试。
+- 复查官方运行数据目录：Eve 归档 schema 仍为 v1，唯一会话仍在；探针仅以 SQLite `readOnly:true` 读取业务库，未执行数据库 v2 升级或归档写入。
+- 本轮 `pnpm typecheck` 0 错、`node --check scripts/t4-live-history.ts` 通过、`pnpm test` **105/105 全绿**（上轮 99，新增 6），`git diff --check` 通过。状态：**T4 离线负载与边界已通过，真实 SDK 历史分页验收仍未通过；不进入 T5，不提交 Git**。
+- 后续定位：在本地授权会话内先分辨 SDK 是否存在准确的目标 Contact，再区分 `prepareAddress()` 与 `getMessages()` 的失败；诊断必须只打印稳定原因码，禁止回显 UID、会话标识、token、原始 SDK 错误或正文。需要真实 SDK 读取成功以及至少两页合法历史的现场证据才能关闭 T4-5 Gate。
+
+### T4-5 追加诊断：真实失败点从通用 history 缩至 SDK Contact 缺失（2026-10-29）
+
+- 只读现场探针已按顺序确认：登录身份通过、没有 QR/session_rejected/verification_required；异常前安全回调最后记录 `history_local_contact_missing`，即缓存/SDK 本地陌生人投影均**未提供 UID 和 threadId 双重匹配的 Contact**，因此尚未执行 `Contact.getHistory()`、没有发起真正的历史消息分页请求；不再笼统归类为“历史接口失败”。
+- 新增 `onHistoryDiagnostic` 安全回调：仅允许固定阶段码，不暴露 SDK Contact、真实 UID、会话/短会话 ID、游标、原始异常、正文或凭据；探针输出 `historyDiagnostic` 和短 ID 提示缺失的布尔值。未知 SDK 异常统一转 `history_sdk_throw`，接口非零转 `history_sdk_nonzero`。调用方不会取得可能含私密信息的原始异常。
+- 已核对 SDK 源码与当前已安装类型：目标 `getHistory` 依赖 SDK 绑定的 `Contact`，本地 `getStrangerList()` 仅投影已同步记录。SDK 提供 `refreshStrangerConversations()`，但会批量拉取其他会话与消息，不满足项目唯一白名单最小访问原则；**不自动调用**，也不以归档中的 threadId 手工构造联系人或短 ID。
+- 新增两项离线测试：SDK 已绑定目标联系人可直接历史读取（不扫描其他联系人）；SDK 抛出含模拟敏感令牌的异常/非零状态仅返回稳定诊断码（测试日志中无模拟令牌）。另外现有本地投影 fixture 补充了 SDK 公开 Contact 必填字段，不放宽 thread/UID 规则。
+- **现场 Gate 仍未过**：必须在 SDK 正式绑定已授权目标 Contact 后重新限页只读探测，观察多页 `hasMore/cursor` 的真实链路；除非真实页链符合 Contract，不能标记 verified，也不能进入 T5。无需再次盲目试历史接口或做非目标会话批量同步。
+
+### T4-5 本轮诊断最终回归（2026-10-29）
+
+- 完整测试：`cd app && pnpm typecheck` 0 错；`pnpm test` **107/107 通过**，fail=0；`node --check scripts/t4-live-history.ts` 通过；`git diff --check` 通过。较上一轮 105 项增加 2 个诊断安全测试。
+- 真实登录已验证，历史仍是 **Contact 缺失**，未发起真正 getHistory 分页请求，故真实多页 Gate 不能关闭。
+- 正式 Eve SQLite `PRAGMA user_version=1`（未迁移）、只读探针无剩余进程，所有新改动仍未提交。注意检查进程数时 `grep` 零匹配返回 1，会导致整个 shell 组合命令返回 1；这不影响上述 typecheck/test/diff 的独立通过结论。
+- 本轮没有实际私信发送或 SDK 非目标历史批量读取。后续要从可信目标入站事件恢复 SDK Contact 后，才有资格进行真实历史分页验收；如果平台不再提供该 Contact，保持 gap/unverified 而不是制造 coverageProof。
+
+### T4-6 真实阻塞已解开：缺陷在实现，不在 SDK（2026-10-29）
+
+#### 根因（实现缺陷，非平台限制）
+
+上一轮结论「SDK 无法提供目标 Contact」不成立。复查 `node_modules/douyin-im/lib/sdk/account.js` 确认 SDK **同时**提供 `getFriendList()`（含完整分页，`count:100` 循环到 `hasMore=false`）与 `getStrangerList()`。
+
+而 `readHistory()` 的联系人回退路径**只刷新了陌生人列表**：目标若已是好友，`pickStranger()` 永远返回 undefined，于是必然落到 `history_local_contact_missing`。诊断码把它归因为「SDK 没有绑定」，实际是 dac 自己少查了一类。
+
+#### 修复
+
+`app/src/platform/douyin.ts` 的联系人回退改为：先 `getFriendList()` + `pickFriend()`，未命中再 `getStrangerList()` + `pickStranger()`。两类都查过仍无双重匹配才报 `history_local_contact_missing`。仍不构造会话地址、不调用 `refreshStrangerConversations()` 批量拉取其他会话。
+
+#### 真实只读探针结果（`scripts/t4-live-history.ts`，3 页上限）
+
+| 指标 | 实测 |
+|---|---|
+| 读取页数 | **3**（真实多页链路跑通） |
+| 原始条数 | **132** |
+| 排除条数 | **0**（无静默丢弃） |
+| `hasMultiplePages` | **true** |
+| `reachedHistoryEnd` | false（3 页上限内未到底，符合预期） |
+| `coverageClaim` | **none**（未冒充 verified） |
+| `sqliteModified` | **false** |
+| 正式库状态 | `user_version=1`、messages=1、batches=1 —— **完全未被改动** |
+| 残留进程 | 无 |
+
+#### 测试
+
+- 新增 2 条：目标为好友时经 `getFriendList` 绑定（并断言不再扫 stranger）、好友与陌生人皆无时才报 missing（并断言两类都查过）。
+- 修正 2 条既有测试：它们原按「只查 stranger」写死调用序列，现按新行为对齐；其中一条的 fake 补上 `getFriendList`（原先缺失会被 catch 成 `history_local_lookup_failed`）。
+- `pnpm typecheck` 0 错；`pnpm test` **109/109**。
+
+#### 仍未完成
+
+- 真实多页**未跑到历史末尾**（3 页上限），`coverageProof` 与 `verified` 水位的真实签发仍未验证。
+- 实验模式 `--experimental-reconcile` 会在真实库上触发 v1→v2 迁移与历史网络查询，**正式库仍保持 v1**，未在真实账号上启用。
+- 真实 SIGKILL 下的页事务恢复已在离线验证（子进程），但未在真实分页链上复测。
+
+**判定：T4 的真实阻塞已解除，真实多页分页链首次跑通；完整覆盖证明与水位签发仍待验证，T4 不标记通过。**

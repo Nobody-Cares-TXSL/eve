@@ -11,7 +11,7 @@ import { normalizeHistoryMessage } from '../../src/platform/history.ts';
 import type { InboundMessage, PlatformStatus } from '../../src/platform/types.ts';
 
 class FakeClient extends EventEmitter {
-  readonly account = { uid: '111', imUid: '222', online: true, pickFriend: () => undefined, pickStranger: () => undefined };
+  readonly account = { uid: '111', imUid: '222', online: true, pickFriend: () => undefined, pickStranger: () => undefined, resolveShortId: (_threadId:string,hint?:string) => hint };
   readonly accounts = [this.account];
   loginCalls = 0;
   logoutCalls = 0;
@@ -143,4 +143,166 @@ test('本机验证默认禁用；显式允许后才调用 SDK 的人工验证页
     assert.equal(opened, true);
     await interactive.stop();
   } finally { await rm(dir,{recursive:true,force:true}); }
+});
+
+test('T4-5: SDK 本地陌生人视图可恢复目标历史联系人，不拼接会话地址',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'eve-history-contacts-'));
+  const thread='0:1:222:333';
+  let scanned=0,historyCalls=0,bound=false;
+  const contact={
+    uid:'333',threadId:thread,conversationType:1,conversationShortId:'123456',
+    getHistory:async()=>{
+      historyCalls++;
+      return {statusCode:0,hasMore:false,cursor:'0',direction:'older' as const,messages:[{
+        threadId:thread,msgId:'7701260499833538097',senderUid:'333',content:'{"text":"mock"}',
+        msgType:7,createTime:123,indexInConversationV2:'9007199254740995',
+      }]};
+    },
+  };
+  const client=new FakeClient();
+  Object.assign(client.account,{
+    // 好友列表为空（目标不是好友），由陌生人视图恢复绑定
+    getFriendList:async()=>[],
+    pickFriend:()=>undefined,
+    getStrangerList:async()=>{scanned++;bound=true;return [contact];},
+    pickStranger:()=>bound?contact:undefined,
+  });
+  try{
+    const {port}=make(client,dir);
+    await port.start();
+    const page=await port.readHistory(thread);
+    assert.equal(scanned,1);
+    assert.equal(historyCalls,1);
+    assert.equal(page.messages.length,1);
+    assert.equal(page.messages[0]?.serverMessageId,'7701260499833538097');
+    assert.equal(page.excludedCount,0);
+    await port.stop();
+  }finally{await rm(dir,{recursive:true,force:true});}
+});
+test('T4-5: SDK 只返回错误 thread 时不允许读取，非白名单在触发本地投影前拒绝',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'eve-history-foreign-'));
+  let friendScans=0,strangerScans=0,reads=0;
+  const contact={uid:'333',threadId:'0:1:222:444',getHistory:async()=>{
+    reads++;throw Error('not_allowed');
+  }};
+  const client=new FakeClient();
+  Object.assign(client.account,{
+    getFriendList:async()=>{friendScans++;return [];},
+    pickFriend:()=>undefined,
+    getStrangerList:async()=>{strangerScans++;return [contact];},
+    pickStranger:()=>contact,
+  });
+  try{
+    const {port}=make(client,dir);await port.start();
+    await assert.rejects(port.readHistory('0:1:222:444'),/白名单/);
+    assert.equal(friendScans+strangerScans,0,'非白名单必须在任何本地投影前拒绝');
+    await assert.rejects(port.readHistory('0:1:222:333'),/目标会话尚未由 SDK 绑定/);
+    // SDK 只给出错误 thread（444 而非 333）：好友与陌生人都查过但都未命中
+    assert.equal(friendScans,1);
+    assert.equal(strangerScans,1);
+    assert.equal(reads,0);
+    await port.stop();
+  }finally{await rm(dir,{recursive:true,force:true});}
+});
+
+test('T4-5: 目标是好友时通过 getFriendList 绑定，不得只查 stranger 列表',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'eve-history-friend-'));
+  const thread='0:1:222:333';
+  let friendScans=0,strangerScans=0,reads=0;
+  const contact={
+    uid:'333',threadId:thread,conversationType:1,conversationShortId:'123456',
+    getHistory:async()=>{reads++;return {statusCode:0,hasMore:false,cursor:'0',direction:'older' as const,messages:[]};},
+  };
+  const client=new FakeClient();
+  // 模拟 SDK 的真实时序：好友列表尚未加载时 pickFriend 为空，getFriendList 后才可命中
+  let loaded=false;
+  Object.assign(client.account,{
+    // 好友列表命中；stranger 列表为空——旧实现只看 stranger 会误报 contact_missing
+    getFriendList:async()=>{friendScans++;loaded=true;return [contact];},
+    pickFriend:()=>loaded?contact:undefined,
+    getStrangerList:async()=>{strangerScans++;return [];},
+    pickStranger:()=>undefined,
+  });
+  try{
+    const {port}=make(client,dir);await port.start();
+    const page=await port.readHistory(thread);
+    assert.equal(page.statusCode,0);
+    assert.equal(friendScans,1,'必须查询好友列表');
+    assert.equal(reads,1,'好友绑定后必须能读到历史');
+    assert.equal(strangerScans,0,'好友命中后不应再扫陌生人列表');
+    await port.stop();
+  }finally{await rm(dir,{recursive:true,force:true});}
+});
+
+test('T4-5: 好友与陌生人都没有该会话时才报 contact_missing，且两类都查过',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'eve-history-none-'));
+  const thread='0:1:222:333';
+  let friendScans=0,strangerScans=0;
+  const client=new FakeClient();
+  Object.assign(client.account,{
+    getFriendList:async()=>{friendScans++;return [];},
+    pickFriend:()=>undefined,
+    getStrangerList:async()=>{strangerScans++;return [];},
+    pickStranger:()=>undefined,
+  });
+  try{
+    const {port}=make(client,dir);await port.start();
+    await assert.rejects(port.readHistory(thread),/目标会话尚未由 SDK 绑定/);
+    assert.equal(friendScans,1);
+    assert.equal(strangerScans,1);
+    await port.stop();
+  }finally{await rm(dir,{recursive:true,force:true});}
+});
+
+test('T4-5: SDK 已绑定目标 Contact 时直接读取历史，不触发全局联系人扫描',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'eve-history-bound-'));
+  let scans=0,reads=0;
+  const thread='0:1:222:333';
+  const contact={
+    uid:'333',threadId:thread,conversationType:1,conversationShortId:'123456',
+    getHistory:async()=>{reads++;return {statusCode:0,hasMore:false,cursor:'0',direction:'older' as const,messages:[]};},
+  };
+  const client=new FakeClient();
+  Object.assign(client.account,{
+    pickStranger:()=>contact,
+    getStrangerList:async()=>{scans++;return []},
+  });
+  const codes:string[]=[];
+  try{
+    const port=new DouyinReadOnlyPort({dataDir:dir,selfUid:'111',targetUid:'333',
+      client:client as unknown as Client,onHistoryDiagnostic:code=>codes.push(code)});
+    port.subscribe({onMessage:()=>{},onStatus:()=>{}});
+    await port.start();
+    const page=await port.readHistory(thread);
+    assert.equal(page.statusCode,0);
+    assert.equal(reads,1);assert.equal(scans,0);
+    assert.deepEqual(codes,['history_cached_contact','history_contact_bound','history_sdk_start','history_success']);
+    await port.stop();
+  }finally{await rm(dir,{recursive:true,force:true});}
+});
+test('T4-5: SDK 历史抛错或非零状态只产生固定诊断码，不泄露原始错误',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'eve-history-redacted-'));
+  const thread='0:1:222:333';
+  let mode:'throw'|'nonzero'='throw';
+  const contact={uid:'333',threadId:thread,conversationType:1,conversationShortId:'123456',
+    getHistory:async()=>{
+      if(mode==='throw')throw new Error('SECRET_ACCOUNT_TOKEN_SHOULD_NOT_LEAK');
+      return {statusCode:403,statusMsg:'SECRET_ACCOUNT_TOKEN_SHOULD_NOT_LEAK',hasMore:false,cursor:'0',direction:'older',messages:[]};
+    }};
+  const client=new FakeClient();
+  Object.assign(client.account,{pickStranger:()=>contact});
+  const codes:string[]=[];
+  try{
+    const port=new DouyinReadOnlyPort({dataDir:dir,selfUid:'111',targetUid:'333',
+      client:client as unknown as Client,onHistoryDiagnostic:code=>codes.push(code)});
+    port.subscribe({onMessage:()=>{},onStatus:()=>{}});
+    await port.start();
+    await assert.rejects(port.readHistory(thread),/history_sdk_throw/);
+    assert.ok(!codes.join('|').includes('SECRET_'));
+    assert.equal(codes.at(-1),'history_sdk_throw');
+    mode='nonzero';
+    await assert.rejects(port.readHistory(thread),/history_sdk_nonzero/);
+    assert.equal(codes.at(-1),'history_sdk_nonzero');
+    await port.stop();
+  }finally{await rm(dir,{recursive:true,force:true});}
 });

@@ -111,3 +111,15 @@
 - **AC-T3.7 崩溃恢复**：真实子进程 `SIGKILL`（非模拟异常）后，已提交批次完整存活、可继续写入且不重复；事务在 `COMMIT` 前被强杀时不得留下任何半提交行；`journal_mode` 实测为 `wal`。
 - **AC-T3.8 回调边界**：`EveArchive.open()` 及其他同步 DB 调用不得出现在 SDK 事件回调栈内（Contract §1）；身份记录可为纯数据，但建库必须在 `await port.start()` 之后的主流程完成。
 - **AC-T3.9 真实现场归档**：一次真实只读运行中，目标账号真实私信必须写入 `eve.sqlite`，`server_message_id` 保持 19 位字符串，`from_self` 方向正确，`sync_state` 保持 `unverified`（live 不得冒充 verified），库文件 0600，优雅退出后数据持久。真实现场不作为自动化测试，不得把真实 UID/正文写入仓库。
+
+## T4 — 断线分页对账与可信恢复（Contract 草案阶段，AC 尚待冻结）
+
+- **AC-T4.1 SDK 分页可观测性**：读取每页保留 rawCount / acceptedCount / excludedCount+分类、请求 cursor/方向、响应 cursor/方向、hasMore/statusCode；测试 SDK 的升序返回视图与 older 方向、自动排除当前 anchor、19 位 ID 与大游标均不丢精度。任何未解释的过滤都不得生成完整性证明。
+- **AC-T4.2 真实多页补收**：以 mock >50 条（至少 51、120）跨页恢复，只有实际遇到旧持久锚点重叠，或首次完整扫描至 hasMore=false 终点，并通过头部闭合检查才可 verified；不足 50 条、单次空页、SDK 缓存命中和猜测游标均不能独立作为完成条件。
+- **AC-T4.3 不前进与异常页**：hasMore=true 但 cursor 自循环/往返、空页连发、非零状态、错方向、相同 ID 冲突、被丢弃历史行/缺 ID、无法找到旧锚点时必须留下 gap/ambiguous，不能死循环，也不能继续 AI 处理。
+- **AC-T4.4 实时与历史交错**：重连乱序、重复 WS 推送与分页重叠必须按 (conversation_id,server_message_id) 合并；分页期间新消息到达时头页需再次闭合，不能漏掉并发窗口；index 只作线索，不能按固定差值推断丢消息条数。
+- **AC-T4.5 v1→v2 事务迁移**：新增 epoch/page/eligible 结构不破坏 T3 旧记录；schema_version/user_version 同步，升级中 SIGKILL/失败回滚，未来版本拒绝，备份保护且不得写入 Git。对账页数据+游标证据+最终水位与 eligible 同事务一致性可被故障注入验证。
+- **AC-T4.6 Proof 与处理门控**：只有由同一有效 epoch、已提交分页链、旧锚点/初次终点、头页闭合和 pending gap/ambiguous 数为 0 共同支撑的 coverageProof 才可写 verified；伪造 proof、旧 PID proof、运行中 stop/reconnecting 不可放行；eligible 每服务器事件最多一条，T4 不调用模型和 send。
+- **AC-T4.7 重启与进程崩溃**：在单页事务提交前、后分别 SIGKILL；不留半页/错误水位；新进程需重新验证 epoch，旧 cursor/旧证明不能直接推进 verified；所有已确定消息可通过 ID 匹配重放且不产生重复 eligible。
+- **AC-T4.8 账号与安全**：SDK 登录 UID/IM UID、会话和目标白名单始终准确；历史不得接受群或非目标账号消息。日志不打印消息正文、真实 UID、挑战 URL；只读联调不得发送/标记已读；无法判定历史完整时明确呈现缺口而不声称“零丢失”。
+- **AC-T4.9 有界资源**：页数/总消息/总耗时/重试次数均有明确上限和失败状态，持续新增消息、半开连接或慢响应不能无限持锁/无限扫描，不能因此放宽 verified 的条件。
