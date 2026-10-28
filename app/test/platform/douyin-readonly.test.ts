@@ -69,6 +69,25 @@ test('登录已失效时状态转移并封锁只读查询', async () => {
     await port.stop();
   } finally { await rm(dir,{recursive:true,force:true}); }
 });
+test('logout 在账号确已 offline 时 reject 视为正常停机；仍 online 时不得吞掉', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'eve-t1-'));
+  try {
+    // 情形一：账号已离线，SDK 仍 reject —— T1 观察到的真实情况，必须视为正常停止
+    const offline = new FakeClient();
+    offline.logout = async function (this: FakeClient) { this.logoutCalls++; this.account.online = false; throw new Error('already_offline'); };
+    const a = make(offline, dir);
+    await a.port.start();
+    await a.port.stop();               // 不得抛出
+    assert.equal(offline.logoutCalls, 1);
+
+    // 情形二：logout 失败且账号仍 online —— 无法确认退出，必须抛出交由上层判码 1
+    const stillOnline = new FakeClient();
+    stillOnline.logout = async function (this: FakeClient) { this.logoutCalls++; throw new Error('logout_failed'); };
+    const b = make(stillOnline, dir);
+    await b.port.start();
+    await assert.rejects(b.port.stop(), /logout_failed/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
 test('历史消息仅明确文本可变为 text，分享标题不得冒充', () => {
   const base = {threadId:'0:1:222:333',msgId:'99',senderUid:'333',content:'{"text":"hello"}',msgType:7,createTime:123456,status:0};
   assert.equal(normalizeHistoryMessage(base,new Set(['111','222']))?.kind,'text');

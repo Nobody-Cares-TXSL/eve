@@ -1,0 +1,163 @@
+import {randomUUID} from 'node:crypto';
+import {readFile} from 'node:fs/promises';
+import {join} from 'node:path';
+import {readState,writeState,paths,initDirs,processStart,BLOCKED,readJson,listRequests,atomicJson,removeFile,type RuntimeState,type Phase,type Paths} from './state.ts';
+import {BoundedQueue} from './queue.ts';
+import type {PlatformPort,PlatformSink} from '../platform/types.ts';
+import type {RuntimeConfig} from './config.ts';
+
+export type Action = 'pause'|'resume'|'stop';
+export interface ControlRequest { readonly id:string; readonly instanceId:string; readonly action:Action; readonly at:number; }
+const actions = new Set(['pause','resume','stop']);
+function validControl(x: unknown): x is ControlRequest {
+  if (!x || typeof x !== 'object' || Array.isArray(x)) return false;
+  const v=x as Record<string,unknown>;
+  return typeof v['id']==='string' && /^[a-f0-9-]{36}$/.test(v['id']) &&
+    typeof v['instanceId']==='string' && actions.has(String(v['action'])) && typeof v['at']==='number';
+}
+async function ackExists(p: Paths, id: string): Promise<boolean> {
+  try { await readFile(join(p.acks,id+'.json'),'utf8'); return true; }
+  catch(e) { if ((e as NodeJS.ErrnoException).code==='ENOENT') return false; throw e; }
+}
+export class Runner {
+  private readonly id=randomUUID();
+  private readonly p:Paths;
+  private s:RuntimeState;
+  private readonly q:BoundedQueue<unknown>;
+  private stopping=false;
+  private faulted=false;
+  private active=false;
+  private blockPending: Promise<void> | undefined;
+  private messages=0;
+  private readonly processed=new Set<string>();
+  private wake: (()=>void)|undefined;
+  private readonly port:PlatformPort;
+  private readonly config:RuntimeConfig;
+  constructor(root:string, port:PlatformPort, config:RuntimeConfig) {
+    this.port=port;this.config=config;
+    this.p=paths(root);
+    this.s={phase:'starting',instanceId:this.id,pid:process.pid,processStart:processStart(process.pid),
+      updatedAt:Date.now(),reason:''};
+    this.q=new BoundedQueue(config.queueCapacity,async()=>{this.messages++;},reason=>{void this.block('paused_env',reason);});
+  }
+  private async set(phase:Phase,reason=''):Promise<void> {
+    this.s={...this.s,phase,reason,updatedAt:Date.now()};
+    await writeState(this.p,this.s);
+  }
+  private block(phase:'paused_auth'|'paused_risk'|'paused_env'|'paused_unknown',reason:string):Promise<void> {
+    if (this.blockPending) return this.blockPending;
+    if (this.faulted || this.stopping) return Promise.resolve();
+    this.faulted=true;
+    this.q.pause();
+    // run() 退出前必须 await 这个 promise：否则返回码读到的是落盘前的 phase。
+    this.blockPending=(async()=>{
+      try {await this.set(phase,reason);}catch{this.faulted=true;}
+      this.wake?.();
+    })();
+    return this.blockPending;
+  }
+  private readonly sink:PlatformSink={
+    onMessage:message=>{
+      if (this.stopping || this.faulted || BLOCKED.includes(this.s.phase)) return;
+      this.q.push(message);
+    },
+    onStatus:status=>{
+      if (status.type==='session_rejected') void this.block('paused_auth','session_rejected');
+      else if (status.type==='verification_required' && !this.config.allowLocalVerification)
+        void this.block('paused_risk','verification_required');
+    },
+  };
+  private async ack(req:ControlRequest,ok:boolean,reason=''):Promise<void> {
+    await atomicJson(join(this.p.acks,req.id+'.json'),{id:req.id,instanceId:this.id,ok,reason,phase:this.s.phase});
+    await removeFile(join(this.p.requests,req.id+'.json'));
+  }
+  private async controls():Promise<void> {
+    const names=await listRequests(this.p);
+    const pending:ControlRequest[]=[];
+    for(const name of names) {
+      const full=join(this.p.requests,name);
+      let value:unknown;
+      try {value=await readJson(full);} catch {await removeFile(full);continue;}
+      if (!validControl(value) || value.id+'.json'!==name) {await removeFile(full);continue;}
+      if (value.instanceId!==this.id) {await this.ack(value,false,'old_instance');continue;}
+      pending.push(value);
+    }
+    pending.sort((a,b)=>(a.action==='stop'?0:a.action==='pause'?1:2) -
+      (b.action==='stop'?0:b.action==='pause'?1:2) || a.at-b.at);
+    for(const req of pending) {
+      // 幂等三层：内存 processed 挡同进程重复轮询；已存在的 ack 挡跨重启/文件重建
+      // 的重放（不重新执行已完成语义的请求）；不同实例由上方 instanceId 校验拒绝。
+      if (this.processed.has(req.id) || await ackExists(this.p,req.id)) {
+        this.processed.add(req.id);
+        await removeFile(join(this.p.requests,req.id+'.json'));
+        continue;
+      }
+      this.processed.add(req.id);
+      if (this.stopping) {await this.ack(req,false,'stopping');continue;}
+      if (req.action==='stop') {
+        this.stopping=true;this.q.pause();await this.set('stopping','stop_requested');
+        await this.ack(req,true);this.wake?.();
+      } else if (this.faulted) await this.ack(req,false,'blocked');
+      else if (req.action==='pause') {
+        this.q.pause();await this.set('paused_manual','manual');await this.ack(req,true);
+      } else if (this.s.phase==='paused_manual') {
+        await this.set('running');this.q.resume();await this.ack(req,true);
+      } else await this.ack(req,false,'not_paused');
+    }
+  }
+  async run():Promise<number> {
+    await initDirs(this.p);
+    const prev=await readState(this.p);
+    if (prev && BLOCKED.includes(prev.phase)) return 3;
+    this.port.subscribe(this.sink);
+    let closeFail=false;
+    let pendingAtStop=0;
+    const signal=()=>{if (this.stopping) return;this.stopping=true;this.q.pause();this.wake?.();};
+    process.on('SIGINT',signal);
+    process.on('SIGTERM',signal);
+    try {
+      await this.set('starting');
+      // A signal during initial SDK login must not leave an active connection after stop.
+      await this.port.start();
+      if (!this.stopping && !this.faulted) {await this.set('running');this.q.resume();}
+      while(!this.stopping && !this.faulted) {
+        await this.controls();
+        if(this.stopping || this.faulted) break;
+        this.s={...this.s,updatedAt:Date.now()};await writeState(this.p,this.s);
+        await new Promise<void>(resolve=>{
+          this.wake=resolve;
+          setTimeout(()=>{if(this.wake===resolve)this.wake=undefined;resolve();},this.config.pollMs);
+        });
+      }
+    } catch {
+      if (!this.faulted && !this.stopping) {
+        this.faulted=true;
+        await this.set('error','runtime_failure').catch(()=>undefined);
+      }
+    } finally {
+      process.off('SIGINT',signal);process.off('SIGTERM',signal);
+      this.stopping=true;
+      // 故障阻塞的落盘可能仍在飞行中（溢出/拒登录都是同步触发）：
+      // 必须等它完成，否则返回码与状态文件会读到落盘前的 phase。
+      await this.blockPending?.catch(()=>undefined);
+      pendingAtStop=this.q.length;
+      await this.q.stop();
+      // SDK offline after rejected logout is still a completed shutdown: T1 observed this case.
+      try {await this.port.stop();}
+      catch {closeFail=true;}
+      this.wake=undefined;
+    }
+    if (this.faulted) return BLOCKED.includes(this.s.phase)?3:1;
+    if (pendingAtStop>0) {
+      await this.set('paused_env','undrained_queue_requires_reconciliation');return 3;
+    }
+    if (closeFail) {
+      // Cannot generally prove SDK is offline from PlatformPort.stop rejecting.
+      // Rejecting stop is not silently treated as clean; follow-up T2 exit semantics check.
+      await this.set('error','shutdown_unconfirmed').catch(()=>undefined);
+      return 1;
+    }
+    await this.set('stopped','normal_stop');
+    return 0;
+  }
+}

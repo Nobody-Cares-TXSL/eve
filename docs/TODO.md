@@ -44,11 +44,11 @@
 
 ### T2 — TS CLI、可暂停的事件消费者与故障状态
 
-- [ ] T2-1：实现 TS 配置校验、doctor --json、status、run、pause/resume/stop、日志脱敏；CLI 合约在开发前确认。
-- [ ] T2-2：SDK 回调只投递到**有界队列**；单消费者顺序处理，暂停后禁止新业务消费；规定队列满时背压/安全暂停和历史补收。
-- [ ] T2-3：状态文件区分进程存活与业务阻塞原因，paused_unknown、paused_auth 不得被 PID 死亡覆盖为普通 stopped。
-- [ ] T2-4：验证控制请求幂等、单实例、SIGTERM 优雅停机和 SIGKILL 重启恢复；退出码与 systemd 策略一致。
-- **Gate**：三种配置场景 + 两实例测试 + pause/resume 同 PID + SIGKILL 后阻塞原因不丢；关闭时不会继续执行队列发送。
+- [x] T2-1：实现 TS 配置校验、doctor --json、status、run、pause/resume/stop、日志脱敏；CLI 合约在开发前确认。
+- [x] T2-2：SDK 回调只投递到**有界队列**；单消费者顺序处理，暂停后禁止新业务消费；规定队列满时背压/安全暂停和历史补收。
+- [x] T2-3：状态文件区分进程存活与业务阻塞原因，paused_unknown、paused_auth 不得被 PID 死亡覆盖为普通 stopped。
+- [x] T2-4：验证控制请求幂等、单实例、SIGTERM 优雅停机和 SIGKILL 重启恢复；退出码与 systemd 策略一致。
+- **Gate**：三种配置场景 + 两实例测试 + pause/resume 同 PID + SIGKILL 后阻塞原因不丢；关闭时不会继续执行队列发送。**已达成（55/55，见 docs/TODO-GATES.md T2 段）**
 
 ### T3 — Eve SQLite 消息归档（不接 AI）
 
@@ -108,6 +108,6 @@
 
 ## 当前下一步
 
-**R-01～R-04 与 T0 已完成（证据见 docs/TODO-GATES.md）。下一步：T1 Platform Adapter，仍一次一个 Slice。** 下一次开始编程前先完成：本 Slice 的四问、Contract、可重复 AC、测试设计、理解关口。通过后才勾选，未完成任务不提前标记完成。
+**R-01～R-04、T0、T1、T2 已完成（证据见 docs/TODO-GATES.md）。下一步：T3 归档 Contract（`docs/contracts/archive.md` 先行），仍一次一个 Slice。** 下一次开始编程前先完成：本 Slice 的四问、Contract、可重复 AC、测试设计、理解关口。通过后才勾选，未完成任务不提前标记完成。
 
 **当前最重要的边界**：SDK 已验证的是可行性，不是 Eve 整体完成；不修改上游账号凭证，不在未经准备的情况下触发真实自动发送。

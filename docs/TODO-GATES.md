@@ -119,3 +119,59 @@ pnpm test
   - 扫码成功后 QR 文件删除的现场证据（见上）。
   - T2-4 退出码异常修复（见上）。
   - 真实断线重连与 `getHistory` 分页对账 —— 属 T4，T1 未做。
+
+## T2 — 第一轮代码与 mock 子进程验证（未完成，2026-10-28）
+
+- 实现范围：`app/src/runtime/{config,state,queue,doctor,runner}.ts`、`app/src/cli.ts`、`app/test/runtime/*`；`app/package.json` 新增 `pnpm dac`；`docs/contracts/t2-runtime.md` 与 `docs/AC-TS.md` 新增 Contract/AC。
+- 本轮验证：`pnpm typecheck` 通过；`pnpm test` **38/38**（含真实进程的锁、pause/resume 同 PID、stop、doctor JSON、业务阻塞）。独立子进程现场：第二个 `run --mock` 返回 `4`；`pause`、`resume`、`stop` 均得到 ack；stop 主进程退出码 `0`。
+- 独立信号验收：SIGINT → 退出码 0/stopped；SIGTERM → 退出码 0/stopped；SIGKILL → 保留 running，status 返回 stale=true。退出码来自子进程 `wait()`，不是 tee 管道码。
+- 只读安全：T2 runner 只调用 T1 只读 Port，队列消费者仅计数；未接 AI、未接 sendMsg，未运行真实抖音连接或发送。
+- 已发现并修复：原 `BoundedQueue` 和 `Runner` 参数属性不兼容 TS erasableSyntaxOnly；定时器 `unref` 会让 mock run 在无其他句柄时自行退出；unblock 必须检查真实进程身份而非仅靠心跳；停机时有未消费队列须保守进入 paused_env；T1 Port 已离线但 SDK logout reject 的处理现在仅在账号确实 offline 时视为正常。
+- **未通过的 Gate，不得勾选 T2 全部完成**：①控制请求重放、并发竞争与 stop 优先级压力测试；②队列溢出→持久化 paused_env→进程码 3 的完整子进程链；③真实 SDK logout 异常前后状态的故障注入测试；④ SIGKILL 后复跑和持久状态人工解除的更完整场景；⑤ doctor 全部 D1~D11 的强诊断实义检查（本版部分为阶段性提示，不得称完成）；⑥文件系统不可信符号链接和状态文件篡改测试；⑦真实运行只读配置与连接的回归验证。
+- **状态**：T2 已开始，基础实现与核心 mock 链路可复现；未提交 Git，暂不进入 T3。
+
+## T2 第二轮补强（2026-10-28，追加，不回改上条历史）
+
+上条 7 项未通过 Gate 的处置结果。
+
+### 已补证（可重复自动化）
+
+| Gate | 覆盖 | 证据 |
+|---|---|---|
+| ①控制重放/竞争/stop 优先级 | `test/runtime/controls.test.ts` 6 条 | 重放不二次执行、stop 与 pause 同轮 stop 优先且 pause 得 `stopping`、`old_instance` 拒绝、伪造文件名拒绝 |
+| ②队列溢出→paused_env→码 3 | 同上 | capacity=1 推 3 条 → `paused_env` + reason 含 overflow + 退出码 3 |
+| ③SDK logout 异常故障注入 | controls 1 条 + `douyin-readonly.test.ts` 1 条 | Port 侧：已 offline 时 reject 视为正常停机；仍 online 时抛出交上层判码 1；Runner 侧：reject → `error/shutdown_unconfirmed` + 码 1 |
+| ⑤doctor 强诊断 | `test/runtime/doctor.test.ts` 4 条 | D10 因 `sendMsg` 转 fail、D9 因 0755 转 warn、D3 因 `.py` 转 fail、D4/D8 缺配置 fail、输出不回显 UID |
+| ⑥不可信文件系统 | `test/runtime/fs-untrusted.test.ts` 4 条 | 请求符号链接不被执行且外部文件不变、状态文件被换成链接时不写穿、文件名与 id 不一致拒绝、非法 JSON 丢弃不阻塞 |
+| ⑦真实只读回归 | 人工执行一次 | `run --config <真实配置>` 进入 `running alive`；SIGTERM 后 `wait` 得**真实退出码 0**、状态 `stopped/normal_stop`；全程 SDK 静默无正文日志；`sendMsg` 仅出现在注释与检查器模式中 |
+
+### 本轮修复的真实缺陷（如实记录）
+
+1. **故障落盘竞态**：`block()` 的落盘是异步的，`run()` 可能在 phase 仍是 `starting` 时就返回码 3。改为 `blockPending` promise 并在退出前 join。
+2. **doctor 自指误报**：D10 扫描 `src/` 会把 `doctor.ts` 自身的检测正则扫进去。检查器现在跳过自身文件。
+3. **测试孤儿进程**：CLI 集成用例只 SIGKILL wrapper，留下 flock 派生的 `--locked` 孙进程（实测残留 2 个）。改为 SIGTERM → 等 3s → SIGKILL，再按 `--state-dir` 兜底清理。
+4. **时间敏感断言不稳定**：固定 `delay` 在高负载下偶发失败（实测 1/4）。全部改为轮询等待，`spawnSync` 预算 7s→20s、等待预算 3.6s→9s。
+
+### 验证结果（本阶段中间态）
+
+- `pnpm typecheck` 0 错；`pnpm test` **53/53**，连续 4 次并行运行全部通过，无孤儿进程残留。
+- 本轮新增测试（controls 6 / fs-untrusted 4 / doctor 4 / readonly +1），总数 38→53。
+
+### 第二轮后半：④ 与 ② 的子进程级补证
+
+| 项 | 做法 | 结果 |
+|---|---|---|
+| ② 队列溢出子进程链 | 新增 `app/scripts/fixtures/overflow-runner.ts`（capacity=1 推 3 条），由 `cli-integration.test.ts` 起真实子进程 | 退出码 **3**、`runtime.json` 为 `paused_env` 且 reason 含 `overflow` |
+| ④ SIGKILL 全链 | `SIGKILL → 状态保留 running → status 判 stale → 复跑接管 → pause → unblock 被拒（进程存活）→ stop → 码 0` | 全链通过（3.3s） |
+
+### 补证过程中又修掉的两个真实缺陷
+
+5. **`pgrep` 清理空转**：`spawnSync('pgrep', ['-f', '--state-dir '+dir])` 的 pattern 以 `--` 开头，被 pgrep 当作选项直接报错退出（status 2），**孤儿清理代码从未生效**。改用不带前导 `--` 的 pattern，并加 `ps` 复核只杀 `cli.ts run`，避免误伤测试自身。
+6. **SIGKILL 复跑误读旧状态**：新实例接管前，旧的 `running` 状态文件仍在，`waitForState('running')` 会立即返回旧值，导致随后的 `pause` 打到死实例上返回 2。改为等待 `instanceId` 变化。
+
+### 验证结果（第二轮终态）
+
+- `pnpm typecheck` 0 错；`pnpm test` **55/55**，连续 3 次并行运行全部通过，无孤儿进程残留。
+- 测试总数 38 → 55（controls 6、fs-untrusted 4、doctor 4、readonly +1、cli-integration +2）。
+
+**判定：T2 的七项 Gate 全部有可重复证据；④与②的子进程链已补。T2 可标记完成，进入 T3 前由操作者确认。**

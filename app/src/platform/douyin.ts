@@ -216,6 +216,9 @@ export class DouyinReadOnlyPort implements PlatformPort {
     this.recentQueue.length = 0;
     try {
       await this.client.logout();
+    } catch (error) {
+      // SDK 可能在已下线后仍 reject；只在确实全部离线时把它视为完成。
+      if (this.client.accounts.some(account => account.online)) throw error;
     } finally {
       this.active = undefined;
       await this.qr.remove();
