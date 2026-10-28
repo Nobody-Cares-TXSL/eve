@@ -353,3 +353,55 @@ pnpm test
 - 真实 SIGKILL 下的页事务恢复已在离线验证（子进程），但未在真实分页链上复测。
 
 **判定：T4 的真实阻塞已解除，真实多页分页链首次跑通；完整覆盖证明与水位签发仍待验证，T4 不标记通过。**
+
+### T4-7 真实历史终点 + 隔离影子库 coverageProof 现场验收（2026-10-29）
+
+- 基线 Git `bb5f735`，起始工作区干净。将 `app/scripts/t4-live-history.ts` 增加受控参数：最多 30 页、最长 120 秒、页间间隔上限 4 秒；本次显式使用 **24 页、90 秒、间隔 1 秒**，仍在单实例 `flock` 与操作系统进程 `timeout` 保护下运行。
+- **只读历史探针实测通过**：SDK 成功读取 4 页，原始消息 **132 条**、排除 **0**、`reachedHistoryEnd=true`、`hitPageLimit=false`、退出码 **0**；`coverageClaim=none`（仅探针，未尝试水位推进），Eve 正式数据库的 SQLite 文件及侧车文件前后 SHA-256 指纹未变化。这里的 `hasMore=false` 是 SDK 可检索范围的终点，不保证平台不可见/已删除消息不存在。
+- **真实 coverageProof 隔离演练通过**：新增 `app/scripts/t4-shadow-proof.ts`，默认禁用，须显式 `EVE_T4_SHADOW_PROOF=1`；真实授权账号在线，使用内存文件系统优先的私有临时目录（权限受限）创建独立 v2 SQLite，从 SDK 实际拉取历史，连接 `reconcileOnce()` 与 `EveArchive` 的完整事务链，网络读取每次间隔 1 秒且带 `maxPages=20/maxMessages=900/maxDurationMs=80000/readTimeoutMs=15000` 上限。最终 **5 次真实历史请求，归档 132 条，5 页证据（older 4 + head_close 1）、`sync_state=verified`、epoch verified、eligible 0**；退出码 0。临时库正常清理、正式 SQLite 文件指纹没有变化、正式库未升级。该 `verified` 仅存在于已清理的影子库，不是生产运行状态。
+- **保留的正式 Gate**：正式 Eve 数据库仍是 v1；未备份并在正式数据库执行 v1→v2 迁移；未在正式 Runner 实验模式下验收新实例的真实水位签发、断线/重启二次对账和停止后的门控关闭。正式 T4 仍不标记完成，不进入 T5，也没有发送消息、调用 AI 或修改远端已读状态。
+- 本轮探针/影子代码不得自动启动；开展正式 v2 迁移前需生成一致性的 SQLite 私有备份、校验备份身份/完整性与恢复步骤，且明确实验模式会在停止后关闭当前 verified 状态（历史锚点保留）。
+
+### T4-7 收束校验（2026-10-29）
+
+- `pnpm typecheck` 0 错；`pnpm test` **109/109 通过**、fail=0；两个现场探针均通过 `node --check`；`git diff --check` 通过。未修改 T4 核心恢复器算法，新增/修改仅为限页真实探针、隔离影子 proof 脚本和验证文档。
+- 正式 SQLite 在本轮之后再次只读核对：**user_version=1, messages=1, batches=1**，不受临时影子库 proof 的 v2 迁移影响；`SHADOW_TEMP_DIR_COUNT=0`、`LIVE_PROBE_ACTIVE=0`，没有遗留临时库或探针。
+- **待正式 Gate**：一致性私有备份、明确回滚路径、正式 Runner 使用原库完成 v1→v2 迁移及真实 proof、停止/重启断线后的门控校验。真实影子 proof 成功不自动授权生产 DB 升级。T4 保持未正式完成，工作区有本轮未提交改动。
+
+### T4-8 一致性备份与回滚方案（2026-10-29，本轮新增）
+
+正式库升级前的安全网。新增 `app/scripts/t4-backup.ts`（`backup` / `verify` / `rollback` 三个子命令）。
+
+#### 为什么用 `VACUUM INTO` 而不是复制文件
+
+WAL 模式下，已提交但未 checkpoint 的事务只在 `-wal` 里。裸复制 `.sqlite` 会得到缺数据或半写的副本。`VACUUM INTO` 在一个读事务内导出完整逻辑数据库，天然包含 WAL 内容。
+
+#### 正式库真实备份（已执行）
+
+| 项 | 实测 |
+|---|---|
+| 产物 | `data/backups/eve-v1-<timestamp>.sqlite`，53248 字节 |
+| 校验 | `v1 messages=1 meta=v1` |
+| SHA-256 | `aab6593f…d6824c` |
+| 权限 | 备份文件 0600、备份目录 0700 |
+| 源库 | `sourceUnchanged: true`，仍为 v1 / 1 条消息 |
+
+#### 完整往返演练（在副本上，不碰正式库）
+
+`v1` → `upgradeToV2()` → `v2 / messages=1 / 3 张 v2 表` → `rollback` → `v1 / messages=1 / 0 张 v2 表`。回滚前的当前库被另存为 `*.pre-rollback-<timestamp>`，不静默丢弃。
+
+#### 自动化测试（新增 4 条）
+
+备份一致性快照与权限、损坏/缺失备份被拒、v2 迁移后回滚往返、源库符号链接拒绝。
+
+#### 过程中修掉的脚本缺陷
+
+`fingerprint()` 原先把 `-wal`/`-shm` 计入「源库是否被改动」，但 SQLite 即使以 `readOnly` 打开也可能创建 shm 文件，导致误报 `source_changed_during_backup`。改为只对主库文件取指纹，主库是否改变由 `VACUUM INTO` 的读事务语义保证。
+
+#### 仍未完成
+
+- 正式库**尚未**执行 v1→v2 迁移；备份已就绪但迁移未做。
+- 正式 Runner 在实验模式下的真实水位签发、断线/重启二次对账、停止后门控关闭，均未在真实环境验收。
+- 备份保留策略、异地副本、定期校验未做（T9 范畴）。
+
+**判定：T4 正式升级的安全前置条件（备份 + 可验证回滚）已就绪；正式迁移与生产 Gate 仍未执行，T4 不标记完成。**

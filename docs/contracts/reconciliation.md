@@ -132,3 +132,20 @@ T4-1：完善 PlatformPort 历史页可观测性，覆盖 SDK 光标与过滤行
 - 2026-10-29 的只读诊断码为 `history_local_contact_missing`：已通过真实登录/身份门禁，但 SDK 已绑定联系人缓存与 `getStrangerList()` 本地投影都未找到与目标 UID/threadId 双重匹配的 SDK Contact，因此不能调用 `getHistory()`。此前笼统 `sdk_or_session_failure` 的归因已被缩小。**没有真实历史页证据。**
 - SDK `refreshStrangerConversations()` 的实现会从陌生人箱读取多条其他会话及其消息，不是只针对目标 UID 的精确查询。为了遵守单目标/最小访问 Contract，不自动调用，不能将归档 threadId/UID 填入人工构造的 `Stranger.bind`。待授权目标会话由 SDK 正常入站事件或可信同步恢复为真实 Contact 后，才能重试安全只读探针。
 - `onHistoryDiagnostic` 回调只返回固定白名单阶段码；原始异常、状态描述、Cookie、token、UID、正文永不穿越此诊断接口。未公开的 SDK 内部 `resolveShortId()` 不能被应用硬依赖，缺少短会话 ID 提示不等于 SDK 无法本地补全；作为诊断布尔值而非擅自拼造地址。
+
+## 14. 真实覆盖证明的隔离演练
+
+- 2026-10-29 真实 SDK older 分页已读取到 `hasMore=false`（共 4 页、132 条、零排除），但普通只读探针不签发 coverageProof。
+- 另以隔离临时 v2 SQLite 演练完整恢复器：older 分页 4 页 + 头部闭合 1 页；5 次真实历史请求后，所有 132 条成功归档，epoch/会话均 verified，eligible=0（首轮基线不得把旧消息直接变成待决策事件）。证明只适用于 SDK 可检索、已验收的历史窗口。
+- 此测试没有修改正式 v1 SQLite，不等于正式 Runner 上线验收。后续 v1→v2 的实际升级、备份及重启/断线门控需独立验证；停机不得将上次 verified 当作当前会话永久有效。
+
+## 15. 正式库升级前的备份与回滚
+
+正式 v1→v2 迁移前的强制前置条件。工具：`app/scripts/t4-backup.ts`。
+
+- **一致性来源**：必须用 `VACUUM INTO` 生成快照，不得裸复制 `.sqlite`。WAL 模式下未 checkpoint 的已提交事务只存在于 `-wal`，裸复制会得到缺数据或半写副本。
+- **只读源库**：备份进程以 `readOnly` 打开源库，不改写其内容；脚本对主库文件取 SHA-256 前后比对。`-wal`/`-shm` 不计入指纹——SQLite 以只读方式打开也可能创建 shm，计入会产生假警报。
+- **产物权限**：备份目录 0700、备份文件 0600，与正式库同级保护；备份本身属于敏感材料（含聊天正文）。
+- **备份校验**：生成后必须通过 `PRAGMA integrity_check`、`user_version ∈ {1,2}`、`archive_meta` 存在且身份一致、消息计数可读，才算可用；任一项失败即删除产物并报错。
+- **回滚语义**：`rollback` 前先校验备份可用；先把当前库另存为 `*.pre-rollback-<timestamp>`（不静默丢弃），删除旧 `-wal`/`-shm`，再用 `VACUUM INTO` 从备份重建目标库并复校，最后 0600/0700 收权。
+- **禁止项**：不得在未完成可用备份的情况下执行 v1→v2；不得用回滚替代迁移失败的事务回滚（两者互补：事务回滚处理运行中失败，备份处理迁移后发现问题或库损坏）。
