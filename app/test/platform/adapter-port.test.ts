@@ -37,7 +37,7 @@ test('状态事件透传（reconnecting 计数供 T4 消费）', () => {
   const statuses: PlatformStatus[] = [];
   port.subscribe({ onMessage: () => {}, onStatus: (s) => statuses.push(s) });
   port.pushStatus({ type: 'reconnecting', attempt: 2, delayMs: 2000 });
-  port.pushStatus({ type: 'online', uid: 'self', nickname: 'x' });
+  port.pushStatus({ type: 'online', uid: 'self', imUid: 'self-im', nickname: 'x' });
   assert.deepEqual(statuses.map((s) => s.type), ['reconnecting', 'online']);
 });
 

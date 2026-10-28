@@ -52,11 +52,11 @@
 
 ### T3 — Eve SQLite 消息归档（不接 AI）
 
-- [ ] T3-1：编写 docs/contracts/archive.md：字段、复合唯一键、读写事务、同步水位、gap / ambiguous、迁移版本及输入输出。
-- [ ] T3-2：采用 (conversationId, serverMessageId) 幂等归档（id_mode 主路径），保留无 ID 时的保守兜底；不能把内容哈希当事件 ID。
-- [ ] T3-3：SDK 自带 im-state.sqlite 只作 SDK 缓存；Eve SQLite 是业务记录真相源，消息写入与业务同步水位在一个事务中推进。
-- [ ] T3-4：以 douyin-bot/database.py、storage.py 的 SQL/历史归档设计为候选，**逐段对照**复用；禁止继承已识别的连接泄漏和昵称键。
-- **Gate**：同文两条、双方同文、重放去重、跨会话隔离、无重叠、事务中途异常、进程崩溃恢复测试全过。
+- [x] T3-1：编写 docs/contracts/archive.md：字段、复合唯一键、读写事务、同步水位、gap / ambiguous、迁移版本及输入输出。
+- [x] T3-2：采用 (conversationId, serverMessageId) 幂等归档（id_mode 主路径），保留无 ID 时的保守兜底；不能把内容哈希当事件 ID。
+- [x] T3-3：SDK 自带 im-state.sqlite 只作 SDK 缓存；Eve SQLite 是业务记录真相源，消息写入与业务同步水位在一个事务中推进。
+- [x] T3-4：以 douyin-bot/database.py、storage.py 的 SQL/历史归档设计为候选，**逐段对照**复用；禁止继承已识别的连接泄漏和昵称键。
+- **Gate**：同文两条、双方同文、重放去重、跨会话隔离、无重叠、事务中途异常、进程崩溃恢复测试全过。**已达成（71/71，含真实 SIGKILL 崩溃恢复与真实只读归档现场，见 docs/TODO-GATES.md T3 段）**
 
 ### T4 — WS 断线后的分页对账与可信恢复
 
@@ -108,6 +108,6 @@
 
 ## 当前下一步
 
-**R-01～R-04、T0、T1、T2 已完成（证据见 docs/TODO-GATES.md）。下一步：T3 归档 Contract（`docs/contracts/archive.md` 先行），仍一次一个 Slice。** 下一次开始编程前先完成：本 Slice 的四问、Contract、可重复 AC、测试设计、理解关口。通过后才勾选，未完成任务不提前标记完成。
+**R-01～R-04、T0、T1、T2、T3 已完成（证据见 docs/TODO-GATES.md）。下一步：T4 断线分页对账与可信恢复（`docs/contracts/` 先行补 T4 契约），仍一次一个 Slice。** 下一次开始编程前先完成：本 Slice 的四问、Contract、可重复 AC、测试设计、理解关口。通过后才勾选，未完成任务不提前标记完成。
 
 **当前最重要的边界**：SDK 已验证的是可行性，不是 Eve 整体完成；不修改上游账号凭证，不在未经准备的情况下触发真实自动发送。

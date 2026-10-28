@@ -175,3 +175,77 @@ pnpm test
 - 测试总数 38 → 55（controls 6、fs-untrusted 4、doctor 4、readonly +1、cli-integration +2）。
 
 **判定：T2 的七项 Gate 全部有可重复证据；④与②的子进程链已补。T2 可标记完成，进入 T3 前由操作者确认。**
+
+## T3 — SQLite Archive 第一轮离线实现（尚未过完整 Gate）
+
+- 新增 `docs/contracts/archive.md`、`app/src/archive/{schema.sql,store.ts}`、`app/test/archive/store.test.ts`；T3 AC 已写入 `docs/AC-TS.md`。实现不依赖 SDK 内部缓存，不接 AI、不发送消息，不修改 T1/T2 运行入口。
+- 身份二次校验由 ArchiveIdentity(ownerUid,targetUid,ownUids) 实施：测试主 UID 与 imUid 不同、消息方向匹配、跨会话整批拒绝。**仍待验证**：真实 Runner 上线事件如何安全提供经认证的 imUid；尚未把 T3 消费者接入 T2 Runner。
+- 批次 SHA-256 仅用于同 batchId 重放一致性校验，不充当事件身份；保存逐项 outcomes_json，保证混合 new/matched/ambiguous 重放原顺序。跨批次无 ID 消息保守保留 ambiguous，避免内容哈希误去重。
+- 当前 6 项专属离线测试：同文异 ID、双向同文、批次重放与冲突、跨会话拒绝、故障回滚、gap、重启身份与权限；尚未声称 T3 所有 Gate 通过。
+- **未完成**：可信平台身份传递到 Runner、archiveBatch 业务队列接线及失败阻塞；schema 迁移与损坏/未来版本负例；生产路径的 SQLite WAL/SHM 符号链接处理与日志泄露审查；不同会话同服务端 ID 的受控隔离 fixture；并发及意外断电故障注入。T3 不进入 T4，以上补齐后再验收。
+
+### T3 第二轮：可信身份、Runner 接线与安全负例（2026-10-28）
+
+- T1 在线状态包含 SDK 核验的主 UID 和 IM UID。T2 Runner 核验二者后才可初始化 EveArchive，错账号身份进入 paused_auth（码 3），不建立数据库。
+- 真实只读运行的 SDK 入站消息进入 T2 有界队列，消费者将消息写入独立 eve.sqlite；同服务器 ID 重放不重复插入；消费者异常转 paused_env。Mock CLI 保持无数据库副作用。
+- 新增归档 Runner 集成测试：不同 imUid 的合法身份接收、队列保存和重复事件去重，以及错误身份阻断。新增未来 Schema 版本拒绝、SQLite/WAL/SHM 符号链接及悬空链接拒绝测试。
+- **未证实**：真实抖音归档现场联调、T4 多页对账/覆盖证据、数据库整体断电/并发压力、迁移旧版本完整路径。T3 本轮暂不标记全部完成，不提交 Git。
+
+### T3 第三轮：数据库预检/迁移与失败阻塞补证（2026-10-29）
+
+- 调整 EveArchive.open 的执行顺序：先检查文件/侧车符号链接与数据库版本、账户绑定、完整性（quick_check），核对通过后才切换 WAL、开启事务。此举避免对不兼容版本或账号错配的库提前切换日志模式。
+- 迁移策略明确：已知的 **空白 v0** 数据库可事务初始化为 v1；含未知旧表的 v0 结构拒绝，不做猜测式升级；未来版本拒绝，原版本保持不变。本轮并未实现任何已存在业务数据的历史旧版迁移（尚无正式 v0 业务 schema）。
+- 新增安全/负例测试：空白 v0→v1、未知旧库拒绝、身份错配与未来版本预检、同一 serverMessageId 冲突后 Runner 持久 paused_env，且已写消息不被覆盖。专用 SQLite 测试使用临时目录和假 UID，不接真实平台、不发送私信。
+- 仍未进行真实只读平台归档现场验收，真实崩溃/断电恢复与资源压力尚不等于自动测试通过；T4 的覆盖水位与历史对账不能在 T3 伪称已完成。代码保留未提交以便复查。
+
+### T3 第四轮：真实归档现场验收 + 崩溃恢复 + 契约违规修复（2026-10-29）
+
+#### 1. 真实只读归档现场验收（已通过）
+
+真实账号、真实私信、真实 SQLite，全程未调用 AI、未发送任何消息。
+
+| 检查项 | 实测结果 |
+|---|---|
+| 运行状态 | `running` → SIGTERM → **`stopped`/`normal_stop`**，进程干净退出 |
+| 消息入库 | 1 条真实私信写入 `data/eve.sqlite` |
+| `server_message_id` | **19 位且为字符串**（未转 number，精度未损） |
+| 方向判定 | `from_self=0`，发送者为目标账号 |
+| 类型判定 | `kind='text'`、`message_type=7` |
+| 来源标记 | `first_source='live'` |
+| **`sync_state`** | **`unverified`** —— 未冒充 `verified`（Contract §4 明确 live 不得推进水位） |
+| 批次记账 | 1 batch：inserted 1 / matched 0 / ambiguous 0 |
+| 文件权限 | `eve.sqlite`、`-wal`、`-shm` 全部 **0600** |
+| 优雅退出后 | WAL 已 checkpoint（0B），数据持久（messages=1, batches=1） |
+
+现场同时证实：身份绑定跨进程有效（新进程用同一 config 重开同一 DB，`account_mismatch` 预检通过）。
+
+#### 2. 崩溃恢复（真实 SIGKILL，非模拟）
+
+新增 `test/archive/crash-recovery.test.ts` 3 条，子进程真实 `SIGKILL` 自己：
+
+| 场景 | 断言 |
+|---|---|
+| 已提交批次 + SIGKILL | 子进程 `signal==='SIGKILL'`；重开后 messages=1、batches=1 存活；同事件重放得 `matched`，**不重复插入** |
+| 事务中途 SIGKILL | 子进程在 `BEGIN IMMEDIATE` 后、`COMMIT` 前被强杀；重开 counts 全 0，**无半提交** |
+| journal_mode | 独立进程读回 `wal`，证明 WAL 确实生效 |
+
+#### 3. 修复一处 Contract 违规（实现缺陷）
+
+`Runner` 原先在 **SDK 事件回调** `onStatus('online')` 内调用 `EveArchive.open()`，而 `open()` 全是同步调用（`lstatSync`/`mkdirSync`/`DatabaseSync`）。Contract §1 明文禁止「把同步 DB 调用放入 SDK 回调」。
+
+修法：`onStatus` 只记录纯数据身份（零 I/O、零阻塞）；建库移到 `run()` 中 `await port.start()` 之后——此时 `system.online` 已同步触发完毕，不在回调栈上。身份校验失败仍进 `paused_auth`，建库失败仍进 `paused_env`。
+
+#### 4. 验证结果
+
+- `pnpm typecheck` 0 错。
+- `pnpm test` **71/71**（原 68 + 崩溃恢复 3），归档专项 16/16。
+- 测试中修正了一处我自己写错的地方：崩溃用例的 `createTime` 与子进程写入值不一致，被 `message_conflict` 正确拦下——**是测试数据错误，不是实现缺陷**，已对齐。
+
+#### 5. 仍未完成（不得视为 T3 关闭）
+
+- **T4 范畴**：`getHistory` 多页对账、`coverageProof` 构造与审核、`verified` 水位的真正推进。T3 不实现、不声称。
+- **资源压力**：未做长时间高频写入、磁盘满、DB 锁竞争（`busy_timeout` 实际触发）的量化验收。
+- **并发**：本阶段单进程单写入者，多实例写同一 DB 不在 T3 范围（T2 锁已排除同 state-dir 双实例）。
+- 真实账号与凭据不进入任何测试；现场只做了 1 条消息的单次验收，未做持续运行观察。
+
+**判定：T3 核心归档能力（含真实现场）与崩溃恢复已验收；T4 对账能力尚未开始，不得混入。T3 可标记完成并提交。**

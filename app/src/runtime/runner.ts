@@ -3,6 +3,8 @@ import {readFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {readState,writeState,paths,initDirs,processStart,BLOCKED,readJson,listRequests,atomicJson,removeFile,type RuntimeState,type Phase,type Paths} from './state.ts';
 import {BoundedQueue} from './queue.ts';
+import {EveArchive,type ArchiveIdentity} from '../archive/store.ts';
+import type {InboundMessage} from '../platform/types.ts';
 import type {PlatformPort,PlatformSink} from '../platform/types.ts';
 import type {RuntimeConfig} from './config.ts';
 
@@ -23,7 +25,10 @@ export class Runner {
   private readonly id=randomUUID();
   private readonly p:Paths;
   private s:RuntimeState;
-  private readonly q:BoundedQueue<unknown>;
+  private readonly q:BoundedQueue<InboundMessage>;
+  private archive: EveArchive | undefined;
+  private trustedIdentity:ArchiveIdentity | undefined;
+  private readonly archivePath: string | undefined;
   private stopping=false;
   private faulted=false;
   private active=false;
@@ -33,12 +38,20 @@ export class Runner {
   private wake: (()=>void)|undefined;
   private readonly port:PlatformPort;
   private readonly config:RuntimeConfig;
-  constructor(root:string, port:PlatformPort, config:RuntimeConfig) {
+  constructor(root:string, port:PlatformPort, config:RuntimeConfig, archivePath?:string) {
+    this.archivePath=archivePath;
     this.port=port;this.config=config;
     this.p=paths(root);
     this.s={phase:'starting',instanceId:this.id,pid:process.pid,processStart:processStart(process.pid),
       updatedAt:Date.now(),reason:''};
-    this.q=new BoundedQueue(config.queueCapacity,async()=>{this.messages++;},reason=>{void this.block('paused_env',reason);});
+    this.q=new BoundedQueue(config.queueCapacity,async message=>{
+      if(this.archivePath){
+        if(!this.archive || !this.trustedIdentity) throw new Error('archive_identity_unverified');
+        const batchId=randomUUID();
+        this.archive.archiveBatch({batchId,conversationId:message.conversationId,source:'live',messages:[message]});
+      }
+      this.messages++;
+    },reason=>{void this.block('paused_env',reason);});
   }
   private async set(phase:Phase,reason=''):Promise<void> {
     this.s={...this.s,phase,reason,updatedAt:Date.now()};
@@ -59,9 +72,24 @@ export class Runner {
   private readonly sink:PlatformSink={
     onMessage:message=>{
       if (this.stopping || this.faulted || BLOCKED.includes(this.s.phase)) return;
+      if(this.archivePath && (!this.archive||!this.trustedIdentity)) {
+        void this.block('paused_env','archive_identity_unverified');return;
+      }
       this.q.push(message);
     },
     onStatus:status=>{
+      if(status.type==='online' && this.archivePath){
+        // 契约 §1：SDK 回调内禁止同步 DB 调用。此处只记录纯数据身份，
+        // 建库在 run() 中 await port.start() 之后完成（那时本事件已同步触发完毕）。
+        if(status.uid!==this.config.selfUid || !/^[0-9]+$/.test(status.imUid)){
+          void this.block('paused_auth','archive_identity_mismatch');return;
+        }
+        if(this.trustedIdentity && !this.trustedIdentity.ownUids.includes(status.imUid)){
+          void this.block('paused_auth','archive_identity_changed');return;
+        }
+        this.trustedIdentity={ownerUid:this.config.selfUid,targetUid:this.config.targetUid,
+          ownUids:[...new Set([status.uid,status.imUid])]};
+      }
       if (status.type==='session_rejected') void this.block('paused_auth','session_rejected');
       else if (status.type==='verification_required' && !this.config.allowLocalVerification)
         void this.block('paused_risk','verification_required');
@@ -119,6 +147,15 @@ export class Runner {
       await this.set('starting');
       // A signal during initial SDK login must not leave an active connection after stop.
       await this.port.start();
+      // 建库在此处而非 SDK 回调：身份已由 system.online 核验并记录，
+      // 同步 DB 调用不落在回调线程上（契约 §1）。
+      if(this.archivePath && !this.faulted && !this.stopping){
+        if(!this.trustedIdentity){await this.block('paused_env','archive_identity_unverified');}
+        else {
+          try{this.archive=EveArchive.open(this.archivePath,this.trustedIdentity);}
+          catch{await this.block('paused_env','archive_open_failed');}
+        }
+      }
       if (!this.stopping && !this.faulted) {await this.set('running');this.q.resume();}
       while(!this.stopping && !this.faulted) {
         await this.controls();
@@ -142,6 +179,8 @@ export class Runner {
       await this.blockPending?.catch(()=>undefined);
       pendingAtStop=this.q.length;
       await this.q.stop();
+      try{this.archive?.close();}catch{closeFail=true;}
+      this.archive=undefined;
       // SDK offline after rejected logout is still a completed shutdown: T1 observed this case.
       try {await this.port.stop();}
       catch {closeFail=true;}

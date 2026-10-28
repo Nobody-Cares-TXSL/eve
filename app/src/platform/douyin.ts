@@ -92,7 +92,7 @@ export class DouyinReadOnlyPort implements PlatformPort {
       this.active = account;
       this.verified = true;
       void this.qr.remove();
-      this.status({ type: 'online', uid: platformUid, nickname: screenName ?? '' });
+      this.status({ type: 'online', uid: platformUid, imUid: account.imUid!, nickname: screenName ?? '' });
     });
     this.client.on('system.login.session', ({ status }) => {
       if (status === 'expired' || status === 'unverified') {

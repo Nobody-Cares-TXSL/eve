@@ -92,7 +92,7 @@ async function main():Promise<number> {
       allowLocalVerification:config.allowLocalVerification,
       notifyQrPath:path=>console.log('本机扫码文件：'+path),
     });
-    return new Runner(stateDir,port,config).run();
+    return new Runner(stateDir,port,config,mock?undefined:join(dataDir,'eve.sqlite')).run();
   }
   console.log('dac: doctor [--json], status [--json], run [--mock], pause, resume, stop, unblock --reason <说明>');
   return cmd==='help'?0:2;

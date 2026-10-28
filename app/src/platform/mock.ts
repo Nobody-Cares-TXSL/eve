@@ -7,6 +7,8 @@
 import type { InboundMessage, PlatformPort, PlatformSink, PlatformStatus, HistoryPage } from './types.ts';
 
 export class MockPlatformPort implements PlatformPort {
+  private readonly loginIdentity: { uid:string; imUid:string } | undefined;
+  constructor(loginIdentity?: { uid:string; imUid:string }) {this.loginIdentity=loginIdentity;}
   readonly delivered: InboundMessage[] = [];
   readonly statuses: PlatformStatus[] = [];
   startCount = 0;
@@ -20,6 +22,7 @@ export class MockPlatformPort implements PlatformPort {
 
   async start(): Promise<void> {
     this.startCount += 1;
+    if(this.loginIdentity)this.pushStatus({type:'online',uid:this.loginIdentity.uid,imUid:this.loginIdentity.imUid,nickname:'mock'});
   }
 
   async stop(): Promise<void> {

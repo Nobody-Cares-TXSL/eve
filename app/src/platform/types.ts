@@ -37,7 +37,7 @@ export interface HistoryPage {
 
 /** 登录/会话状态机所需的平台侧事件（T1 消费，T0 仅定义）。 */
 export type PlatformStatus =
-  | { type: 'online'; uid: string; nickname: string }
+  | { type: 'online'; uid: string; imUid: string; nickname: string }
   | { type: 'reconnecting'; attempt: number; delayMs: number }
   | { type: 'qr_required'; qrPath: string | null }
   | { type: 'verification_required'; methods: readonly string[] }

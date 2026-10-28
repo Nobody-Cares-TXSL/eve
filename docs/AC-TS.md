@@ -98,3 +98,16 @@
 - **AC-T2.7 文件系统不可信**：请求目录中的符号链接不得被当作控制指令，也不得写穿到链接目标；状态文件被替换为符号链接时，原子写必须替换路径本身而非写入外部目标；请求文件名与内部 id 不一致必须拒绝；非法 JSON 请求被丢弃且不阻塞后续合法请求。
 - **AC-T2.8 doctor 强诊断**：doctor 的每项检查必须能因真实缺陷转为 fail/warn（可被证伪），不得是固定文案：源码出现 `sendMsg` → D10 fail；凭据目录非 0700 → D9 warn；src 下出现 `.py` → D3 fail；配置缺失 → D4/D8 fail。D11（平台风险）无法自动化，明确保留为人工确认项。doctor 输出不得回显账号 UID。
 - **AC-T2.9 测试卫生**：子进程测试结束后不得留下孤儿进程（flock 派生的 `--locked` 孙进程）；时间敏感断言用轮询而非固定延迟，全套并行重复运行不得偶发失败。
+
+
+## T3 — Eve SQLite 消息归档（实施前冻结的验收条件）
+
+- **AC-T3.1 身份与白名单**：归档绑定配置的 owner/target；只接受平台已认证上线事件派生的 ownUid 集合（包含不同的主 UID 与 imUid），逐条检查 threadId、senderUid、fromSelf；跨会话、冒充自身或错目标整批拒绝，不落盘。
+- **AC-T3.2 ID 幂等**：复合唯一键 (conversation_id,server_message_id)，19 位 ID 原样保留；相同文字不同 ID、双方相同文字、跨会话同 ID 都不能误合并。同键但关键字段冲突必须回滚，不能覆盖旧记录。
+- **AC-T3.3 双模式及批次重放**：无 ID 进入 uncertain_messages/ambiguous；同 batchId 完全一致的请求重放不新增 uncertain；同 batchId 修改一条消息即 batch_conflict；不同 batchId 同文无 ID 仍必须保留待确认项，不靠内容哈希去重。请求 digest 覆盖完整有序输入，不得充当消息 ID。
+- **AC-T3.4 原子写入、水位/gap**：一次事务提交消息、uncertain、gap、batch；中间异常完全回滚。live 新消息不得推动 verified_anchor_id，history 游标不等于可信覆盖证明；显式发现 gap 则保留未核实状态。
+- **AC-T3.5 数据库生命周期**：Eve DB 与 SDK im-state.sqlite 分离；独占连接关闭后拒绝操作，重启持久化，用户/目标身份不符拒绝，future schema_version 拒绝且不覆写，WAL、外键及权限符合 Contract。
+- **AC-T3.6 安全**：全 mock/临时库，不调用真实 SDK、AI 或发送；不在测试日志/仓库写真实 UID、账号凭据、聊天正文；源码无第三方代码复制，后续若直接复用则先在 NOTICE 逐片段登记。
+- **AC-T3.7 崩溃恢复**：真实子进程 `SIGKILL`（非模拟异常）后，已提交批次完整存活、可继续写入且不重复；事务在 `COMMIT` 前被强杀时不得留下任何半提交行；`journal_mode` 实测为 `wal`。
+- **AC-T3.8 回调边界**：`EveArchive.open()` 及其他同步 DB 调用不得出现在 SDK 事件回调栈内（Contract §1）；身份记录可为纯数据，但建库必须在 `await port.start()` 之后的主流程完成。
+- **AC-T3.9 真实现场归档**：一次真实只读运行中，目标账号真实私信必须写入 `eve.sqlite`，`server_message_id` 保持 19 位字符串，`from_self` 方向正确，`sync_state` 保持 `unverified`（live 不得冒充 verified），库文件 0600，优雅退出后数据持久。真实现场不作为自动化测试，不得把真实 UID/正文写入仓库。
