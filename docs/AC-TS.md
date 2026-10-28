@@ -112,7 +112,11 @@
 - **AC-T3.8 回调边界**：`EveArchive.open()` 及其他同步 DB 调用不得出现在 SDK 事件回调栈内（Contract §1）；身份记录可为纯数据，但建库必须在 `await port.start()` 之后的主流程完成。
 - **AC-T3.9 真实现场归档**：一次真实只读运行中，目标账号真实私信必须写入 `eve.sqlite`，`server_message_id` 保持 19 位字符串，`from_self` 方向正确，`sync_state` 保持 `unverified`（live 不得冒充 verified），库文件 0600，优雅退出后数据持久。真实现场不作为自动化测试，不得把真实 UID/正文写入仓库。
 
-## T4 — 断线分页对账与可信恢复（Contract 草案阶段，AC 尚待冻结）
+## T4 — 断线分页对账与可信恢复（应用层 Gate 已通过，2026-10-29）
+
+> 状态：**AC-T4.1～T4.9 已验收**（124/124，证据见 `docs/TODO-GATES.md` T4-8/T4-9）。
+> 真实物理断网与 90 秒有效期长期校准转入 T9，保留为未验证状态。
+> **T5 强制义务**：领取消息前必须检查 `coverageStatus().usable`——`eligible_events` 存在不等于可直接处理。
 
 - **AC-T4.1 SDK 分页可观测性**：读取每页保留 rawCount / acceptedCount / excludedCount+分类、请求 cursor/方向、响应 cursor/方向、hasMore/statusCode；测试 SDK 的升序返回视图与 older 方向、自动排除当前 anchor、19 位 ID 与大游标均不丢精度。任何未解释的过滤都不得生成完整性证明。
 - **AC-T4.2 真实多页补收**：以 mock >50 条（至少 51、120）跨页恢复，只有实际遇到旧持久锚点重叠，或首次完整扫描至 hasMore=false 终点，并通过头部闭合检查才可 verified；不足 50 条、单次空页、SDK 缓存命中和猜测游标均不能独立作为完成条件。
@@ -123,3 +127,4 @@
 - **AC-T4.7 重启与进程崩溃**：在单页事务提交前、后分别 SIGKILL；不留半页/错误水位；新进程需重新验证 epoch，旧 cursor/旧证明不能直接推进 verified；所有已确定消息可通过 ID 匹配重放且不产生重复 eligible。
 - **AC-T4.8 账号与安全**：SDK 登录 UID/IM UID、会话和目标白名单始终准确；历史不得接受群或非目标账号消息。日志不打印消息正文、真实 UID、挑战 URL；只读联调不得发送/标记已读；无法判定历史完整时明确呈现缺口而不声称“零丢失”。
 - **AC-T4.9 有界资源**：页数/总消息/总耗时/重试次数均有明确上限和失败状态，持续新增消息、半开连接或慢响应不能无限持锁/无限扫描，不能因此放宽 verified 的条件。
+- **AC-T4.10 证明有效期**：`verified` 不是永久状态。`coverageStatus(thread, maxAgeMs)` 必须能独立判定 `usable`；时间戳缺失、未来时间（时钟回拨）、超过有效期一律不可用。**SDK 静默失联（从不发 offline/reconnecting）时，过期证明仍必须被撤销**。Schema 必须禁止「verified 但缺锚点/时间戳」的状态。撤销后历史锚点保留以便重新对账。
