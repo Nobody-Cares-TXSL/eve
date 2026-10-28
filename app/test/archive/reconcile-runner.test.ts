@@ -75,3 +75,52 @@ test('T4 opt-in Runner: 未知目标会话不拼 thread，继续 unverified',asy
   await stop(stateDir);assert.equal(await running,0);
  }finally{await rm(dir,{recursive:true,force:true});}
 });
+
+test('T4 Runner: pause ACK 前必须关闭 verified；resume 要重新对账',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'eve-t4-pause-gate-'));
+ const stateDir=join(dir,'state'),db=join(dir,'eve.sqlite');
+ const port=new MockPlatformPort({uid:'111',imUid:'222'});
+ port.delivered.push(...Array.from({length:5},(_,i)=>msg(i)));
+ const running=new Runner(stateDir,port,config,db,true).run();
+ async function control(action:'pause'|'resume'){
+  const p=paths(stateDir),state=await readState(p);assert.ok(state);
+  await initDirs(p);
+  const id=randomUUID();
+  await durableRequest(join(p.requests,id+'.json'),{id,instanceId:state.instanceId,action,at:Date.now()});
+  let response:{ok:boolean;phase:string}|undefined;
+  await until(async()=>{
+   try {response=await readJson(join(p.acks,id+'.json')) as {ok:boolean;phase:string};return true;}
+   catch{return false;}
+  });
+  assert.equal(response?.ok,true);return response?.phase;
+ }
+ try{
+  await until(async()=>(await readState(paths(stateDir)))?.phase==='running');
+  port.pushMessage(msg(5));
+  await until(async()=>{
+   try{
+    const a=EveArchive.open(db,identity),s=a.conversationState(thread);a.close();return s==='verified';
+   }catch{return false;}
+  });
+  const anchor=msg(5).serverMessageId;
+  assert.equal(await control('pause'),'paused_manual');
+  const paused=EveArchive.open(db,identity);
+  assert.equal(paused.conversationState(thread),'unverified');
+  assert.equal(paused.getVerifiedAnchor(thread),anchor);
+  paused.close();
+  assert.equal(await control('resume'),'running');
+  await until(async()=>{
+   const a=EveArchive.open(db,identity);
+   const verified=a.conversationState(thread)==='verified';
+   a.close();return verified;
+  });
+  const resumed=EveArchive.open(db,identity);
+  assert.equal(resumed.getVerifiedAnchor(thread),anchor);
+  resumed.close();
+  await stop(stateDir);
+  assert.equal(await running,0);
+  const stopped=EveArchive.open(db,identity);
+  assert.equal(stopped.conversationState(thread),'unverified');
+  stopped.close();
+ }finally{await rm(dir,{recursive:true,force:true});}
+});

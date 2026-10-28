@@ -13,6 +13,9 @@ export class MockPlatformPort implements PlatformPort {
   readonly statuses: PlatformStatus[] = [];
   startCount = 0;
   stopCount = 0;
+  /** 测试驱动：置 true 后 readHistory 抛错，用于模拟「SDK 静默失联」——
+   *  没有 offline 事件，但对账实际无法成功。 */
+  failHistory = false;
   /** 由测试手动投喂（模拟 SDK 推送） */
   private sinks: PlatformSink[] = [];
 
@@ -30,6 +33,7 @@ export class MockPlatformPort implements PlatformPort {
   }
 
   async readHistory(conversationId: string, cursor?: string | null): Promise<HistoryPage> {
+    if (this.failHistory) throw new Error('mock_history_unavailable');
     const messages = this.delivered.filter((m) => m.conversationId === conversationId);
     const start = cursor == null ? messages.length : Math.min(Number(cursor), messages.length);
     if (!Number.isSafeInteger(start) || start < 0) throw new Error('invalid mock cursor');

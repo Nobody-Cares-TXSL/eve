@@ -342,4 +342,35 @@ export class EveArchive {
   return rows.map(x=>x.conversation_id).filter(id=>this.validThread(id));
  }
  conversationState(id:string){this.check();return (this.db.prepare('SELECT sync_state FROM conversations WHERE conversation_id=?').get(id) as {sync_state:string}|undefined)?.sync_state??null;}
+
+ /**
+  * 证明是否仍可用（T4 安全门控）。
+  *
+  * verified 不是永久状态：一份 coverageProof 只在 maxAgeMs 内有效。
+  * 超过有效期即视为无法继续证明其有效性，**即使 SDK 从未报告断线**。
+  * 调用方（未来 T5 领取消息前）必须以此为准，而不是只读 sync_state。
+  *
+  * 返回值区分「为什么不可用」，便于上层记录原因且不暴露正文：
+  *   state    当前 sync_state（null = 会话不存在）
+  *   verified 是否 verified
+  *   fresh    是否在有效期内
+  *   usable   两者同时成立才为 true
+  *   ageMs    verified 距今多久（未 verified 时为 null）
+  */
+ coverageStatus(id:string,maxAgeMs:number):{
+  state:string|null;verified:boolean;fresh:boolean;usable:boolean;ageMs:number|null;
+ }{
+  this.requireV2();
+  if(!this.validThread(id))throw new ArchiveError('rejected');
+  if(!Number.isSafeInteger(maxAgeMs)||maxAgeMs<1)throw new ArchiveError('invalid_max_age');
+  const row=this.db.prepare('SELECT sync_state,last_verified_at_ms FROM conversations WHERE conversation_id=?')
+   .get(id) as {sync_state:string;last_verified_at_ms:number|null}|undefined;
+  const state=row?.sync_state??null;
+  const verified=state==='verified';
+  const at=row?.last_verified_at_ms??null;
+  const ageMs=verified&&at!==null?Date.now()-at:null;
+  // 时间戳缺失或倒退一律视为不可用（保守，不假设「刚验证过」）
+  const fresh=ageMs!==null&&ageMs>=0&&ageMs<=maxAgeMs;
+  return {state,verified,fresh,usable:verified&&fresh,ageMs};
+ }
 }

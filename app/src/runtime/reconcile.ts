@@ -8,8 +8,9 @@ export interface ReconcileLimits {
  maxMessages:number;
  maxDurationMs:number;
  readTimeoutMs:number;
+ pageGapMs:number;
 }
-const defaults:ReconcileLimits={maxPages:100,maxMessages:5000,maxDurationMs:60000,readTimeoutMs:12000};
+const defaults:ReconcileLimits={maxPages:100,maxMessages:5000,maxDurationMs:60000,readTimeoutMs:12000,pageGapMs:0};
 export interface ReconcileInput{
  port:PlatformPort;
  archive:EveArchive;
@@ -44,7 +45,7 @@ function codeFor(e:unknown):string{
 }
 export async function reconcileOnce(input:ReconcileInput):Promise<ReconcileResult>{
  const limits={...defaults,...input.limits};
- if(Object.values(limits).some(x=>!Number.isSafeInteger(x)||x<1))
+ if(Object.entries(limits).some(([key,x])=>!Number.isSafeInteger(x)||(key==='pageGapMs'?x<0||x>4000:x<1)))
    throw new Error('invalid_reconcile_limits');
  const id=randomUUID();
  // Let archive own the epoch and its previous anchor; no caller-provided proof object.
@@ -52,11 +53,18 @@ export async function reconcileOnce(input:ReconcileInput):Promise<ReconcileResul
   instanceId:input.instanceId,imUid:input.imUid});
  const started=Date.now();
  let pages=0,total=0,cursor:string|null=null;
+ let lastReadStartedAt:number|null=null;
  const visited=new Set<string>();
  const alive=()=>!input.signal?.aborted&&input.isSafe()&&Date.now()-started<=limits.maxDurationMs;
  const fetch=async(at:string|null):Promise<HistoryPage>=>{
   if(!alive())throw new ReconcileFailure('epoch_invalidated');
   if(outstandingHistory.has(input.port))throw new ReconcileFailure('history_request_still_pending');
+  if(lastReadStartedAt!==null&&limits.pageGapMs>0){
+   const delay=Math.max(0,limits.pageGapMs-(Date.now()-lastReadStartedAt));
+   if(delay)await new Promise<void>(done=>setTimeout(done,delay));
+   if(!alive())throw new ReconcileFailure('epoch_invalidated');
+  }
+  lastReadStartedAt=Date.now();
   let attempt:Promise<HistoryPage>;
   try{attempt=Promise.resolve(input.port.readHistory(input.conversationId,at));}
   catch(e){throw e;}

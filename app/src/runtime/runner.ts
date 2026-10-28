@@ -9,6 +9,12 @@ import type {InboundMessage} from '../platform/types.ts';
 import type {PlatformPort,PlatformSink} from '../platform/types.ts';
 import type {RuntimeConfig} from './config.ts';
 
+/**
+ * 一份 coverageProof 的最长可用时间。超过即撤销，即使 SDK 从未报告断线。
+ * 取值需小于 SDK 心跳周期（15s）的若干倍：多次心跳未确认即不再信任旧证明。
+ */
+export const COVERAGE_MAX_AGE_MS = 90_000;
+
 export type Action = 'pause'|'resume'|'stop';
 export interface ControlRequest { readonly id:string; readonly instanceId:string; readonly action:Action; readonly at:number; }
 const actions = new Set(['pause','resume','stop']);
@@ -31,12 +37,15 @@ export class Runner {
   private trustedIdentity:ArchiveIdentity | undefined;
   private readonly archivePath: string | undefined;
   private readonly reconcileEnabled:boolean;
+  private readonly historyPageGapMs:number;
+  private readonly coverageMaxAgeMs:number;
   private reconciliationGeneration=0;
   private reconciliationRequested=false;
   private reconciliationRunning:Promise<void>|undefined;
   private reconciliationAbort:AbortController|undefined;
   private platformOnline=false;
   private coverageInvalidationPending=false;
+  private coverageInvalidationChain:Promise<void>=Promise.resolve();
   private confirmedConversationId:string|undefined;
   private stopping=false;
   private faulted=false;
@@ -47,8 +56,11 @@ export class Runner {
   private wake: (()=>void)|undefined;
   private readonly port:PlatformPort;
   private readonly config:RuntimeConfig;
-  constructor(root:string, port:PlatformPort, config:RuntimeConfig, archivePath?:string, reconcileEnabled=false) {
+  constructor(root:string, port:PlatformPort, config:RuntimeConfig, archivePath?:string,
+              reconcileEnabled=false, historyPageGapMs=0, coverageMaxAgeMs=COVERAGE_MAX_AGE_MS) {
     this.reconcileEnabled=reconcileEnabled;
+    this.historyPageGapMs=historyPageGapMs;
+    this.coverageMaxAgeMs=coverageMaxAgeMs;
     this.archivePath=archivePath;
     this.port=port;this.config=config;
     this.p=paths(root);
@@ -118,10 +130,18 @@ export class Runner {
       }
       if((status.type==='offline'||status.type==='reconnecting')&&this.reconcileEnabled){
         this.platformOnline=false;
-        this.coverageInvalidationPending=true;
         this.reconciliationGeneration++;
         this.reconciliationAbort?.abort();
         this.reconciliationRequested=true;
+        // 立即排队撤销（不在 SDK 回调栈上做同步 DB 调用，契约 §1）。
+        // 撤销与重新对账之间必须有明确顺序：对账启动前 await 此 promise，
+        // 否则重连过快时（实测 ~1.2s）会跨过撤销窗口，旧 verified 直接续用。
+        this.coverageInvalidationPending=true;
+        this.coverageInvalidationChain=this.coverageInvalidationChain.then(async()=>{
+          if(!this.coverageInvalidationPending||!this.archive)return;
+          this.coverageInvalidationPending=false;
+          this.archive.invalidateCurrentCoverage();
+        }).catch(()=>{void this.block('paused_env','coverage_invalidation_failed');});
         this.wake?.();
       }
       if (status.type==='session_rejected') void this.block('paused_auth','session_rejected');
@@ -161,7 +181,22 @@ export class Runner {
         await this.ack(req,true);this.wake?.();
       } else if (this.faulted) await this.ack(req,false,'blocked');
       else if (req.action==='pause') {
-        this.q.pause();this.reconciliationGeneration++;this.reconciliationAbort?.abort();await this.set('paused_manual','manual');await this.ack(req,true);
+        this.q.pause();this.reconciliationGeneration++;this.reconciliationAbort?.abort();
+        // A paused runtime must not retain an old current-coverage gate.
+        // Persist gate invalidation before returning the pause acknowledgement.
+        if(this.reconcileEnabled&&this.archive){
+          try{
+            this.coverageInvalidationPending=false;
+            await this.coverageInvalidationChain;
+            this.archive.invalidateCurrentCoverage();
+          }
+          catch{
+            await this.block('paused_env','coverage_invalidation_failed');
+            await this.ack(req,false,'coverage_invalidation_failed');
+            continue;
+          }
+        }
+        await this.set('paused_manual','manual');await this.ack(req,true);
       } else if (this.s.phase==='paused_manual') {
         await this.set('running');this.q.resume();if(this.reconcileEnabled)this.reconciliationRequested=true;await this.ack(req,true);
       } else await this.ack(req,false,'not_paused');
@@ -203,9 +238,18 @@ export class Runner {
       while(!this.stopping && !this.faulted) {
         await this.controls();
         if(this.stopping || this.faulted) break;
-        if(this.reconcileEnabled&&this.coverageInvalidationPending&&this.archive){
-          this.coverageInvalidationPending=false;
-          this.archive.invalidateCurrentCoverage();
+        // 断线撤销必须先完成，才允许启动新一轮对账。
+        if(this.reconcileEnabled&&this.archive)await this.coverageInvalidationChain;
+        // 证明有效期门控：verified 不是永久状态。即使 SDK 从未报告断线，
+        // 过期证明也必须撤销，不能无限期沿用（T4 安全边界）。
+        if(this.reconcileEnabled&&this.archive&&this.confirmedConversationId&&
+           this.s.phase==='running'&&!this.reconciliationRunning){
+          const status=this.archive.coverageStatus(this.confirmedConversationId,this.coverageMaxAgeMs);
+          if(status.state==='verified'&&!status.usable){
+            this.archive.invalidateCurrentCoverage();
+            this.reconciliationRequested=true;
+            this.wake?.();
+          }
         }
         if(this.reconcileEnabled&&this.archive&&this.trustedIdentity&&this.platformOnline&&
            this.reconciliationRequested&&this.confirmedConversationId&&!this.reconciliationRunning&&this.q.isIdle&&
@@ -218,6 +262,7 @@ export class Runner {
           this.reconciliationRunning=reconcileOnce({
             port:this.port,archive,conversationId:this.confirmedConversationId!,
             imUid,instanceId:this.id,signal:controller.signal,
+            limits:{pageGapMs:this.historyPageGapMs},
             isSafe:()=>!this.stopping&&!this.faulted&&this.s.phase==='running'&&
               generation===this.reconciliationGeneration&&this.platformOnline&&this.q.isIdle,
           }).then(result=>{

@@ -405,3 +405,92 @@ WAL 模式下，已提交但未 checkpoint 的事务只在 `-wal` 里。裸复�
 - 备份保留策略、异地副本、定期校验未做（T9 范畴）。
 
 **判定：T4 正式升级的安全前置条件（备份 + 可验证回滚）已就绪；正式迁移与生产 Gate 仍未执行，T4 不标记完成。**
+
+### T4-8 正式库迁移 + 真实 Runner 水位与门控验收（2026-10-29）
+
+- 基线 Git `b998d28`，开始时工作区干净、Runner 无活动实例，正式库 v1/meta v1、messages=1、batches=1、integrity=ok。先在单实例锁下用 VACUUM INTO 再生成一份迁移前 v1 备份；迁移前分别校验源库和新备份六张表的内容摘要完全一致，账号绑定一致、文件 0600、`integrity_check=ok`。
+- 在同一单实例锁下，正式 `EveArchive.upgradeToV2()` 事务升级成功：`user_version=2` 与 `archive_meta.schema_version=2` 同步，新增 reconcile_epochs/reconcile_pages/eligible_events 三表，原有 messages=1、batches=1 无损，完整性校验通过。未调用回滚；两份原 v1 备份均保留。
+- 为减少实盘历史接口调用突发，`reconcileOnce()` 新增有界 pageGapMs；实验性真实 Runner CLI 使用 **850ms** 最小请求间隔（Mock 默认 0），先通过专项 Mock 和类型检查。
+- **真实 Runner 首轮**：`run --experimental-reconcile` 经 SDK 读取完整历史、在正式 v2 库提交 **5 页历史证据**，新 epoch=verified，会话 `sync_state=verified`，锚点存在，eligible=0；停止退出码 0、状态 stopped，数据库 `sync_state=unverified`、锚点保留；正式库消息数 **132**，批次增至 6。
+- **真实 Runner 第二次重启**：重新生成一个已验证 epoch（页面仅 2 页：旧锚点重叠＋头部闭合），eligible 仍为 0，停止后再次 unverified。不是继承旧 verified。
+- **真实暂停门控发现并修复缺陷**：旧版本 pause ACK 只设置 paused_manual，数据库仍 verified；修复为在确认 pause 前调用 `invalidateCurrentCoverage()`，发生数据库错误则安全阻塞并拒绝成功 ACK。新增 mock 集成测试覆盖 pause → unverified、resume → 重新 verified、stop → unverified。
+- **修复后的第三次真实运行**：重新签发 verified，pause ACK 后真实数据库立即 unverified 且锚点保留；resume 时先 reconciling，随后新 epoch verified；stop 后 unverified、Runner 正常退出。最新正式库 **Schema v2 / integrity=ok / messages=132 / batches=12 / eligible=0 / 4 个 verified epoch**。
+- **迁移后防护**：备份脚本现在按实际 Schema 版本命名（eve-v1-* 或 eve-v2-*），并拒绝备份中 `schema_version` 与 `user_version` 不一致；新增 v2 备份回归测试。正式库再次 VACUUM INTO，产物 **v2 messages=132 meta=v2**、167936 字节、0600，源库不变。迁移前两份 v1 快照仍可校验。无真实 UID、消息正文或 token 写入 Gate。
+- **未通过的现场 Gate**：本轮未主动制造真实网络链路中断/恢复；不把 Mock offline/reconnecting 或真实 pause/resume 冒充真实断线证据。T4 默认仍是只读实验模式，不能因此直接进入自动 AI 发送；本轮改动未提交 Git。
+
+### T4-8 最终回归与交付状态
+
+- `cd app && pnpm typecheck` **0 错**；`pnpm test` **115/115 通过**（相比 `b998d28` 的 113 项增加暂停门控与 v2 备份 2 项）；`git diff --check` 通过。
+- 正式 Runner 确认 `phase=stopped, alive=false`，正式库 v2/`integrity_check=ok`/messages=132/batches=12/eligible=0；**当前** `sync_state=unverified`，锚点保留。验证过程没有发送任何私信或调用模型。
+- 正式迁移与真实签发已通过；仍需真实网络断线/恢复的现场 Gate，T4 不自动声明全部完成。工作区包含本轮未提交变更，**未自动提交 Git**。
+
+### T4-9 证明有效期门控与探针修正（2026-10-29）
+
+#### 1. 断线探针的结论：`ss -K` 不构成有效断线注入
+
+四种手段逐一实测，均无法可靠模拟 SDK 网络断线：
+
+| 手段 | 实测结果 |
+|---|---|
+| `ss -K` 关闭本进程 TCP 连接 | 关闭 3~6 个真实抖音 443 连接后，SDK **90 秒内零状态事件** |
+| 等待 ping timeout（90s 窗口） | 仍无 `reconnecting`；SDK 保有冗余连接继续工作 |
+| `SIGSTOP` 冻结进程 | 冻结整个进程，无法观察事件 |
+| 对象图查找 `frontierWs` | 两层搜索未命中，SDK 内部不暴露 |
+
+**结论**：`ss -K` 断开后 DB 未退出 verified，**不能**证明「真实网络断线时门控失效」——因为当时 SDK 仍保有部分连接且未报告离线，无法确认发生了完整中断。但它揭示了一个真实缺口：**当 SDK 不发状态事件时，T4 缺乏独立判断连接是否仍可信的依据**。
+
+探针脚本已改写为诊断工具，输出显式标注 `verdict: not_a_valid_disconnect_proof`，不作为 Gate 证据。
+
+#### 2. 新增：证明有效期门控（T4 安全边界）
+
+**原则**：verified 不是永久状态。无法持续证明其有效性时，必须拒绝继续使用这份证明。
+
+- `EveArchive.coverageStatus(thread, maxAgeMs)` → `{state, verified, fresh, usable, ageMs}`；调用方以 `usable` 为准，不得只读 `sync_state`。
+- `fresh` 要求时间戳存在、非未来（时钟回拨）、且 `ageMs <= maxAgeMs`；缺失或倒退一律不可用。
+- `Runner.COVERAGE_MAX_AGE_MS` 默认 90s（SDK 心跳 15s 的整数倍）；轮询中发现 `verified && !usable` 即撤销门控并触发重新对账，历史锚点保留。
+- 与断线事件的关系：`offline`/`reconnecting` 仍是更快的撤销路径，但**不再是唯一路径**。
+
+#### 3. 新增测试（12 条）
+
+`test/archive/coverage-expiry.test.ts`（7 条）：
+- 新签发证明有效期内可用
+- **过期证明即使 `sync_state` 仍为 verified 也不可用**（核心负例）
+- Schema CHECK 约束本身禁止「verified 但缺时间戳」
+- 非 verified 一律不可用、未来时间戳不可用
+- 非白名单线程拒绝（不泄露存在性）
+- 非法 `maxAge` 拒绝
+- 撤销后立即不可用但锚点保留
+
+`test/archive/coverage-expiry-runner.test.ts`（2 条）：
+- **SDK 从不发 offline 时，过期证明仍被 Runner 撤销**（通过 `MockPlatformPort.failHistory` 模拟静默失联）
+- 有效期内证明不被误撤销
+
+#### 4. 探针脚本修正（按审查意见逐条）
+
+| 问题 | 处理 |
+|---|---|
+| `socketsKilled` 统计命令成功次数而非实际断开数 | 改为 `establishedBefore/AfterKill` 前后计数对比 |
+| `ss -K dst` 按对端匹配，可能影响其他进程 | 显式注释该限制，仅限测试机知情使用 |
+| `reverifiedAfterReconnect` 假阳性 | 删除该指标（无法区分「从未失效」与「已恢复」） |
+| `messagesNotDuplicated` 只看总数不减少 | 删除该指标（无法证明无重复插入） |
+| 诊断日志输出对端地址与原始异常 | 只输出连接**计数**；异常只输出固定类别码 |
+| `.t4-reconnect-state/` 未跟踪 | 已加入 `.gitignore` |
+
+#### 5. 过程中修正的测试错误（如实记录）
+
+1. 断言 `conversationState === 'unverified'` 过窄——对账失败路径实际落到 `gap`，两者都不可用。改为断言「不是 verified」+「`usable === false`」。
+2. 断言「确实经过了有效期」是时序断言，撤销可能早于 100ms 完成。改为等待「过期或退出 verified」的条件。
+3. 最初以为过期门控会触发，实测 `ageMs` 一直约 40ms——因为 Runner 持续对账会刷新 `last_verified_at_ms`。**这符合语义**（能持续证明即可用），门控针对的是「对账无法继续成功」的场景，测试需用 `failHistory` 模拟。
+
+#### 6. 验证结果
+
+- `pnpm typecheck` 0 错；`pnpm test` **124/124**（新增 12 条）。
+- 诊断探针可运行，输出 `verdict: not_a_valid_disconnect_proof`、连接计数、DB 快照，无对端地址、无原始异常。
+
+#### 7. 仍未完成
+
+- **真实物理断网/系统级网络注入**：留给 T9 运维验收（需要 root 或物理断网）。这**不阻塞** T4 关闭安全门控缺口。
+- 有效期 90s 的取值来自 SDK 心跳周期推算，未经长时间真实运行校准。
+- T5 必须实现的义务已写入 Contract §16，但尚未有代码。
+
+**判定：T4 的安全门控缺口已补齐（证明不再无限期有效）；真实网络注入留给 T9。**

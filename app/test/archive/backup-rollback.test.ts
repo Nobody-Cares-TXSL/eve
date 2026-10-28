@@ -116,3 +116,25 @@ test('拒绝符号链接的源库路径', () => {
     assert.match(r.stderr, /拒绝符号链接/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+
+test('v2 备份按实际版本命名并保留对账表',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'eve-t4-v2-backup-'));
+ try{
+  const src=seed(dir),out=join(dir,'backups');
+  const a=EveArchive.open(src,identity);
+  try{a.upgradeToV2();}finally{a.close();}
+  const result=run(['backup','--src',src,'--out',out]);
+  assert.equal(result.status,0,result.stderr);
+  const report=JSON.parse(result.stdout) as {file:string;verify:string;sourceUnchanged:boolean};
+  assert.match(report.file,/eve-v2-.*\.sqlite$/);
+  assert.match(report.verify,/v2 messages=1 meta=v2/);
+  assert.equal(report.sourceUnchanged,true);
+  const copy=new DatabaseSync(report.file,{readOnly:true});
+  try{
+   assert.equal((copy.prepare('PRAGMA user_version').get() as {user_version:number}).user_version,2);
+   assert.equal((copy.prepare('SELECT COUNT(*) n FROM messages').get() as {n:number}).n,1);
+   assert.equal((copy.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE type='table' AND name IN ('reconcile_epochs','reconcile_pages','eligible_events')").get() as {n:number}).n,3);
+  }finally{copy.close();}
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});

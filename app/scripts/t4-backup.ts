@@ -59,6 +59,7 @@ function verifyBackup(file: string): { ok: boolean; detail: string } {
     const meta = db.prepare('SELECT schema_version,owner_uid,target_uid FROM archive_meta WHERE singleton=1')
       .get() as { schema_version: number; owner_uid: string; target_uid: string } | undefined;
     if (!meta) return { ok: false, detail: 'archive_meta_missing' };
+    if (meta.schema_version !== version) return { ok: false, detail: 'schema_meta_mismatch' };
     const messages = (db.prepare('SELECT COUNT(*) n FROM messages').get() as { n: number }).n;
     return { ok: true, detail: `v${version} messages=${messages} meta=v${meta.schema_version}` };
   } finally { db.close(); }
@@ -72,8 +73,17 @@ if (command === 'backup') {
   mkdirSync(outDir, { recursive: true, mode: 0o700 });
   chmodSync(outDir, 0o700);
   const before = fingerprint(src);
+  const versionDb = new DatabaseSync(src, { readOnly: true });
+  let sourceVersion: number;
+  try {
+    sourceVersion = (versionDb.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
+  } finally { versionDb.close(); }
+  if (sourceVersion !== 1 && sourceVersion !== 2) {
+    console.error('backup_failed: schema_unsupported');
+    process.exit(2);
+  }
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const target = join(outDir, `eve-v1-${stamp}.sqlite`);
+  const target = join(outDir, `eve-v${sourceVersion}-${stamp}.sqlite`);
   const temp = target + '.tmp';
   // 只读打开源库：备份过程不得改写源库。
   const source = new DatabaseSync(src, { readOnly: true });

@@ -149,3 +149,23 @@ T4-1：完善 PlatformPort 历史页可观测性，覆盖 SDK 光标与过滤行
 - **备份校验**：生成后必须通过 `PRAGMA integrity_check`、`user_version ∈ {1,2}`、`archive_meta` 存在且身份一致、消息计数可读，才算可用；任一项失败即删除产物并报错。
 - **回滚语义**：`rollback` 前先校验备份可用；先把当前库另存为 `*.pre-rollback-<timestamp>`（不静默丢弃），删除旧 `-wal`/`-shm`，再用 `VACUUM INTO` 从备份重建目标库并复校，最后 0600/0700 收权。
 - **禁止项**：不得在未完成可用备份的情况下执行 v1→v2；不得用回滚替代迁移失败的事务回滚（两者互补：事务回滚处理运行中失败，备份处理迁移后发现问题或库损坏）。
+
+## 15. T4-8 正式环境 Gate 的安全事实
+
+- 正式 v1→v2 已在备份经过一致性验证、实例锁保护下完成；真实 SDK 历史全量补收后正式库 132 条，首次 5 页完成可信水位签发，重启旧锚点重叠仅需两页。每轮停止都会撤销当前 `verified`，保留旧锚点。生产库不再是 v1。
+- 原 Runner `pause` 在 DB 中未撤销 `verified` 是本轮真实 Gate 发现的失败；现已改成 pause ACK 前事务撤销，失败必须安全阻塞。真实 pause/resume 现场验证通过；恢复后重新核对头部与锚点，不复用旧 epoch。
+- 真实 Runner 对账请求添加 850ms 页间隔以降低突发请求，备份文件名按实际 schema v1/v2 命名。迁移前 v1 备份与迁移后含 132 条消息的 v2 快照均保留。
+- 真实断线/网络恢复的现场演练尚未执行；Mock 已有重连 Gate，不能与真实链路验收混为一谈。所有演练不调用 AI、不发送消息。
+
+## 16. 证明有效期门控（verified 不是永久状态）
+
+**原则**：一份 coverageProof 只在有限时间内有效。无法持续证明其有效性时，系统必须拒绝继续使用这份证明——即使 SDK 从未报告断线。
+
+- **API**：`EveArchive.coverageStatus(conversationId, maxAgeMs)` 返回 `{state, verified, fresh, usable, ageMs}`。**调用方必须以 `usable` 为准，不得只读 `sync_state`**。
+- **判定**：`usable = verified && fresh`；`fresh` 要求 `last_verified_at_ms` 存在、非未来时间（时钟回拨）、且 `ageMs <= maxAgeMs`。时间戳缺失或倒退一律不可用，不假设「刚验证过」。
+- **有效期**：`Runner.COVERAGE_MAX_AGE_MS` 默认 90 秒，远小于典型会话间隔，且是 SDK 心跳周期（15s）的整数倍——多次心跳未确认即不再信任旧证明。
+- **Runner 行为**：轮询循环中检查；发现 `verified` 但 `!usable` 时调用 `invalidateCurrentCoverage()` 撤销当前门控并触发重新对账。历史锚点保留。
+- **与断线事件的关系**：`offline`/`reconnecting` 仍触发立即撤销（更快），但**不再是唯一路径**。SDK 静默失联时由有效期兜底。
+- **Schema 保障**：`conversations` 表的 CHECK 约束禁止 `sync_state='verified'` 且锚点/时间戳缺失，因此「verified 但无时间戳」在数据库层不可能存在。
+- **T5 义务**：AI 领取消息前必须独立检查 `usable`，不得仅凭 `sync_state='verified'` 放行。
+- **已知局限**：若对账持续成功，`last_verified_at_ms` 会被持续刷新，证明不会过期——这符合语义（能持续证明即可用）。有效期门控针对的是**对账无法继续成功**的场景。

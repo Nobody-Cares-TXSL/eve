@@ -78,3 +78,6 @@ Thumbs.db
 *.tmp
 *.bak
 *.orig
+
+# T4 探针运行产物（临时状态目录，不入库）
+.t4-reconnect-state/
