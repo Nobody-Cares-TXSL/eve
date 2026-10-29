@@ -48,3 +48,14 @@
 ### 第二次真实 CLI 诊断记录
 
 `2026-10-29` 第二次显式测试仍是 blocked/backend_failed，耗时约 3.3 秒，输出审计记录被故障状态保护，未发送私信。仅凭 `claude auth status` 可用、HTTPS HEAD 404 不能推断模型成功、付费状态或请求是否实际到达模型服务器。当前预检在与 Agent 同等精简环境和临时目录下通过，排除简单的 cwd 环境/登录凭据缺失假说；非零退出结构化结果现另行固定分类（不泄露原始 stdout）。真实生成 Gate 继续保留未完成，下一轮不得未经确认自动重试。
+
+## 真实联调通过后的契约补充（2026-10-29）
+
+真实调用失败的三项根因已定位并修复，契约相应收紧：
+
+- **结构化输出的实现依赖**：`--json-schema` 由 Claude Code 内置 `StructuredOutput` 工具承载。**不得用 `--tools ''` 或 `--disallowedTools '*'` 把它一并禁用**，否则 schema 永远无法满足。当前只放行该工具：`--tools 'StructuredOutput'`，其余文件/命令/网络/MCP 工具保持不可用。
+- **不设 `--max-turns`**：结构化输出需要额外的工具回合，`--max-turns 1/2` 实测均返回 `error_max_turns`。资源边界由 `--max-budget-usd`、传输层超时与输出字节上限共同约束。
+- **输出形态**：CLI 可能返回**事件数组**（system/assistant/result…）而非单个 result 对象；解析器必须同时接受两种形态，并只取最后一个 `type='result'` 事件。
+- **模型名不绑定 Anthropic 命名**：通过 `EVE_CLAUDE_MODEL` 配置（只做注入安全校验：非空、≤200 字符、无空白/控制字符），并透传 `ANTHROPIC_MODEL`、`ANTHROPIC_DEFAULT_*_MODEL`、`CLAUDE_CODE_MODEL_CAPABILITIES` 等路由变量。部署环境的网关可能注册任意模型标识。
+- **提示词与权限必须一致**：提示词曾写 "Do not use any tools"，与放行 StructuredOutput 矛盾，导致模型两次被权限拒绝。提示词现明确"只通过 StructuredOutput 提交结果"。
+- **权限边界不变**：以上仍是应用层工具白名单，**不是操作系统级沙箱**；插件与本机工具执行权限继续关闭。

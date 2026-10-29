@@ -163,13 +163,13 @@
 - [x] 认领事务内检查滚动 1 小时与 24 小时次数预算、最小间隔和失败冷却；进程重启不能清零，拒绝时不能调用 Claude。
 - [ ] 真实 Claude API/CLI 费用测量、跨日期长期限额校准、真实网络异常退避、更多内容安全负例和人工审批仍需后续 Gate。
 
-### AC-T5.ClaudeRealSmoke（真实模型 Gate 尚未通过）
+### AC-T5.ClaudeRealSmoke（真实模型 Gate 已通过，2026-10-29）
 
 - [x] 登录状态只读检查通过且不会输出凭据；单次实盘测试输入为虚构账号消息，真实抖音库保持不变、0 发送。
 - [x] 执行失败不得被 CLI 退出码 0 冒充成功；真实 CLI 模式 blocked 必须非零。
 - [x] 错误可归类为固定 code 而不能回显 stdout/stderr 原文、Token、UID、真实对话；Runner 不能在 Agent 认证、网络、CLI 参数或协议失败后继续处理下一条 eligible。
 - [x] 模拟 CLI 子进程成功与认证失败两种端到端路径通过、失败保持完整 SQLite blocked 审计。
-- [ ] **首次真实 Claude 结果成功校验**：本轮实际调用返回 blocked/backend_failed，根因未知，不能冒充完成；须有可诊断结果并另外授权单次再测。
+- [x] **首次真实 Claude 结果成功校验**：根因已定位并修复（StructuredOutput 工具被 `--tools ''`/`--disallowedTools '*'` 禁用、`--max-turns` 截断工具回合、CLI 返回事件数组而解析器只接受单对象）。经 Eve 自身入口 `EVE_T5_CLAUDE_CALL=1 EVE_CLAUDE_MODEL=<环境模型> pnpm t5:claude` 取得 `status=dry_run`、`action=reply`、`aiLedger.recorded=1`、`messagesSent=0`、`eligibleConsumed=0`、退出码 0。证据见 docs/TODO-GATES.md T5-6。
 - [ ] 服务侧可核验的 token / 费用及订阅额度检查，尚未完成。
 
 ### AC-T5.P0-P2 审查修复验收
@@ -177,4 +177,4 @@
 - [x] 任意 AgentTransportCode 由统一类型定义向上贯穿到 DryRunFailure，所有 11 类异常均以自身固定码写入脱敏 dry-run 审计，不因引擎漏列而二次坍缩。
 - [x] Claude 结构 Schema 对 reply/skip/defer 使用支持的 nested anyOf 严格 required/extra keys；本地校验器独立强制 reply 文本和延迟、defer 延迟、reason 边界；官方不支持的数字/字符串约束不得伪装成由远端执行。
 - [x] Claude argv/预检帮助要求同源生成；--max-turns 文档支持但本机 help 隐藏，预检明确表达这一不可验边界；删去永远不会到达的 exitCode 分支。
-- [ ] 下一次真实 CLI 组合、嵌套 Schema 与账号网络端到端验收仍需单独人工明确授权与实际证据；不能以 mock 成功宣告通过。
+- [x] 真实 CLI 组合、嵌套 Schema 与账号网络端到端验收已通过（见 AC-T5.ClaudeRealSmoke 与 T5-6）。仍保留：`--max-turns` 已移除，资源边界改由预算/超时/输出上限约束，长期费用测量未做。

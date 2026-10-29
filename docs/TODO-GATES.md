@@ -687,3 +687,60 @@ WAL 模式下，已提交但未 checkpoint 的事务只在 `-wal` 里。裸复�
 - `pnpm t5:check`：本机 Claude 2.1.310、OAuth 登录、公开参数预检 ready，`modelRequests=0`；隐藏 `--max-turns` 不由 --help 证明，仍由共享 CLI 参数列表保留并单独登记。
 - 正式 `app/data/eve.sqlite` **只读**查询 `user_version=2`、`PRAGMA quick_check=ok`，Runner `phase=stopped`、`alive=false`。没有正式 v3 迁移、未向抖音发送私信、**没有第三次真实 Claude 调用**、未创建 Git commit。
 - **Gate 限制**：即便错误码现已完整上传，`agent_execution_failed` 仍表示 stderr/CLI 输出不可进一步识别的真实错误，不能保证下一次必定获得网络/认证/限额层面的精确根因；嵌套 anyOf JSON Schema 仅经离线 fake CLI 验证，尚无真实 Claude 服务端成功接收证据。完整 T5 与真实模型 Gate 仍未完成。
+
+### T5-6 真实 Claude 联调通过：三个根因全部定位（2026-10-29）
+
+**T5 真实 Claude CLI 一次成功生成 Gate：通过。**
+
+#### 根因（此前两次失败都源于此，与认证/网络/额度无关）
+
+用本地假端点 + 逐参数隔离实验定位，未依赖反复消耗额度试错：
+
+| # | 根因 | 证据 | 影响 |
+|---|---|---|---|
+| 1 | `--tools ''` + `--disallowedTools '*'` 把 Claude Code 内置的 **StructuredOutput 工具**一并禁用 | CLI 输出：`Permission to use StructuredOutput has been denied` | `--json-schema` 永远无法满足 |
+| 2 | `--max-turns 1`（及 2）截断结构化输出所需的额外工具回合 | `subtype: error_max_turns`、`is_error: true` | 提前失败 |
+| 3 | CLI 以**事件数组**返回（system/assistant/result…），而 `parseOutput` 只接受单个对象 | 实测 55~221 个事件 | 即便退出码 0 也会被判 `agent_invalid_output` |
+
+三者叠加导致错误文案既不匹配认证也不匹配网络正则，最终落到 `agent_execution_failed`（P0 修复前是 `backend_failed`），因此前两轮无法定位。
+
+#### 修复
+
+- `--tools 'StructuredOutput'`：只放行这一个内置工具（非文件/命令工具，仅按 schema 提交结果），移除 `--disallowedTools '*'`
+- 移除 `--max-turns`：资源边界改由 `--max-budget-usd 0.10`、传输层 30s 超时、输出字节上限共同约束
+- `parseOutput` 同时接受「单个 result 对象」与「事件数组（取最后一个 type=result）」
+- 模型名可配置：`EVE_CLAUDE_MODEL`（不校验 Anthropic 命名，只做注入安全校验）；`safeAgentEnvironment` 透传 `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_MODEL_CAPABILITIES` 等模型路由变量
+- 提示词同步修正：原写 "Do not use any tools"，与放行 StructuredOutput 矛盾，模型因此两次被拒
+
+#### 端到端验收（Eve 自己的入口，非裸 CLI）
+
+```
+EVE_T5_CLAUDE_CALL=1 EVE_CLAUDE_MODEL='workbuddy-ai/deepseek-v4.1-flash[1m]' pnpm t5:claude
+```
+
+| 指标 | 实测 |
+|---|---|
+| `status` | **`dry_run`** |
+| `action` / `replyLength` | `reply` / 28 |
+| `aiLedger` | recorded **1**、blocked **0**、interrupted 0 |
+| `messagesSent` | **0** |
+| `eligibleConsumed` | **0** |
+| 耗时 | 3360ms |
+| 退出码 | 0 |
+
+隔离实验中的单次调用成本约 $0.005–0.019（`--max-budget-usd 0.10` 上限内）。
+
+#### 正式环境状态
+
+- 正式 `data/eve.sqlite`：`user_version=2`、`quick_check=ok`、messages=132 —— **未迁移 v3、未被本轮触碰**
+- 未发送任何抖音私信；未消费 eligible
+- 探针进程与临时文件已清理，端口 8787 已关闭
+
+#### 仍然成立的限制
+
+- 本轮验证的是 **dry-run 决策生成**，不是发送。T6 的发送链路仍未开始。
+- `EVE_CLAUDE_MODEL` 是本机环境相关配置，不写入仓库；部署到其他环境需按该环境的模型标识设置。
+- 成本控制依赖 `--max-budget-usd` 与调用预算表，尚未做长期费用测量。
+- 单次成功不等于长期稳定；持续运行、超时/限流退避仍需后续验证。
+
+**判定：T5 的真实 Claude 生成 Gate 通过；T5 整体仍不标记完成（发送属 T6）。**

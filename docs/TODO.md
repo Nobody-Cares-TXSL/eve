@@ -108,6 +108,6 @@
 
 ## 当前下一步
 
-**R-01～R-04、T0、T1、T2、T3、T4 已完成（证据见 docs/TODO-GATES.md）。下一步：T5 AI 决策与生成（dry-run），仍一次一个 Slice。T5 强制 Gate：领取消息前必须检查 `coverageStatus().usable`，不得仅凭 `sync_state=verified` 或 `eligible_events` 存在就放行。** 下一次开始编程前先完成：本 Slice 的四问、Contract、可重复 AC、测试设计、理解关口。通过后才勾选，未完成任务不提前标记完成。
+**R-01～R-04、T0～T4 已完成；T5 的 AI 决策引擎、持久认领与真实 Claude 生成 Gate 已通过（证据见 docs/TODO-GATES.md T5-6），但 T5 整体未标记完成——发送属 T6。下一步：T5 收尾（持续运行下的超时/限流退避与费用测量），随后进入 T6 发送链路。** 不变约束：领取消息前必须检查 `coverageStatus().usable`，不得仅凭 `sync_state=verified` 或 `eligible_events` 存在就放行。 下一次开始编程前先完成：本 Slice 的四问、Contract、可重复 AC、测试设计、理解关口。通过后才勾选，未完成任务不提前标记完成。
 
 **当前最重要的边界**：SDK 已验证的是可行性，不是 Eve 整体完成；不修改上游账号凭证，不在未经准备的情况下触发真实自动发送。
