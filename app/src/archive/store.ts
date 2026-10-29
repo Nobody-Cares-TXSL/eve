@@ -1,14 +1,27 @@
 import {DatabaseSync} from 'node:sqlite';
 import {readFileSync,mkdirSync,lstatSync,existsSync,chmodSync,openSync,closeSync} from 'node:fs';
 import {resolve,dirname} from 'node:path';
-import {createHash} from 'node:crypto';
+import {createHash,randomUUID} from 'node:crypto';
 import type {InboundMessage,HistoryPage} from '../platform/types.ts';
 export interface ArchiveIdentity {ownerUid:string;targetUid:string;ownUids:readonly string[]}
 export interface Batch {batchId:string;conversationId:string;source:'live'|'history';messages:readonly InboundMessage[];gapReason?:string}
 export interface BatchResult {outcomes:readonly ('new'|'matched'|'ambiguous')[];replayed:boolean;requiresReconcile:true}
+export interface AiCallPolicy {
+ readonly maxPerHour?:number;
+ readonly maxPerDay?:number;
+ readonly minIntervalMs?:number;
+ readonly failureCooldownMs?:number;
+}
+export interface DryRunCandidate {
+ readonly eventId:string;
+ readonly eventIds:readonly string[];
+ readonly turns:readonly {role:'user'|'assistant';text:string}[];
+}
+
 export class ArchiveError extends Error {readonly code:string;constructor(code:string){super(code);this.code=code;}}
 const sql=readFileSync(new URL('./schema.sql',import.meta.url),'utf8');
 const sqlV2=readFileSync(new URL('./schema-v2.sql',import.meta.url),'utf8');
+const sqlV3=readFileSync(new URL('./schema-v3.sql',import.meta.url),'utf8');
 function digest(r:Batch){return createHash('sha256').update(JSON.stringify([r.conversationId,r.source,r.gapReason??null,r.messages.map(m=>[m.conversationId,m.serverMessageId,m.clientMessageId,m.senderUid,m.fromSelf,m.text,m.kind,m.messageType,m.createTime,m.indexInConversation])])).digest('hex');}
 export class EveArchive {
  private closed=false;
@@ -42,7 +55,7 @@ export class EveArchive {
   try{
    db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=3000');
    const version=(db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-   if(version!==0&&version!==1&&version!==2)throw new ArchiveError('schema_unsupported');
+   if(version!==0&&version!==1&&version!==2&&version!==3)throw new ArchiveError('schema_unsupported');
    if(version===0){
     // SQLite user_version 0 has no versioned Eve schema. Only an EMPTY
     // pre-existing SQLite DB may safely initialize as v1.
@@ -83,7 +96,7 @@ export class EveArchive {
  upgradeToV2(injectFailure=false):void{
   this.check();
   const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-  if(version===2)return;
+  if(version===2||version===3)return;
   if(version!==1)throw new ArchiveError('schema_unsupported');
   this.db.exec('BEGIN IMMEDIATE');
   try{
@@ -93,6 +106,26 @@ export class EveArchive {
    this.db.exec('PRAGMA user_version=2');
    this.db.exec('COMMIT');
   }catch(e){this.db.exec('ROLLBACK');throw e;}
+ }
+ /** T5 explicit migration: only invoke on a backed-up, authorized database. */
+ upgradeToV3(injectFailure=false):void{
+  this.check();
+  const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
+  if(version===3)return;
+  if(version!==2)throw new ArchiveError('migration_requires_v2');
+  this.db.exec('BEGIN IMMEDIATE');
+  try{
+   this.db.exec(sqlV3);
+   if(injectFailure)throw new ArchiveError('migration_injected_failure');
+   this.db.exec('UPDATE archive_meta SET schema_version=3 WHERE singleton=1');
+   this.db.exec('PRAGMA user_version=3');
+   this.db.exec('COMMIT');
+  }catch(e){this.db.exec('ROLLBACK');throw e;}
+ }
+ private requireV3():void{
+  this.check();
+  if((this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version!==3)
+   throw new ArchiveError('ai_requires_v3');
  }
  private valid(r:Batch,m:InboundMessage){
   const own=new Set(this.identity.ownUids),parts=r.conversationId.split(':');
@@ -149,7 +182,7 @@ export class EveArchive {
   private requireV2():void{
     this.check();
     const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-    if(version!==2)throw new ArchiveError('reconcile_requires_v2');
+    if(version!==2&&version!==3)throw new ArchiveError('reconcile_requires_v2');
   }
   private validThread(thread:string):boolean {
     const p=thread.split(':'), own=new Set(this.identity.ownUids);
@@ -357,6 +390,219 @@ export class EveArchive {
   *   usable   两者同时成立才为 true
   *   ageMs    verified 距今多久（未 verified 时为 null）
   */
+ /**
+  * T5 proof revision. Prevents ABA: pause/reconnect may invalidate proof and
+  * finish a NEW verified epoch while an AI backend is still evaluating.
+  */
+ coverageEpoch(id:string,maxAgeMs:number):string|null{
+  if(!this.coverageStatus(id,maxAgeMs).usable)return null;
+  const row=this.db.prepare(
+   "SELECT epoch_id FROM reconcile_epochs WHERE conversation_id=? AND state='verified' ORDER BY rowid DESC LIMIT 1"
+  ).get(id) as {epoch_id:string}|undefined;
+  return row?.epoch_id??null;
+ }
+ /**
+  * T5 preview only. Does NOT claim/consume an eligible event.
+  * Performs the T4 usable gate before exposing text even to our own AI engine.
+  */
+ readDryRunCandidate(id:string,maxAgeMs:number,maxTurns=5,excludeAttempted=false,maxBatchEvents=1):DryRunCandidate|null{
+  this.requireV2();
+  if(!this.validThread(id))throw new ArchiveError('rejected');
+  if(!Number.isSafeInteger(maxTurns)||maxTurns<1||maxTurns>6)throw new ArchiveError('invalid_context_limit');
+  if(!this.coverageStatus(id,maxAgeMs).usable)throw new ArchiveError('coverage_unusable');
+  if(excludeAttempted)this.requireV3();
+  if(!Number.isSafeInteger(maxBatchEvents)||maxBatchEvents<1||maxBatchEvents>3)throw new ArchiveError('invalid_batch_limit');
+  const query=
+   "SELECT e.server_message_id AS event_id,m.local_id,m.text,m.kind,m.sender_uid,m.from_self,m.create_time,m.index_in_conversation "+
+   "FROM eligible_events e JOIN messages m ON m.conversation_id=e.conversation_id AND m.server_message_id=e.server_message_id "+
+   "WHERE e.conversation_id=? AND e.state='pending' "+
+   (excludeAttempted?"AND NOT EXISTS (SELECT 1 FROM ai_batch_items a WHERE a.conversation_id=e.conversation_id AND a.server_message_id=e.server_message_id) ":"")+
+    "ORDER BY CASE WHEN length(m.create_time)=13 AND m.create_time NOT GLOB '*[^0-9]*' "+
+   "THEN CAST(m.create_time AS INTEGER) ELSE 9223372036854775807 END,m.local_id LIMIT 1";
+  const row=this.db.prepare(query).get(id) as {event_id:string;local_id:number;text:string;kind:string;sender_uid:string;from_self:number;create_time:string|null;index_in_conversation:string|null}|undefined;
+  if(!row)return null;
+  if(row.sender_uid!==this.identity.targetUid||row.from_self!==0||row.kind!=='text'||!row.text.trim())
+   throw new ArchiveError('eligible_invalid');
+  // local_id reflects SDK page insertion order, not necessarily send chronology.
+  // Only inject time-ordered context with a trustworthy millisecond timestamp.
+  const timeValid=row.create_time!==null&&/^\d{13}$/.test(row.create_time);
+  const indexValid=row.index_in_conversation!==null&&/^\d+$/.test(row.index_in_conversation)&&
+   Number.isSafeInteger(Number(row.index_in_conversation));
+  const history=(timeValid?this.db.prepare(
+   "SELECT sender_uid,from_self,text,kind FROM messages WHERE conversation_id=? "+
+   "AND length(create_time)=13 AND create_time NOT GLOB '*[^0-9]*' "+
+   "AND (CAST(create_time AS INTEGER)<? OR (CAST(create_time AS INTEGER)=? AND local_id=?)) "+
+   "AND kind='text' AND length(text)>0 ORDER BY CAST(create_time AS INTEGER) DESC,local_id DESC LIMIT ?"
+  ).all(id,Number(row.create_time),Number(row.create_time),row.local_id,maxTurns)
+   :indexValid?this.db.prepare(
+    "SELECT sender_uid,from_self,text,kind FROM messages WHERE conversation_id=? "+
+    "AND index_in_conversation NOT GLOB '*[^0-9]*' "+
+    "AND index_in_conversation IS NOT NULL "+
+    "AND (CAST(index_in_conversation AS INTEGER)<? OR (CAST(index_in_conversation AS INTEGER)=? AND local_id=?)) "+
+    "AND kind='text' AND length(text)>0 "+
+    "ORDER BY CAST(index_in_conversation AS INTEGER) DESC,local_id DESC LIMIT ?"
+   ).all(id,Number(row.index_in_conversation),Number(row.index_in_conversation),row.local_id,maxTurns)
+   :[{sender_uid:row.sender_uid,from_self:row.from_self,text:row.text,kind:row.kind}]) as {sender_uid:string;from_self:number;text:string;kind:string}[];
+  if(!history.length)throw new ArchiveError('eligible_invalid');
+  const own=new Set(this.identity.ownUids);
+  const turns=history.reverse().map(item=>{
+   const target=item.sender_uid===this.identity.targetUid && item.from_self===0;
+   const sender=own.has(item.sender_uid)&&item.from_self===1;
+   if(!target&&!sender)throw new ArchiveError('context_identity_invalid');
+   return {role:(target?'user':'assistant') as 'user'|'assistant',text:item.text.slice(0,1200)};
+  });
+  if(turns.at(-1)?.role!=='user')throw new ArchiveError('eligible_invalid');
+  const eventIds=[row.event_id];
+  if(excludeAttempted&&maxBatchEvents>1){
+   // Missing/invalid timestamps anywhere in the archived thread make
+   // "consecutive" impossible to prove. Fail closed to single-event claims.
+   const unknownTimeline=this.db.prepare(
+    "SELECT COUNT(*) n FROM messages WHERE conversation_id=? "+
+    "AND (create_time IS NULL OR length(create_time)<>13 OR create_time GLOB '*[^0-9]*')"
+   ).get(id) as {n:number};
+   if(unknownTimeline.n>0)return {eventId:row.event_id,eventIds,turns};
+   // Only consecutive, *eligible* incoming text records: stop at outgoing messages,
+   // unsupported timestamps, non-text, attempted items or a long time gap.
+   const followers=this.db.prepare(
+    "SELECT m.server_message_id,m.sender_uid,m.from_self,m.kind,m.text,m.create_time,m.local_id,"+
+    "e.state AS eligible_state,b.claim_id AS attempted "+
+    "FROM messages m LEFT JOIN eligible_events e ON e.conversation_id=m.conversation_id AND e.server_message_id=m.server_message_id "+
+    "LEFT JOIN ai_batch_items b ON b.conversation_id=m.conversation_id AND b.server_message_id=m.server_message_id "+
+    "WHERE m.conversation_id=? AND length(m.create_time)=13 "+
+    "AND m.create_time NOT GLOB '*[^0-9]*' "+
+    "AND (CAST(m.create_time AS INTEGER)>? OR (CAST(m.create_time AS INTEGER)=? AND m.local_id>?)) "+
+    "ORDER BY CAST(m.create_time AS INTEGER),m.local_id LIMIT 8"
+   ).all(id,Number(row.create_time),Number(row.create_time),row.local_id) as {
+    server_message_id:string;sender_uid:string;from_self:number;
+    kind:string;text:string;create_time:string|null;local_id:number;eligible_state:string|null;attempted:string|null}[];
+   let previousTime=timeValid?Number(row.create_time):NaN;
+   let total=turns.at(-1)!.text.length;
+   const merged=[turns.at(-1)!.text];
+   for(const f of followers){
+    if(eventIds.length>=maxBatchEvents)break;
+    const nextTime=f.create_time&&/^\d{13}$/.test(f.create_time)?Number(f.create_time):NaN;
+    if(f.sender_uid!==this.identity.targetUid||f.from_self!==0||f.kind!=='text'||
+       f.eligible_state!=='pending'||f.attempted!==null||!f.text.trim()||
+       !Number.isFinite(previousTime)||!Number.isFinite(nextTime)||
+       nextTime<=previousTime||nextTime-previousTime>15000||
+       total+1+f.text.length>1200)break;
+    eventIds.push(f.server_message_id);
+    merged.push(f.text);
+    total+=1+f.text.length;
+    previousTime=nextTime;
+   }
+   if(merged.length>1)turns[turns.length-1]={role:'user',text:merged.join('\n')};
+  }
+  return {eventId:row.event_id,eventIds,turns};
+ }
+ /** Claim is a permanent, single-attempt dry-run reservation: crashes never auto-retry an AI call. */
+ claimAiDryRun(input:{conversationId:string;maxAgeMs:number;backendId:string;backendKind:'model-api'|'agent-runtime';maxBatchEvents?:number;policy?:AiCallPolicy}):
+   {claimId:string;proofEpoch:string;candidate:DryRunCandidate}|null{
+  this.requireV3();
+  if(!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(input.backendId)||!['model-api','agent-runtime'].includes(input.backendKind))
+   throw new ArchiveError('invalid_backend');
+  this.db.exec('BEGIN IMMEDIATE');
+  try{
+   const proofEpoch=this.coverageEpoch(input.conversationId,input.maxAgeMs);
+   if(!proofEpoch)throw new ArchiveError('coverage_unusable');
+   const candidate=this.readDryRunCandidate(input.conversationId,input.maxAgeMs,5,true,input.maxBatchEvents??1);
+   if(!candidate){this.db.exec('COMMIT');return null;}
+   const p=input.policy??{};
+   const maxHour=p.maxPerHour??6,maxDay=p.maxPerDay??30;
+   const minInterval=p.minIntervalMs??0,failCooldown=p.failureCooldownMs??0;
+   if(![maxHour,maxDay,minInterval,failCooldown].every(Number.isSafeInteger)||
+      maxHour<1||maxHour>100||maxDay<1||maxDay>500||
+      minInterval<0||minInterval>3600000||failCooldown<0||failCooldown>86400000)
+    throw new ArchiveError('invalid_ai_policy');
+   const now=Date.now();
+   const usage=this.db.prepare(
+    "SELECT COUNT(*) AS all_calls,"+
+    "SUM(CASE WHEN claimed_at_ms>? THEN 1 ELSE 0 END) AS recent_hour "+
+    "FROM ai_decision_attempts WHERE claimed_at_ms>?"
+   ).get(now-3600000,now-86400000) as {all_calls:number;recent_hour:number|null};
+   if(Number(usage.recent_hour??0)>=maxHour)throw new ArchiveError('ai_budget_hourly');
+   if(usage.all_calls>=maxDay)throw new ArchiveError('ai_budget_daily');
+   const latest=this.db.prepare(
+    "SELECT claimed_at_ms,state,finished_at_ms FROM ai_decision_attempts ORDER BY claimed_at_ms DESC LIMIT 1"
+   ).get() as {claimed_at_ms:number;state:string;finished_at_ms:number|null}|undefined;
+   if(latest){
+    if(now<latest.claimed_at_ms)throw new ArchiveError('ai_cooldown');
+    if(now-latest.claimed_at_ms<minInterval)throw new ArchiveError('ai_cooldown');
+   }
+   const failed=this.db.prepare(
+    "SELECT MAX(finished_at_ms) AS at FROM ai_decision_attempts WHERE state IN ('blocked','interrupted')"
+   ).get() as {at:number|null};
+   if(failed.at!==null&&(now<failed.at||now-failed.at<failCooldown))
+    throw new ArchiveError('ai_cooldown');
+   const claimId=randomUUID();
+   const eventDigest=createHash('sha256').update(candidate.eventId).digest('hex');
+   this.db.prepare(
+    "INSERT INTO ai_decision_attempts(claim_id,conversation_id,server_message_id,proof_epoch_id,backend_id,backend_kind,state,claimed_at_ms,event_digest) "+
+    "VALUES(?,?,?,?,?,?,'claimed',?,?)"
+   ).run(claimId,input.conversationId,candidate.eventId,proofEpoch,
+    input.backendId,input.backendKind,now,eventDigest);
+   const insert=this.db.prepare(
+    "INSERT INTO ai_batch_items(claim_id,conversation_id,server_message_id,ordinal) VALUES(?,?,?,?)"
+   );
+   for(const [ordinal,eventId] of candidate.eventIds.entries())
+    insert.run(claimId,input.conversationId,eventId,ordinal);
+   this.db.exec('COMMIT');
+   return {claimId,proofEpoch,candidate};
+  }catch(e){this.db.exec('ROLLBACK');throw e;}
+ }
+ /** Finalization is atomic and compares the same proof epoch inside the write transaction. */
+ finishAiDryRun(input:{claimId:string;maxAgeMs:number;outcome:
+  |{status:'recorded';action:'reply'|'skip'|'defer';decisionDigest:string;replyLength:number}
+  |{status:'blocked';reasonCode:string}}):{status:'recorded'|'blocked';reasonCode:string|null}{
+  this.requireV3();
+  if(!/^[a-f0-9-]{36}$/.test(input.claimId))throw new ArchiveError('claim_invalid');
+  this.db.exec('BEGIN IMMEDIATE');
+  try{
+   const row=this.db.prepare(
+    "SELECT conversation_id,proof_epoch_id,state FROM ai_decision_attempts WHERE claim_id=?"
+   ).get(input.claimId) as {conversation_id:string;proof_epoch_id:string;state:string}|undefined;
+   if(!row||row.state!=='claimed')throw new ArchiveError('claim_not_active');
+   const sameProof=this.coverageEpoch(row.conversation_id,input.maxAgeMs)===row.proof_epoch_id;
+   const outcome=input.outcome;
+   const reason=!sameProof?'coverage_lost_after_inference':
+    outcome.status==='blocked'?outcome.reasonCode:null;
+   if(reason!==null){
+    if(!/^[a-z0-9_]{3,80}$/.test(reason))throw new ArchiveError('invalid_audit_reason');
+    this.db.prepare("UPDATE ai_decision_attempts SET state='blocked',finished_at_ms=?,failure_code=? WHERE claim_id=?")
+     .run(Date.now(),reason,input.claimId);
+   }else{
+    if(outcome.status!=='recorded'||!['reply','skip','defer'].includes(outcome.action)||
+       !/^[a-f0-9]{64}$/.test(outcome.decisionDigest)||
+       !Number.isSafeInteger(outcome.replyLength)||outcome.replyLength<0||outcome.replyLength>500)
+     throw new ArchiveError('invalid_audit');
+    this.db.prepare(
+     "UPDATE ai_decision_attempts SET state='recorded',finished_at_ms=?,action=?,decision_digest=?,reply_length=? WHERE claim_id=?"
+    ).run(Date.now(),outcome.action,outcome.decisionDigest,outcome.replyLength,input.claimId);
+   }
+   this.db.exec('COMMIT');
+   return reason!==null?{status:'blocked',reasonCode:reason}:{status:'recorded',reasonCode:null};
+  }catch(e){this.db.exec('ROLLBACK');throw e;}
+ }
+ /** Single-instance startup only; avoids replay of a possibly billable Agent invocation. */
+ recoverAbandonedAiClaims():number{
+  this.requireV3();
+  const result=this.db.prepare(
+   "UPDATE ai_decision_attempts SET state='interrupted',finished_at_ms=?,failure_code='crash_interrupted' WHERE state='claimed'"
+  ).run(Date.now());
+  return Number(result.changes);
+ }
+ aiBatchItems():number{
+  this.requireV3();
+  return Number((this.db.prepare('SELECT COUNT(*) n FROM ai_batch_items').get() as {n:number}).n);
+ }
+ aiAttemptStats():{claimed:number;recorded:number;blocked:number;interrupted:number}{
+  this.requireV3();
+  const states:{[key:string]:number}={claimed:0,recorded:0,blocked:0,interrupted:0};
+  const rows=this.db.prepare('SELECT state,COUNT(*) n FROM ai_decision_attempts GROUP BY state')
+   .all() as {state:string;n:number}[];
+  for(const row of rows)states[row.state]=row.n;
+  return {claimed:states['claimed']!,recorded:states['recorded']!,blocked:states['blocked']!,interrupted:states['interrupted']!};
+ }
  coverageStatus(id:string,maxAgeMs:number):{
   state:string|null;verified:boolean;fresh:boolean;usable:boolean;ageMs:number|null;
  }{

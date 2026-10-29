@@ -4,10 +4,12 @@ import {join} from 'node:path';
 import {readState,writeState,paths,initDirs,processStart,BLOCKED,readJson,listRequests,atomicJson,removeFile,type RuntimeState,type Phase,type Paths} from './state.ts';
 import {BoundedQueue} from './queue.ts';
 import {reconcileOnce} from './reconcile.ts';
-import {EveArchive,type ArchiveIdentity} from '../archive/store.ts';
+import {EveArchive,type ArchiveIdentity,type AiCallPolicy} from '../archive/store.ts';
 import type {InboundMessage} from '../platform/types.ts';
 import type {PlatformPort,PlatformSink} from '../platform/types.ts';
 import type {RuntimeConfig} from './config.ts';
+import {durableDryRunOne} from '../ai/engine.ts';
+import type {AiBackend} from '../ai/contracts.ts';
 
 /**
  * 一份 coverageProof 的最长可用时间。超过即撤销，即使 SDK 从未报告断线。
@@ -15,6 +17,15 @@ import type {RuntimeConfig} from './config.ts';
  */
 export const COVERAGE_MAX_AGE_MS = 90_000;
 
+/** Test/explicit-opt-in only. No default model, no production flag in this stage. */
+export interface AiDryRunSlot {
+ readonly backend:AiBackend;
+ readonly maxAttempts:number;
+ readonly timeoutMs?:number;
+ readonly maxBatchEvents?:number;
+ readonly quietPeriodMs?:number;
+ readonly policy?:AiCallPolicy;
+}
 export type Action = 'pause'|'resume'|'stop';
 export interface ControlRequest { readonly id:string; readonly instanceId:string; readonly action:Action; readonly at:number; }
 const actions = new Set(['pause','resume','stop']);
@@ -39,6 +50,12 @@ export class Runner {
   private readonly reconcileEnabled:boolean;
   private readonly historyPageGapMs:number;
   private readonly coverageMaxAgeMs:number;
+  private readonly aiDryRun:AiDryRunSlot|undefined;
+  private aiRunning:Promise<void>|undefined;
+  private aiAbort:AbortController|undefined;
+  private aiAttempts=0;
+  private aiNextCheck=0;
+  private lastInboundAt=0;
   private reconciliationGeneration=0;
   private reconciliationRequested=false;
   private reconciliationRunning:Promise<void>|undefined;
@@ -57,7 +74,18 @@ export class Runner {
   private readonly port:PlatformPort;
   private readonly config:RuntimeConfig;
   constructor(root:string, port:PlatformPort, config:RuntimeConfig, archivePath?:string,
-              reconcileEnabled=false, historyPageGapMs=0, coverageMaxAgeMs=COVERAGE_MAX_AGE_MS) {
+              reconcileEnabled=false, historyPageGapMs=0, coverageMaxAgeMs=COVERAGE_MAX_AGE_MS,
+              aiDryRun?:AiDryRunSlot) {
+    if(aiDryRun && (!archivePath || !reconcileEnabled ||
+      !Number.isSafeInteger(aiDryRun.maxAttempts)||aiDryRun.maxAttempts<1||aiDryRun.maxAttempts>10 ||
+      !Number.isSafeInteger(aiDryRun.timeoutMs??10_000) ||
+      (aiDryRun.timeoutMs??10_000)<1||(aiDryRun.timeoutMs??10_000)>30_000 ||
+      !Number.isSafeInteger(aiDryRun.maxBatchEvents??1)||
+      (aiDryRun.maxBatchEvents??1)<1||(aiDryRun.maxBatchEvents??1)>3||
+      !Number.isSafeInteger(aiDryRun.quietPeriodMs??0)||
+      (aiDryRun.quietPeriodMs??0)<0||(aiDryRun.quietPeriodMs??0)>15000))
+      throw new Error('ai_dry_run_invalid_options');
+    this.aiDryRun=aiDryRun;
     this.reconcileEnabled=reconcileEnabled;
     this.historyPageGapMs=historyPageGapMs;
     this.coverageMaxAgeMs=coverageMaxAgeMs;
@@ -71,6 +99,12 @@ export class Runner {
         if(!this.archive || !this.trustedIdentity) throw new Error('archive_identity_unverified');
         const batchId=randomUUID();
         this.archive.archiveBatch({batchId,conversationId:message.conversationId,source:'live',messages:[message]});
+        // New live data is not eligible until T4 history proof is refreshed.
+        // Schedule only AFTER the live batch has been committed.
+        if(this.reconcileEnabled){
+          this.reconciliationRequested=true;
+          this.wake?.();
+        }
       }
       this.messages++;
     },reason=>{void this.block('paused_env',reason);});
@@ -83,6 +117,7 @@ export class Runner {
     if (this.blockPending) return this.blockPending;
     if (this.faulted || this.stopping) return Promise.resolve();
     this.faulted=true;
+    this.aiAbort?.abort();
     this.q.pause();
     // run() 退出前必须 await 这个 promise：否则返回码读到的是落盘前的 phase。
     this.blockPending=(async()=>{
@@ -106,6 +141,10 @@ export class Runner {
           this.reconciliationRequested=true;
         }
       }
+      // Any incoming message changes context; abort an in-flight dry-run.
+      // The durable claim will be blocked, and the reconciler will re-prove the head.
+      this.aiAbort?.abort();
+      this.lastInboundAt=Date.now();
       this.q.push(message);
     },
     onStatus:status=>{
@@ -124,6 +163,7 @@ export class Runner {
         if(this.reconcileEnabled){
           this.reconciliationGeneration++;
           this.reconciliationAbort?.abort();
+          this.aiAbort?.abort();
           this.reconciliationRequested=true;
           this.wake?.();
         }
@@ -132,6 +172,7 @@ export class Runner {
         this.platformOnline=false;
         this.reconciliationGeneration++;
         this.reconciliationAbort?.abort();
+        this.aiAbort?.abort();
         this.reconciliationRequested=true;
         // 立即排队撤销（不在 SDK 回调栈上做同步 DB 调用，契约 §1）。
         // 撤销与重新对账之间必须有明确顺序：对账启动前 await 此 promise，
@@ -177,11 +218,11 @@ export class Runner {
       this.processed.add(req.id);
       if (this.stopping) {await this.ack(req,false,'stopping');continue;}
       if (req.action==='stop') {
-        this.stopping=true;this.q.pause();this.reconciliationAbort?.abort();await this.set('stopping','stop_requested');
+        this.stopping=true;this.q.pause();this.reconciliationAbort?.abort();this.aiAbort?.abort();await this.set('stopping','stop_requested');
         await this.ack(req,true);this.wake?.();
       } else if (this.faulted) await this.ack(req,false,'blocked');
       else if (req.action==='pause') {
-        this.q.pause();this.reconciliationGeneration++;this.reconciliationAbort?.abort();
+        this.q.pause();this.reconciliationGeneration++;this.reconciliationAbort?.abort();this.aiAbort?.abort();
         // A paused runtime must not retain an old current-coverage gate.
         // Persist gate invalidation before returning the pause acknowledgement.
         if(this.reconcileEnabled&&this.archive){
@@ -209,7 +250,7 @@ export class Runner {
     this.port.subscribe(this.sink);
     let closeFail=false;
     let pendingAtStop=0;
-    const signal=()=>{if (this.stopping) return;this.stopping=true;this.q.pause();this.reconciliationAbort?.abort();this.wake?.();};
+    const signal=()=>{if (this.stopping) return;this.stopping=true;this.q.pause();this.reconciliationAbort?.abort();this.aiAbort?.abort();this.wake?.();};
     process.on('SIGINT',signal);
     process.on('SIGTERM',signal);
     try {
@@ -225,6 +266,10 @@ export class Runner {
             this.archive=EveArchive.open(this.archivePath,this.trustedIdentity);
             if(this.reconcileEnabled){
               this.archive.upgradeToV2();
+              if(this.aiDryRun){
+                // Never silently upgrade a production database. Single-instance lock is required.
+                this.archive.recoverAbandonedAiClaims();
+              }
               this.archive.invalidateCurrentCoverage();
               const known=this.archive.knownConversations();
               // An Eve-authenticated, already archived thread is evidence; a guessed thread is not.
@@ -270,6 +315,53 @@ export class Runner {
           }).catch(()=>{void this.block('paused_env','reconcile_runtime_failed');})
             .finally(()=>{this.reconciliationRunning=undefined;if(this.reconciliationAbort===controller)this.reconciliationAbort=undefined;this.wake?.();});
         }
+        // T5 experimental opt-in: independent from inbound archive queue.
+        // A single bounded Agent slot only runs under current T4 usable proof.
+        if(this.aiDryRun&&this.archive&&this.confirmedConversationId&&
+           this.platformOnline&&!this.stopping&&!this.faulted&&
+           this.s.phase==='running'&&this.q.isIdle&&
+           !this.reconciliationRunning&&!this.reconciliationRequested&&!this.aiRunning&&
+           this.aiAttempts<this.aiDryRun.maxAttempts&&Date.now()>=this.aiNextCheck&&
+           Date.now()-this.lastInboundAt>=(this.aiDryRun.quietPeriodMs??0)){
+          const archive=this.archive,thread=this.confirmedConversationId;
+          const available=archive.coverageEpoch(thread,this.coverageMaxAgeMs);
+          if(available){
+            const controller=new AbortController();
+            this.aiAbort=controller;
+            const config=this.aiDryRun;
+            this.aiNextCheck=Date.now()+1500;
+            this.aiRunning=durableDryRunOne(archive,config.backend,{
+              conversationId:thread,maxAgeMs:this.coverageMaxAgeMs,
+              timeoutMs:config.timeoutMs??10_000,signal:controller.signal,
+              maxBatchEvents:config.maxBatchEvents??1,
+              ...(config.policy===undefined?{}:{policy:config.policy}),
+            }).then(audit=>{
+              if(audit.status==='dry_run'||(audit.status==='blocked'&&
+                 !['no_pending_event','ai_budget_hourly','ai_budget_daily','ai_cooldown'].includes(audit.reasonCode)))
+                this.aiAttempts++;
+              if(audit.status==='blocked'&&
+                 ['ai_budget_hourly','ai_budget_daily','ai_cooldown'].includes(audit.reasonCode))
+                this.aiNextCheck=Date.now()+10000;
+              if(audit.status==='blocked'&&
+                 ['audit_persist_failed','ledger_unavailable'].includes(audit.reasonCode))
+                void this.block('paused_env','ai_dry_run_ledger_failed');
+              if(audit.status==='blocked'&&
+                 ['agent_cli_configuration_error','agent_auth_error','agent_network_error',
+                  'agent_rate_limit','agent_result_error','agent_invalid_output',
+                  'agent_execution_failed','agent_start_failed','agent_timeout',
+                  'agent_output_too_large'].includes(audit.reasonCode))
+                void this.block('paused_env','ai_backend_unhealthy');
+            }).catch(()=>{void this.block('paused_env','ai_dry_run_runtime_failed');})
+              .finally(()=>{
+                if(this.aiAbort===controller)this.aiAbort=undefined;
+                this.aiRunning=undefined;
+                this.wake?.();
+              });
+          }
+        }
+        // An async Agent failure can set faulted while this iteration is
+        // finishing. Never overwrite its paused_env state with a running pulse.
+        if(this.stopping||this.faulted)break;
         this.s={...this.s,updatedAt:Date.now()};await writeState(this.p,this.s);
         await new Promise<void>(resolve=>{
           this.wake=resolve;
@@ -290,6 +382,8 @@ export class Runner {
       await this.blockPending?.catch(()=>undefined);
       pendingAtStop=this.q.length;
       await this.reconciliationRunning?.catch(()=>undefined);
+      this.aiAbort?.abort();
+      await this.aiRunning?.catch(()=>undefined);
       await this.q.stop();
       if(this.reconcileEnabled&&this.archive){
         try{this.archive.invalidateCurrentCoverage();}catch{closeFail=true;}
@@ -300,6 +394,13 @@ export class Runner {
       try {await this.port.stop();}
       catch {closeFail=true;}
       this.wake=undefined;
+      // All loop writes and blockPending are now settled. Persist the final
+      // fault phase LAST, so an in-flight heartbeat cannot resurrect 'running'
+      // after the agent is blocked and the SDK already stopped.
+      if(this.faulted){
+        try{await writeState(this.p,{...this.s,updatedAt:Date.now()});}
+        catch{closeFail=true;}
+      }
     }
     if (this.faulted) return BLOCKED.includes(this.s.phase)?3:1;
     if (pendingAtStop>0) {

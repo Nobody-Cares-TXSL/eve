@@ -55,11 +55,17 @@ function verifyBackup(file: string): { ok: boolean; detail: string } {
     const integrity = (db.prepare('PRAGMA integrity_check').get() as { integrity_check: string }).integrity_check;
     if (integrity !== 'ok') return { ok: false, detail: 'integrity_failed' };
     const version = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
-    if (version !== 1 && version !== 2) return { ok: false, detail: 'unexpected_schema_version' };
+    if (version !== 1 && version !== 2 && version !== 3) return { ok: false, detail: 'unexpected_schema_version' };
     const meta = db.prepare('SELECT schema_version,owner_uid,target_uid FROM archive_meta WHERE singleton=1')
       .get() as { schema_version: number; owner_uid: string; target_uid: string } | undefined;
     if (!meta) return { ok: false, detail: 'archive_meta_missing' };
     if (meta.schema_version !== version) return { ok: false, detail: 'schema_meta_mismatch' };
+    if (version === 3) {
+      const ledger = db.prepare(
+        "SELECT COUNT(*) n FROM sqlite_master WHERE type='table' AND name IN ('ai_decision_attempts','ai_batch_items')"
+      ).get() as { n: number };
+      if (ledger.n !== 2) return { ok: false, detail: 'ai_ledger_missing' };
+    }
     const messages = (db.prepare('SELECT COUNT(*) n FROM messages').get() as { n: number }).n;
     return { ok: true, detail: `v${version} messages=${messages} meta=v${meta.schema_version}` };
   } finally { db.close(); }
@@ -78,7 +84,7 @@ if (command === 'backup') {
   try {
     sourceVersion = (versionDb.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
   } finally { versionDb.close(); }
-  if (sourceVersion !== 1 && sourceVersion !== 2) {
+  if (sourceVersion !== 1 && sourceVersion !== 2 && sourceVersion !== 3) {
     console.error('backup_failed: schema_unsupported');
     process.exit(2);
   }

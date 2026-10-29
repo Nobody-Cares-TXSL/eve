@@ -19,6 +19,10 @@ import type { InboundMessage } from '../../src/platform/types.ts';
 const identity = { ownerUid: '111', targetUid: '333', ownUids: ['111', '222'] };
 const thread = '0:1:222:333';
 const config = parseConfig({ version: 1, selfUid: '111', targetUid: '333', pollMs: 50 });
+/** 证明有效期。不能用 100ms 这类与 SQLite 读写同量级的值：
+ *  负载下证明可能在测试观测到 verified 之前就已过期（实测偶发 condition_not_met）。
+ *  1500ms 仍远小于下方各等待窗口，能稳定走到过期分支。 */
+const TTL_MS = 1500;
 const msg = (i: number): InboundMessage => ({
   conversationId: thread, serverMessageId: `10000000000000000${i}`, clientMessageId: null,
   senderUid: '333', fromSelf: false, text: 'x', kind: 'text', messageType: 7,
@@ -43,8 +47,7 @@ test('SDK 从不发 offline：过期证明仍必须被 Runner 撤销并重新对
   const db = join(dir, 'eve.sqlite');
   const port = new MockPlatformPort({ uid: '111', imUid: '222' });
   port.delivered.push(...[0, 1, 2, 3, 4].map(msg));
-  // 极短有效期（1ms 级别不合适，用 100ms）便于在测试内触发过期
-  const running = new Runner(stateDir, port, config, db, true, 0, 100).run();
+  const running = new Runner(stateDir, port, config, db, true, 0, TTL_MS).run();
   try {
     await until(async () => (await readState(paths(stateDir)))?.phase === 'running', 'running');
 
@@ -67,15 +70,32 @@ test('SDK 从不发 offline：过期证明仍必须被 Runner 撤销并重新对
     let expired = false;
     for (let i = 0; i < 120; i++) {
       const a = EveArchive.open(db, identity);
-      const s = a.coverageStatus(thread, 100);
+      const s = a.coverageStatus(thread, TTL_MS);
       a.close();
-      if (s.ageMs !== null && s.ageMs > 100) { expired = true; break; }
+      if (s.ageMs !== null && s.ageMs > TTL_MS) { expired = true; break; }
       if (!s.verified) { expired = true; break; }
       await delay(50);
     }
     assert.equal(expired, true, '证明必须最终过期或退出 verified');
-    // 过期后给 Runner 一个轮询周期执行撤销
-    await delay(300);
+    // 门控在证明过期的当下就必须不可用，即使 Runner 尚未获调度。
+    const immediately = EveArchive.open(db, identity);
+    try {
+      assert.equal(immediately.coverageStatus(thread, TTL_MS).usable, false,
+        '即使状态暂为 verified，过期证明必须立即拒绝使用');
+    } finally { immediately.close(); }
+
+    // 并行跑全套测试时 JS 定时器可能因负载延后超过 300ms。
+    // 仍然要求 Runner *实际撤销* verified，只是等待状态转换，而不是
+    // 用固定 sleep 猜测它已获得一个执行周期；有界超时保留真实负例。
+    let invalidated = false;
+    for(let i=0;i<400;i++){
+      const check = EveArchive.open(db,identity);
+      try { invalidated = check.conversationState(thread) !== 'verified'; }
+      finally { check.close(); }
+      if(invalidated)break;
+      await delay(25);
+    }
+    assert.equal(invalidated,true,'过期后 Runner 必须在有界时间内实际撤销 verified');
 
     // 撤销后必须不可用；具体落到 unverified 还是 gap 取决于失败路径，
     // 两者都不放行——断言行为而非字符串。
@@ -83,7 +103,7 @@ test('SDK 从不发 offline：过期证明仍必须被 Runner 撤销并重新对
     try {
       const state = a.conversationState(thread);
       assert.notEqual(state, 'verified', '过期后绝不能仍是 verified');
-      assert.equal(a.coverageStatus(thread, 100).usable, false, '过期后必须不可用');
+      assert.equal(a.coverageStatus(thread, TTL_MS).usable, false, '过期后必须不可用');
       assert.ok(a.getVerifiedAnchor(thread) !== null, '历史锚点必须保留以便重新对账');
     } finally { a.close(); }
 

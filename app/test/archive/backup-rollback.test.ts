@@ -138,3 +138,30 @@ test('v2 备份按实际版本命名并保留对账表',()=>{
   }finally{copy.close();}
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
+
+test('v3 一致性备份能校验 AI 认领表，回滚副本保留决策账本',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'eve-t5-v3-backup-'));
+ try{
+  const src=seed(dir),out=join(dir,'backups');
+  const a=EveArchive.open(src,identity);
+  try{
+   a.upgradeToV2();
+   a.upgradeToV3();
+  }finally{a.close();}
+  const saved=run(['backup','--src',src,'--out',out]);
+  assert.equal(saved.status,0,saved.stderr);
+  const report=JSON.parse(saved.stdout) as {file:string;verify:string;sourceUnchanged:boolean};
+  assert.match(report.file,/eve-v3-.*\.sqlite$/);
+  assert.match(report.verify,/v3 messages=1 meta=v3/);
+  assert.equal(report.sourceUnchanged,true);
+  const check=run(['verify',report.file]);
+  assert.equal(check.status,0,check.stderr);
+  const copy=new DatabaseSync(report.file,{readOnly:true});
+  try{
+   assert.equal((copy.prepare('PRAGMA user_version').get() as {user_version:number}).user_version,3);
+   assert.equal((copy.prepare('SELECT COUNT(*) n FROM messages').get() as {n:number}).n,1);
+   assert.equal((copy.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE type='table' AND name='ai_decision_attempts'").get() as {n:number}).n,1);
+   assert.equal((copy.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE type='table' AND name='ai_batch_items'").get() as {n:number}).n,1);
+  }finally{copy.close();}
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});

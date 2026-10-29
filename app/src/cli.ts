@@ -65,6 +65,12 @@ async function main():Promise<number> {
     await atomicJson(p.state,{...snap.state,phase:'stopped',pid:0,processStart:'',reason:'manual_unblock',updatedAt:Date.now()});
     console.log('已明确解除业务阻塞，请核实风险后再 run');return 0;
   }
+  if(cmd==='run' && args.includes('--experimental-ai-dry-run')) {
+    // The T5 slot is internal/test-injected only. Never silently ignore an
+    // unsupported opt-in flag and give the impression real AI was activated.
+    console.error('T5 Runner AI 自动模式尚未通过正式授权与真实模型 Gate');
+    return 2;
+  }
   if(cmd==='run') {
     await initDirs(p);
     if(!args.includes('--locked') || process.env['EVE_T2_LOCK_HANDOFF'] !== '1') {
