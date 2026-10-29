@@ -128,3 +128,53 @@
 - **AC-T4.8 账号与安全**：SDK 登录 UID/IM UID、会话和目标白名单始终准确；历史不得接受群或非目标账号消息。日志不打印消息正文、真实 UID、挑战 URL；只读联调不得发送/标记已读；无法判定历史完整时明确呈现缺口而不声称“零丢失”。
 - **AC-T4.9 有界资源**：页数/总消息/总耗时/重试次数均有明确上限和失败状态，持续新增消息、半开连接或慢响应不能无限持锁/无限扫描，不能因此放宽 verified 的条件。
 - **AC-T4.10 证明有效期**：`verified` 不是永久状态。`coverageStatus(thread, maxAgeMs)` 必须能独立判定 `usable`；时间戳缺失、未来时间（时钟回拨）、超过有效期一律不可用。**SDK 静默失联（从不发 offline/reconnecting）时，过期证明仍必须被撤销**。Schema 必须禁止「verified 但缺锚点/时间戳」的状态。撤销后历史锚点保留以便重新对账。
+
+## T5 — AI 决策 dry-run（T5-1 本轮冻结，其他条目待实施）
+
+- **AC-T5.1 统一决策 Contract**：reply/skip/defer 必须严格判别；reply 非空且 ≤500 字符、delayMs 0..600000；defer delayMs 1000..86400000；skip 无 text/delayMs；reason ≤120 字符；未知字段（包括工具和发送意图）拒绝。
+- **AC-T5.2 统一 AI Backend 端口**：model-api 与 agent-runtime 共享只接收固定人格和有限历史 turns 的接口，不允许 Backend 获取平台发送端口、账号 UID、messageId、SQLite 路径或插件权限。Agent 子进程不在本轮实施。
+- **AC-T5.3 资格和 Proof 门禁**：只有 v2 库目标线程中 pending 的 eligible、T4 coverage usable 且 proof epoch 存在时才允许把正文送往 Backend；推理后必须再次确认是**同一个** verified epoch（防暂停→重新验证 ABA），过期/gap/停止均拒绝。
+- **AC-T5.4 严格边界与审计**：最多 5 条上下文，每条截断至 1200 字符，不查询未来消息或别的会话；dry-run 只输出 backend、action、内容长度、耗时、事件/决策摘要，不输出正文、UID 或凭据；本轮不标记 eligible processed、不发送私信。
+- **AC-T5.5 Model API 适配器离线验收**：DeepSeek JSON 模式，显式 API Key，固定官方 HTTPS endpoint、无 tools、有限 max_tokens、请求计数上限、限频、拒绝非 stop/工具调用/超大输出/非法 JSON、脱敏 HTTP 错误；mock fetcher 验证，不向真实网络发请求。实际凭据、网络、重试/成本策略后续验收。
+- **AC-T5.6 最终 Slice Gate（尚未完成）**：显式授权真实 API、人格和最小上下文、连续消息合并、后端失败退避、持久 claim/审计/恢复、端到端 100% dry-run；均未通过前不得勾选整体 T5。
+
+### AC-T5.Agent.1 Claude 唯一启用、Agent 适配可扩展性（本轮）
+
+- 只有 claude_code 出现在受信任 AgentRegistry；OpenCode、Codex 等未实现/未注册。重复、未知 Agent、任何宣称工具/文件/MCP/发送权限的定义拒绝。
+- AgentRuntimeDef 仅声明可执行文件、args 构造、输入/输出解析与能力；通用 AgentProcessTransport 处理 stdin、临时 cwd、环境白名单、取消/超时、输出大小与非零退出。新增 Agent 不修改 dryRunOne/T4 Gate/Decision Contract。
+- Claude Code 使用 --safe-mode、--tools 空、--disallowedTools 星号、--strict-mcp-config、--disable-slash-commands、--no-session-persistence，且 --max-turns=1、--max-budget-usd=0.10。模型输出只接受 success.structured_output，之后仍按 Decision Contract 验证。
+- 不向 argv 放入真实消息正文，不自动运行 Claude CLI；默认 pnpm t5:demo 用 fake transport；真实 CLI 只允许 EVE_T5_CLAUDE_CALL=1 pnpm t5:claude，且仅虚构数据。缺少 opt-in 时直接退出，不建立临时库。
+- Typecheck 与单测验收包括真实 fake 子进程、超时 SIGTERM/SIGKILL、进程拒绝重复并行、取消与输出截断；默认测试没有真实模型请求或抖音发送。
+- 当前 CLI 不是 OS 沙箱，故禁止开放 Agent 模型工具或自动加载用户插件/MCP；插件 Gateway 和更强执行隔离为后续 AC，不能提前勾 T5 全部完成。
+
+### AC-T5.Runner（受控内部接线）
+
+- AI 工作槽必须是默认关闭的依赖注入，不能从未验证的外部字符串直接创建 Agent；不能修改原消息归档队列的 FIFO 或放宽 T4 门控。
+- 合法的每次运行认领前验证 verified 同 epoch、可信白名单、队列空闲及已完成历史对账；新消息归档后先重新对账，不能拿旧证明直接运行 AI。
+- 新私信 / 暂停 / 断线 / 账号重绑定 / 停止必须取消运行中的 Agent，且停止须 await Agent 结束后才能关闭 SQLite；审计失败不得视为成功。
+- maxAttempts 有界但仅限本进程，后续还需要跨重启持久额度。自动模式尚无 CLI 授权，传 --experimental-ai-dry-run 必须拒绝，不能忽略参数或默默启动。
+- v2 正式库必须保持 v2；没有正式备份、显式迁移和真人工审批前，Runner 不得隐式建 v3 或操作生产 eligible。
+
+### AC-T5.Batch/Budget · T5-4 已实现部分
+
+- [x] 连续消息认领必须在 SQLite 一事务中保留组内所有真实事件 ID，避免“AI 一次处理三条，剩余两条以后又处理”的重复调用；唯一键和重启恢复都可验证。
+- [x] 历史页顺序不得以 local_id 冒充发生顺序；使用已验证毫秒时间戳选择候选与上下文。不可靠时间戳、自己回复、长间隔、非文本或无资格事件不得跨越合并。
+- [x] Runner 可配置静默窗口，在对账完成且持续安静后才启动新的 AI；实时新消息仍 Abort 旧 Agent。
+- [x] 认领事务内检查滚动 1 小时与 24 小时次数预算、最小间隔和失败冷却；进程重启不能清零，拒绝时不能调用 Claude。
+- [ ] 真实 Claude API/CLI 费用测量、跨日期长期限额校准、真实网络异常退避、更多内容安全负例和人工审批仍需后续 Gate。
+
+### AC-T5.ClaudeRealSmoke（真实模型 Gate 尚未通过）
+
+- [x] 登录状态只读检查通过且不会输出凭据；单次实盘测试输入为虚构账号消息，真实抖音库保持不变、0 发送。
+- [x] 执行失败不得被 CLI 退出码 0 冒充成功；真实 CLI 模式 blocked 必须非零。
+- [x] 错误可归类为固定 code 而不能回显 stdout/stderr 原文、Token、UID、真实对话；Runner 不能在 Agent 认证、网络、CLI 参数或协议失败后继续处理下一条 eligible。
+- [x] 模拟 CLI 子进程成功与认证失败两种端到端路径通过、失败保持完整 SQLite blocked 审计。
+- [ ] **首次真实 Claude 结果成功校验**：本轮实际调用返回 blocked/backend_failed，根因未知，不能冒充完成；须有可诊断结果并另外授权单次再测。
+- [ ] 服务侧可核验的 token / 费用及订阅额度检查，尚未完成。
+
+### AC-T5.P0-P2 审查修复验收
+
+- [x] 任意 AgentTransportCode 由统一类型定义向上贯穿到 DryRunFailure，所有 11 类异常均以自身固定码写入脱敏 dry-run 审计，不因引擎漏列而二次坍缩。
+- [x] Claude 结构 Schema 对 reply/skip/defer 使用支持的 nested anyOf 严格 required/extra keys；本地校验器独立强制 reply 文本和延迟、defer 延迟、reason 边界；官方不支持的数字/字符串约束不得伪装成由远端执行。
+- [x] Claude argv/预检帮助要求同源生成；--max-turns 文档支持但本机 help 隐藏，预检明确表达这一不可验边界；删去永远不会到达的 exitCode 分支。
+- [ ] 下一次真实 CLI 组合、嵌套 Schema 与账号网络端到端验收仍需单独人工明确授权与实际证据；不能以 mock 成功宣告通过。

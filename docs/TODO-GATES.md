@@ -522,3 +522,168 @@ WAL 模式下，已提交但未 checkpoint 的事务只在 `-wal` 里。裸复�
 只有 `coverageStatus().usable === true` 才可放行。此义务已写入 `docs/contracts/reconciliation.md §16` 与 `docs/AC-TS.md AC-T4.10`。
 
 **T4 状态：应用层 Gate 通过、已完成；T9 延期的两项与 T5 的 usable 检查为独立约束，不随 T4 关闭而消失。**
+
+### T5-1 第一个可运行纵切：可信待处理事件 → AI 决策 → 脱敏 dry-run（2026-10-29）
+
+- 基线 Git 7f03823（T4 已关闭应用层 Gate）；开工时工作区干净。先写 docs/contracts/ai-decision.md，再建立 app/src/ai 的类型、严格决策校验与 AI 引擎。
+- EveArchive 新增 readDryRunCandidate（只读，无 claim）：仅在 coverageStatus().usable 为 true、线程匹配目标、eligible state=pending 且消息来自目标本人时提取最多 5 条有限上下文。首次基线无 eligible 就不调用 AI。
+- 独立的 coverageEpoch 读取当前真实 verified epoch ID；推理后双重校验 usable + 同一 epoch，防止暂停/重连/再次签发后的 ABA 误放行；无权访问平台 sendMsg，也没有 Agent 本地执行能力。
+- 统一 AiBackend 可接 model-api 和 agent-runtime。新增 DeepSeekBackend 的固定 HTTPS Chat Completions/JSON Output 适配器和 mock-fetcher 验证；当前不会自动读取 API Key、不会从 CLI/Runner 发起真实模型网络请求。
+- pnpm t5:demo 生成临时 SQLite + 纯 Mock SDK，跑完整基线/新增 eligible/AI reply dry-run，输出仅有动作、长度、哈希、耗时及零发送/零 eligible 消费；运行结束清理临时库。
+- T5 专项测试包含结构化决定、两类 backend、expired/paused/gap、不可信工具调用、超时/异常、模型 API 请求/配额/拒绝、ABA proof epoch 等；未测试真实 AI 和真实 Agent CLI。
+- **T5 尚未完成**：T5-2 真实模型和限额退避、T5-3 参考来源审计、T5-4 消息合并/持久认领/完善注入负例，均需后续实现；目前 T5-1 只能 dry-run 预览，不可作为只执行一次的 AI 处理流程，也不允许发送。
+
+### T5-1 完整回归实测与退出条件
+
+- 2026-10-29：cd app && pnpm typecheck 通过，pnpm test **144/144 通过，0 fail**；git diff --check 通过（旧 T0～T4 124 项 + T5 专项 20 项）。
+- cd app && pnpm t5:demo：输出 mode=offline_t5_demo、platformNetwork=disabled、realModelNetwork=disabled、messagesSent=0、eligibleConsumed=0、action=reply 与两个 SHA-256 摘要，不包含回复原文、真实 UID、平台凭证。临时库自动清理。
+- 本轮只有 T5-1 Contract/Engine/模型 API **离线**适配测试和演示：正式 data/eve.sqlite 未读写、Runner 未接 AI，未安装外部插件、未调用真实 DeepSeek、未发送消息。
+- 统一 backend 已可承载 model-api / agent-runtime 类型；Agent Runtime 尚无受控子进程执行器。DeepSeek adapter 固定官方 endpoint + JSON Output，使用注入的 mock fetch 测试，默认不会发起真实网络请求。
+- 后续 Gate：真实 API 需明确授权并配置密钥/费用预算、限额/退避，连续消息合并、持久 claim 与审计、Agent Runtime 最小授权适配、完整安全测试。**T5 整体不得提前标记完成**。
+- 修改尚未提交 Git；按一 Slice 一工作区保留供用户复核。
+
+### T5-1 扩展性审查 + Claude Code 唯一 Agent（2026-10-29）
+
+- GitHub 参考：OpenDesign 的声明式 Agent Def+Registry+通用执行器（docs/agent-adapters.md）、OpenHands 的 ACP 统一 Agent 协议（docs/ACP_AGENTS.md）、Pi 的 extensions / tool 注册机制（docs/extensions.md）。设计依据与安全取舍登记于 docs/contracts/agent-runtime.md，均只参考思路，不复制源代码。
+- 当前 Claude Code CLI 本机版本 2.1.310（仅 version/help，不做模型调用）。新增 app/src/ai/agent-registry.ts（唯一 claude_code、声明式 def、规范化 JSON 输出）及 agent-transport.ts（stdio、空隔离目录、受限环境、超时、流量/输出上限与进程取消）。
+- 选择 --safe-mode 而非 --bare 是为了能使用 CLI 已有订阅登录；但 --safe-mode 并非 OS 沙盒，暂不允许任何可执行工具/插件。代码明确禁用内置工具和 MCP，不调用平台 SDK 发信。
+- pnpm t5:demo 已改为通过 Claude Agent Adapter 的**模拟执行器**运行：离线、只用虚构账号、输出 action/digest/长度等审计；pnpm t5:claude 必须显式设置 EVE_T5_CLAUDE_CALL=1，且输入同样只用虚构数据。没有真实 Claude 额度消耗，尚未做 CLI 登录/输出端到端收费验收。
+- 此轮修改在前一轮 T5-1 未提交工作区上继续迭代，不擅自 commit。DeepSeek Model API 仍是可选未激活原型，不是当前注册的 Agent。
+- Agent Registry/Process 的专项测试覆盖无实际模型网络的 fake subprocess、全工具关闭、stdin 和 argv 分离、输出大小、超时、取消、并发、错误解析、未知 Agent 与越权声明；最终测试总数以独立 pnpm test 结果为准。
+- 后续 Gate：由用户显式授权的真实 Claude 额度验收、持久认领与审计、限流/退避、连续消息合并、沙箱和插件授权、T6 发送安全边界。**T5 仍未完成。**
+
+### T5 Claude 唯一 Agent 首轮回归证据
+
+- 实测 cd app && pnpm typecheck 通过，pnpm test **155/155 通过、fail 0**（此前 T5-1 基线 144 + 新增 Agent 专项 11）；git diff --check 通过。
+- pnpm t5:demo：offline_t5_demo，backendId=claude_code，backendKind=agent-runtime，realModelNetwork=disabled，messagesSent=0，eligibleConsumed=0，reply 仅输出长度/hash，临时库清理。
+- env -u EVE_T5_CLAUDE_CALL pnpm t5:claude：退出码 2 + claude_call_requires_explicit_opt_in；执行前后临时目录数均为 0，未调用 Claude CLI 或网络。
+- 本地 Claude Code CLI 2.1.310：仅执行 --version/--help，不进行实际模型请求。已实现真实执行器但仅通过 fake CLI 子进程测试。
+- 不提交 Git、不升级正式 Eve SQLite、不发送抖音消息。**T5 Agent 架构初版完成，整体 T5 未完成。** 首次真实 Claude 测试需用户显式接受模型调用额度/隐私风险。
+
+### T5-2 持久 dry-run 认领与真实 SIGKILL 恢复（2026-10-29）
+
+- 加入 app/src/archive/schema-v3.sql，显式 upgradeToV3() 用事务保留 T4 历史和 Proof；v3 的 EveArchive.open/upgradeToV2/requireV2 继续兼容既有 T4 操作。**未迁移正式库**。
+- AI 引擎新增 durableDryRunOne，与原先的预览 dryRunOne 共用内部 evaluateCandidate。SQLite 认领表按会话+消息 ID 唯一，Proof Epoch 在认领和提交时均检查；只保存动作、摘要、长度和失败码。没有发送路径。
+- 若 Claude 已被调用但进程崩溃，恢复时不自动重启同一消息的调用。显式 recoverAbandonedAiClaims 在单实例安全启动时把 claimed 标 interrupted；失败与超时为 blocked。
+- 纯模拟专项测试：v2→v3 事务回滚/幂等与 T4 兼容、并发只一人领到、两条消息依次处理、证明过期、推理期间失联、超时后不重试、模拟重启及 **真实 SIGKILL 子进程认领恢复**；备份脚本 v3 验收通过。
+- pnpm t5:demo 现在使用临时 v3 SQLite + 模拟 Claude，产生 ledger.recorded=1、messagesSent=0、eligibleConsumed=0；仅输出动作、长度、哈希及用时。
+- 未提交 Git。**T5 整体未完成**：真实 Claude 与生产 Runner 接线仍未启用；真实库仍 v2。
+### T5-2 最终全量回归与生产边界
+
+- `cd app && pnpm typecheck` 0 错；`pnpm test` **166/166 全绿**，fail=0；`git diff --check` 通过。前轮 155 项，本轮新增 11 项（v3 账本/真实 SIGKILL/备份等）。
+- 正式 Eve 数据库使用只读 SQLite 核验：`PRAGMA user_version=2`、`PRAGMA quick_check=ok`；本轮**没有**执行生产 upgradeToV3，未改动正式归档。
+- T5 demo 使用虚构历史及 Claude 假传输，v3 账本 recorded=1、messagesSent=0、eligibleConsumed=0，审计只有决策动作、长度、摘要和耗时；真实 Claude CLI/API 不曾执行。
+- Git 工作区保留未提交 T5 修改，正式 T5 不能标记完成。下一步：真实 Claude CLI 在显式授权下用虚构消息进行小额/单次验收，或继续安全接线/人工审核，再考虑正式 v3 备份迁移。
+
+### T5-3 Runner 内部受控 AI dry-run 接线（2026-10-29）
+
+- app/src/runtime/runner.ts 新增可选 AiDryRunSlot，不传时 T1～T4 既有 Runner 行为不变；AI 工作槽只能在 T4 verified epoch + usable + 当前 running/online + q.isIdle + 无 reconciliation 时执行，且 maxAttempts 每进程 1～10 次。
+- Runner 启动带 AI 槽时，明确要求事先存在 v3 SQLite，只执行 recoverAbandonedAiClaims，不升级正式 v2。停止先 abort 后等待 AI，避免关闭 SQLite 后 Agent 再写入；pause/offline/reconnecting/新事件均 abort。
+- 修复对新实时消息的再对账触发：归档提交后置 reconciliationRequested，而不是等待下一次重连/证明过期。AI 执行期间新消息到达则中断旧推理，重新获取 T4 Proof 后才能处理新 eligible。
+- 9 项 Runner/CLI 专项测试通过：重复启动无双执行、暂停取消、旧认领重启 interrupted、拒绝 v2 隐式迁移、非法配置、新私信触发再对账、新上下文取消旧决策、SDK reconnecting 取消旧决策、CLI 禁止尚未启用的 --experimental-ai-dry-run。
+- 目前没有对真实抖音开启 AI 自动消费：CLI 明确拒绝自动模式选项，默认 Runner 无 AI 槽。实际测试均用虚构账号及 MockPlatformPort + 模拟 Claude Backend。正式库保留 v2，无发送。
+
+### T5-3 最终全量回归与生产保护（2026-10-29）
+
+- 全量 `pnpm typecheck` **0 错**，`pnpm test` **175/175 通过**、fail=0；`git diff --check` 通过。原先 166 项 + 9 项 Runner/CLI 新增测试。
+- 对正式 `app/data/eve.sqlite` **只读**检查：`PRAGMA user_version=2`、`PRAGMA quick_check=ok`。未运行正式 v2→v3 迁移、未操作真实 eligible_events、未发送任何抖音消息、未调用真实 Claude。
+- 本轮新改动有 app/src/runtime/runner.ts、app/src/cli.ts、app/test/ai/runner-integration.test.ts、T5 Contract/AC/Gate；源工作区还包含此前未提交的 T5-1/T5-2 修改，**未创建 Git commit**。
+- 内部 Runner AI 工作槽集成测试为模拟 MockPort + Claude FakeBackend，CLI 真实 --experimental-ai-dry-run 刻意不开放。这是工程接线验收，不是实盘 Agent/账单/权限验收。T5 仍未完成。
+
+### T5-4 部分 Gate：合并、消息发生顺序和持久额度（2026-10-29）
+
+- 发现并修复历史分页写入顺序与时间顺序不一致的问题：合并和上下文按可信 create_time 毫秒排序，不从未来消息构造较早事件的 AI 输入；缺失或异常时间戳时回退单条。不通过修改测试预期掩盖排序缺陷。
+- 当前 v3 Schema 增加 ai_batch_items 表，事务中一次认领全部组员；一个 Claude 决策记录关联多个真实 eligible 事件，组内成员不会被重复领取。既有 T5-2 认领/崩溃测试继续通过。
+- 跨重启额度从 ai_decision_attempts 事务内统计滚动 1h/24h；blocked/interrupted 也计入调用尝试。失败冷却、最小间隔及未来时钟异常 fail closed。严格仅计次数，**不声称追踪 Claude 的实际费用**。
+- T5 Runner 新增 quietPeriodMs 和 maxBatchEvents，真实新消息到达后等静默窗口且完成 T4 重新对账，才允许 AI。专项测试：两条接近的实时私信只产生一次追加 Claude 调用。
+- 29/29 项持久账本及 Runner 专项测试通过；生产 CLI 没有启用自动 AI，正式库不升级。T5-4 其他注入/模型联调尚未完成。
+
+### T5-4 全量回归结果与剩余 Gate（2026-10-29）
+
+- `pnpm typecheck` 通过，`pnpm test` **186/186 全绿，fail=0**（相比前轮 175 项新增 11 项），`git diff --check` 通过。
+- 对照旧 T5-1 测试时发现早期模拟消息无 13 位毫秒时间戳却有可信数字 `indexInConversation`，已修复：**仅上下文排序**可用 index 作为既有消息的顺序线索，**不可**据此推断缺失消息或合并；合并始终要求有效时间戳，并且遇到未知时间顺序时回退单条。旧 T5-1 的完整 user/assistant/user 上下文测试保持原验收条件且通过。
+- 新增 ai_batch_items 的 v3 Schema 备份完整性校验；所有 T5 合并、滚动预算、失败冷却、跨重启持久性及 Runner 静默窗口测试通过。
+- `pnpm t5:demo` 实测 `recorded=1`、`messagesSent=0`、`eligibleConsumed=0`、`realModelNetwork=disabled`，输出只含摘要/动作/长度/耗时。
+- 正式 `data/eve.sqlite` 只读检查 `user_version=2`、`quick_check=ok`，没有迁移正式库、没有调用真实 Claude、没有发送消息。Git 工作区包含此前与本轮的 T5 未提交修改；**未执行 git commit**。
+- 本轮证明的是离线应用层 T5-4 部分能力，不是完整 T5 验收。后续仍需真实 Claude 显式授权单次验收、费用测量与配额校准、非零的正式静默/冷却配置、正式 v3 备份迁移和人工审核/运行门控。
+
+### T5-5 Claude 首次真实调用和诊断门控（2026-10-29）
+
+- **已执行一次真实模型 dry-run**：本机 CLI 2.1.310，auth status 已登录 OAuth，输入全部虚构，30 秒程序超时；约 5.1 秒后 blocked/backend_failed，记录 1 次 blocked、0 recorded、0 发送；旧 demo 错误地以退出码 0 结束。明确记录为 **真实模型 Gate 未通过**，未重复调用。
+- 修复退出码与诊断：真实模式 blocked 退出码 4；仅匹配临时 stderr 的已知固定类别，既不回显错误原文，也不把不可诊断失败直接归咎于登录状态。Claude error-result 与解析失败单独归类，Runner 随即 fail closed，防止消耗剩余待处理事件。
+- 本地 mock-executable 仿真通过相同的 `pnpm t5:claude` 入口测试结构化成功和认证失败；两种情形都不使用网络模型、抖音私信或正式库。启用 --no-chrome 进一步减少能力暴露。
+- 当前仍需一次**后续有明确授权**的真实成功联调、额度确认；不能根据模拟测试宣布真实 Claude 已可用。
+
+### T5-5 并行回归发现并修复的 Runner 故障状态竞态（2026-10-29）
+
+- 单独运行 Agent 认证失败测试通过，但全量并行回归暴露：即使 Runner 返回故障退出码 3，异步常规轮询写入有概率把状态文件覆盖回 `running`。这违反失败关闭语义；不能仅以单项测试通过宣布 Gate 成功。
+- 修复：Runner 在周期性写运行心跳前检查 faulted/stopping；退出的 finally 阶段在 blockPending、所有任务和 SDK 停止后，最终写入内存中故障状态文件，使其不能被旧 `running` 写入覆盖。
+- 负例持续要求 `exitCode=3`、状态文件 `paused_env`、T4 Coverage `unverified`、AI recorded=0、最多一次调用。Runner 11 项专项测试通过；需全量复验。
+
+### T5-5 最终回归证据（2026-10-29）
+
+- 最终全量 `pnpm typecheck` **0 错误**；`pnpm test` **191/191 通过，fail=0**；`git diff --check` 通过。原 186 项新增 5 项（Agent 分类 2、模拟真实 CLI 正反例 2、认证异常 Runner 1）。
+- 受并行全量回归暴露的故障状态覆盖竞态修复后，通过同样 191 项全量测试；不再接受“exit=3 但状态文件显示 running”的结果。
+- 只读正式数据库 `user_version=2`、`quick_check=ok`，Runner `alive=false`、最近状态 `stopped`；本轮没有迁移正式库，没有发送抖音消息。
+- 特别说明：本轮实际执行的是**一次真实 Claude CLI 端到端调用尝试**，返回 `backend_failed`；不能证明请求到达模型服务器，也不能声称模型生成成功或有明确可核算费用。之后没有再次调用真实模型。修复后的分类器仅在未来经授权的调用中才有机会得到明确原因码。
+- Git 工作区继续保留此前 T5 和本轮修改，不自动提交。真实 Claude Gate 与 T5 整体保持未完成。
+
+### T5-5B Claude CLI 无模型费用预检与协议排查（2026-10-29）
+
+- 本轮**未重复真实 Claude 模型调用**。上一轮唯一真实调用返回 blocked/backend_failed，仍无法从旧的隐私安全日志确定具体根因；本次只核查本地 CLI 版本、公开参数与 `claude auth status`。
+- 增加 `app/src/ai/claude-preflight.ts` 与 `pnpm t5:check`：只执行三条不请求模型的命令 `claude --version` / `claude --help` / `claude auth status`，全部通过才输出 ready；结果限于版本、登录布尔值、OAuth/API 认证类别、公开 flag 是否存在；**不记录邮箱、认证 token、用户文件、真实对话**。实机输出 `status=ready`、版本 2.1.310、`authMode=oauth`、`modelRequests=0`。
+- 官方 CLI 参考确认 `--max-turns` 是正式支持的 print-mode 参数，但未必出现在本机 `--help` 中，因此预检没有把它伪装成已在帮助中证明；见 https://code.claude.com/docs/en/cli-reference。
+- 将预检放在真实 dry-run 示例**建立临时 SQLite 之前**，预检拒绝时以退出码 2 关闭；不会自动登录、自动调用 Claude 或生成假的已审计记录。原 `EVE_T5_CLAUDE_CALL=1` 显式开关仍保留。
+- 假 CLI 子进程回归包含模拟版本/帮助/登录状态、真实调用模式成功结构化结果、后端认证失败脱敏与非零退出；预检失败关闭包含未安装、未登录和缺失必要公开 flags。
+- 注意：`ready` 只证明本地预检，**不证明一组实际 CLI 参数一起能启动模型，也不证明认证服务器/网络连通或真实额度**。真实 Claude 生成 Gate 仍未完成，未经明确授权不得循环重试。
+
+### T5-5B 最终回归：Claude 不调用模型的安全预检（2026-10-29）
+
+- `pnpm t5:check` 在实际 Ubuntu Claude Code CLI 2.1.310 上返回 `status=ready`、`authMode=oauth`、`loggedIn=true`、`flagsPresent=true`、`modelRequests=0`；没有调用 `claude -p`。特别说明：`--max-turns` 虽列在官方 CLI reference，但不在本机 --help，预检没有夸大对它的运行时验证。
+- `pnpm t5:claude` 在真实执行入口会先完成安全预检，失败则固定类别退出码 2，避免进入临时 SQLite 或调用模型；原 EVE_T5_CLAUDE_CALL=1 仍必须显式设置。
+- 新增 2 项 `claude-preflight.test.ts` 专项测试，模拟 --version/--help/auth status 的正常、无二进制、未登录与缺失必要 flag。修改 CLI smoke fake 二进制以模拟 preflight 后，原成功与认证失败测试也通过。
+- 全量 `pnpm typecheck` 0 错；`pnpm test` **193/193 通过**；`git diff --check` 通过。`pnpm t5:demo` 继续返回 mock Claude 决策 `dry_run` 且 `messagesSent=0`、`eligibleConsumed=0`、`recorded=1`。
+- 正式 SQLite 只读 `PRAGMA user_version=2`、`PRAGMA quick_check=ok`；Runner `alive=false`、`phase=stopped`。**本轮没有任何新的真实 Claude 模型请求**，没有发送私信，也没有迁移正式库、没有 Git commit。
+- **真实 Claude 生成 Gate 继续未通过**：此前唯一一次真实尝试返回 backend_failed，旧日志未留可区分根因。新的 ready 只是本地 CLI 预检，不是后端网络/计费/实际 JSON 输出证明。下一次真实付费试跑必须单次显式授权，使用现有脱敏错误分类，不能反复盲试。
+
+### T5-5C 第二次真实 Claude 单次请求与无费用诊断（2026-10-29）
+
+- 用户同意继续此前建议的“一次真实 Claude CLI 测试”。执行前只读核查 `pnpm t5:check`：Claude Code v2.1.310、OAuth 已登录、必要公开 CLI 参数存在；正式 `data/eve.sqlite` 仍 v2，`PRAGMA quick_check=ok`，Runner 停止。
+- **第二次真实调用尝试，且仅此一次**：`EVE_T5_CLAUDE_CALL=1 pnpm t5:claude`，虚构对话、临时 SQLite v3、Claude CLI --safe-mode/--tools ""/--max-turns=1/--max-budget-usd=0.10，外层 timeout 52 秒，内部 30 秒。约 3308 ms 后 `status=blocked,reasonCode=backend_failed`，`aiLedger={claimed:0,recorded:0,blocked:1,interrupted:0}`，进程退出码 4，`messagesSent=0`、`eligibleConsumed=0`。**未发生第三次模型调用**。后端未提供可验证模型费用或 token 记录；可能消耗 Claude 额度，不冒称成功。
+- 无模型请求认证环境对照：`claude auth status` 在普通 shell 与 Agent **同样环境变量白名单 + 临时工作目录**下均返回 loggedIn=true、OAuth；因此“子进程缺失 OAuth 凭据”未得到支持。普通网络 TLS HEAD 至 `https://api.anthropic.com` 返回 HTTP 404（TLS 校验码 0），仅证明基础 HTTPS 路径可达，**不是**实际认证/模型/API 的成功证据。
+- 仍无法由之前的兜底 `backend_failed` 精确判定请求为什么失败，可能是未分类 CLI 退出、权限/配置或 stdout 结构。禁止通过连续真实模型调用猜测。完善 `classifyAgentExit(stderr,stdout)`：CLI 非零退出且 stdout 带 `result/is_error=true` 结构化结果时只返回固定 `agent_result_error`，不泄露 stdout 文本；其余继续保守给 `agent_execution_failed`。该分类的 fake CLI 专项测试已通过，不宣称因此定位了本次的旧错误。
+- 预检 `pnpm t5:check` 已改为在 AgentProcessTransport **完全相同环境白名单和临时工作目录**内执行 --version/--help/auth status，而非普通 shell 的配置；缺失/未登录时拒绝。整个预检不执行 `-p`、不请求模型。
+- **真实 Claude 生成 Gate 仍未通过**。本轮没有读取真实私信、没有更改生产库、没有发送私信。可继续完善可观测诊断，但再次真实模型调用需单次明确授权。
+
+### T4 回归负例并行时序修复（2026-10-29，T5-5C 补充）
+
+- 本轮首次全量测试为 193/194；失败的既有 `coverage-expiry-runner.test.ts` 在对账证明确实过期后固定 sleep(300ms)，随后要求 `conversationState != verified`，并行负载下有时 Runner 尚未获调度，尽管 `coverageStatus.usable=false` 已即时生效。
+- 不能修改掉“必须撤销 verified”的安全要求。本次替换固定 300ms 猜测为**有界状态轮询（最多约 10 秒的正常轮询间隔，机器负载可再影响实际耗时）**，增加证明过期时 `usable=false` 的即时断言，保留最终 conversationState!=verified 与锚点不丢失断言。测试不改变 v3 Schema 或生产 T4 门控代码。
+- 该 T4 两项专项测试独立复测 **2/2 通过**。必须等待完整全量回归后才能最终声明 T5-5C 测试 Gate 通过。
+
+### T5-5C 最终回归与生产只读复核（2026-10-29）
+
+- TypeScript `pnpm typecheck` 通过（0 错）；全量 `pnpm test` **194/194 通过，0 fail**；`git diff --check` 通过。
+- 全量首次 193/194 的 T4 失败负例已定位：固定 sleep(300ms) 受并行调度影响，不足以证明 Runner 获得轮询时间。保留证明过期后立即 `usable=false`、随后数据库必须非 verified、且历史锚点保留的全部安全断言；改用有界状态轮询。独立 2/2、全量 194/194 验证通过。
+- 正式 SQLite 只读：`user_version=2`、`quick_check=ok`。Runner `phase=stopped`、`alive=false`。没有正式迁移、没有抖音消息发送、没有真实私信送给 AI。
+- 本轮**恰好一次**第二轮真实 Claude 模型调用尝试：返回 `blocked/backend_failed`（约 3.3 秒），退出码 4；不宣称真实模型已通过。之后仅使用 `auth status`、CLI 帮助、HEAD 探测和模拟进程诊断；没有第三次真实调用。
+- 新增基于实际 Agent 环境的 Claude 安全预检；对非零返回的结构化 Agent JSON 错误可归类固定 `agent_result_error`，仍不打印任何原始 stdout/stderr。旧无法精确分类的 backend_failed 根因仍未知。
+- 全部修改仍处于未提交工作区，没有擅自执行 `git commit`。T5 整体及真实 Claude 成功生成 Gate 继续未完成。
+
+### T5 Claude Adapter P0/P1/P2 审查修复（2026-10-29）
+
+按照独立审查修复三项，**无真实 Claude 模型调用**，不涉及正式 SQLite v2 数据或 Douyin 发送。
+
+- **P0：错误码两层坍缩**。先前 Agent Transport 有 11 类故障，但 AI Engine 仅保留其中 6 类，遗漏的 5 类落到 backend_failed。现在 DryRunFailure 类型直接以 AgentTransportCode 联合类型为来源，evaluateCandidate 遇到任意 AgentTransportError 即原样记录 e.code；在 T5 单测中逐一注入全部 11 类错误验证，账本/审计不包含原始 stderr、stdout、凭证或正文。Runner 对包括 agent_execution_failed、agent_start_failed、agent_timeout、agent_output_too_large 的不可用后端失败暂停 env 并取消工作槽，不自动领取下一条。注意：**agent_execution_failed 仍是 Transport stderr/structured error 都无法分类时的兜底**，不能承诺下次真实请求必然定位根因。
+- **P1：CLI JSON Schema / Decision 校验器漂移**。原 Schema 允许 reply 缺 text、skip 多 delayMs、reply 延迟上限与 defer 下限错误。现由独立 `decision-schema.ts` 实现顶层普通对象 `{decision:{anyOf:[reply,skip,defer]}}`，每个分支具有自己的 required / additionalProperties:false / action enum，适配器解包 decision 后仍调用既有 validateDecision()。避免使用 Claude Code/工具生态有兼容风险的根级 oneOf/anyOf；Anthropic Structured Outputs 官方列出支持 anyOf，且**不支持** minimum/maximum/minLength/maxLength，故严格数值与字符长度限制由本地 DECISION_LIMITS + validateDecision 执行。Schema description 从同一 DECISION_LIMITS 生成可读范围提醒，不能声称服务端也强制范围。来源：https://platform.claude.com/docs/en/build-with-claude/structured-outputs 。
+- **P2：参数预检与真实调用维护两套清单**。新建 `claude-invocation.ts`，buildClaudeArguments 与 claudeHelpRequirements 均从唯一 CLAUDE_FLAGS 数据声明生成；隐藏于本机 --help 的 --max-turns 明确标记为仅在 CLI 二进制/文档核对过、不在帮助输出中可验证。原注册表中 transport 只在 exit=0 resolve 后检查 exitCode!==0 的不可达代码已删除。官方 CLI：https://code.claude.com/docs/en/cli-reference 。
+- 增加完整正反测试：所有 11 类 Transport 原码、结构 Schema 分支与无关字段拒绝、合法边界/非法数值仍由本地 validator 拒绝、CLI argv 与预检共享字段、模拟 Claude wrapper structured_output 决策、Runner 对未知 CLI 错误的 fail-closed。
+- 这些离线测试通过并不等于真实 Claude 服务端接受该嵌套 Schema；**T5 真实 CLI 一次成功生成 Gate 仍未通过**，未经再次明确授权不得进行第三次模型请求。
+
+### T5 P0/P1/P2 审查修复最终回归（2026-10-29）
+
+- TypeScript 类型检查 `pnpm typecheck` 通过；全量 `pnpm test` **200/200 通过、fail=0**（此前 194 项 + 6 项新测试）；`git diff --check` 通过。包括 Runner 遇到 `agent_execution_failed` 立即 fail closed，全部 11 个传输错误码在审计中不再被二次坍缩。
+- `pnpm t5:demo` 使用模拟 Claude，脱敏 `action=reply`、`aiLedger.recorded=1`、`messagesSent=0`、`eligibleConsumed=0`、`realModelNetwork=disabled`。模拟真实 CLI 入口的结构化 wrapper 正反例通过，不触发 Claude 实际请求。
+- `pnpm t5:check`：本机 Claude 2.1.310、OAuth 登录、公开参数预检 ready，`modelRequests=0`；隐藏 `--max-turns` 不由 --help 证明，仍由共享 CLI 参数列表保留并单独登记。
+- 正式 `app/data/eve.sqlite` **只读**查询 `user_version=2`、`PRAGMA quick_check=ok`，Runner `phase=stopped`、`alive=false`。没有正式 v3 迁移、未向抖音发送私信、**没有第三次真实 Claude 调用**、未创建 Git commit。
+- **Gate 限制**：即便错误码现已完整上传，`agent_execution_failed` 仍表示 stderr/CLI 输出不可进一步识别的真实错误，不能保证下一次必定获得网络/认证/限额层面的精确根因；嵌套 anyOf JSON Schema 仅经离线 fake CLI 验证，尚无真实 Claude 服务端成功接收证据。完整 T5 与真实模型 Gate 仍未完成。

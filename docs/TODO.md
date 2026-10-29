@@ -68,8 +68,8 @@
 
 ### T5 — AI 决策与生成（L3 / dry-run）
 
-- [ ] T5-1：先定义 AI 决策结构：reply / skip / defer；生成内容、延迟建议与理由摘要均结构化校验。
-- [ ] T5-2：实现 DeepSeek 适配层与独立人格 Prompt，按 PRD 仅发送最小必要上下文，不上传凭证或无关账号信息；接入超时、限额、错误退避。
+- [x] T5-1：先定义 AI 决策结构：reply / skip / defer；生成内容、延迟建议与理由摘要均结构化校验。（Contract + 离线 dry-run；见 docs/TODO-GATES.md）
+- [ ] T5-2：按 2026-10-29 新决策，优先 Claude Code CLI 的 Agent Runtime Adapter（仅注册 Claude），保留通用 Model API 接口供以后使用；最小上下文、人格 Prompt、超时、限额与错误退避仍需真实验收。DeepSeek API 原型暂不启用。
 - [ ] T5-3：参考 douyin-bot/llm_service.py 的调用流程和可许可复用的模板；douyin-robot/src/prompts.py 仅参考设计，不复制文本。
 - [ ] T5-4：离线 fixture 测试不回复、合并连续消息、延迟回复、提示注入、第三方内容伪造指令、模型异常。
 - **Gate**：100% 不触发真实发送；能显示完整的 input-event → 上下文 → AI 决策 → dry-run 输出及审计元数据（无正文日志）。
