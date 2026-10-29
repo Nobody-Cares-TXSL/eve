@@ -61,6 +61,12 @@ export function safeAgentEnvironment():NodeJS.ProcessEnv{
   'HTTPS_PROXY','HTTP_PROXY','NO_PROXY','https_proxy','http_proxy','no_proxy',
   'ANTHROPIC_BASE_URL','ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN',
   'CLAUDE_CODE_USE_BEDROCK','CLAUDE_CODE_USE_VERTEX',
+  // 模型路由配置：不是 Eve 的私密凭据，而是部署环境对 CLI 的模型映射。
+  // 过滤掉它们会让子进程落到 CLI 内置默认模型名，与本地网关不匹配而失败。
+  'ANTHROPIC_MODEL','ANTHROPIC_SMALL_FAST_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL','CLAUDE_CODE_MODEL_CAPABILITIES',
+  'CLAUDE_CODE_SUBAGENT_MODEL',
  ];
  const env:NodeJS.ProcessEnv={};
  for(const key of allowed){

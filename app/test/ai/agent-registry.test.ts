@@ -41,10 +41,11 @@ test('Claude Code invocation: stdin contains conversation; argv contains no priv
  assert.ok(seen.args.includes('--disable-slash-commands'));
  assert.ok(seen.args.includes('--no-session-persistence'));
  assert.ok(seen.args.includes('--json-schema'));
- assert.ok(seen.args.includes('--tools'));
- assert.equal(seen.args[seen.args.indexOf('--tools')+1],'');
- assert.equal(seen.args[seen.args.indexOf('--disallowedTools')+1],'*');
- assert.equal(seen.args[seen.args.indexOf('--max-turns')+1],'1');
+ // --json-schema 依赖内置 StructuredOutput 工具；只放行它，不放行其他工具。
+ assert.equal(seen.args[seen.args.indexOf('--tools')+1],'StructuredOutput');
+ assert.equal(seen.args.includes('--disallowedTools'),false,'不能再用 * 把 StructuredOutput 一并禁掉');
+ // 不设 --max-turns：结构化输出需要额外工具回合，实测 1/2 都会 error_max_turns。
+ assert.equal(seen.args.includes('--max-turns'),false);
  assert.ok(seen.stdin.includes('hello'));
  assert.ok(!seen.args.join(' ').includes('hello'));
  assert.equal(seen.timeoutMs,30000);
@@ -53,7 +54,7 @@ test('Claude Code invocation: stdin contains conversation; argv contains no priv
  assert.deepEqual(seen.args,buildClaudeArguments());
  assert.deepEqual(JSON.parse(seen.args[seen.args.indexOf('--json-schema')+1]!),claudeDecisionSchema);
  assert.ok(claudeHelpRequirements().includes('--print'));
- assert.ok(!claudeHelpRequirements().includes('--max-turns'));
+ assert.ok(claudeHelpRequirements().includes('--tools'));
 });
 test('Claude result parser: only result success structured_output may cross boundary',async()=>{
  const malformed=[

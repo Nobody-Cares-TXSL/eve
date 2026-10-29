@@ -35,9 +35,22 @@ const claudeDef:AgentRuntimeDef={
   let envelope:unknown;
   try{envelope=JSON.parse(stdout) as unknown;}
   catch{throw new AgentTransportError('agent_invalid_output');}
-  if(!envelope||typeof envelope!=='object'||Array.isArray(envelope))
+  // 本机 CLI 实测以**事件数组**返回（system/assistant/result…），
+  // 而文档描述的是单个 result 对象。两种形态都要接受：
+  // 数组取最后一个 type='result' 的事件；对象直接用。
+  let result:Record<string,unknown>;
+  if(Array.isArray(envelope)){
+   const events=envelope.filter((e):e is Record<string,unknown> =>
+     !!e&&typeof e==='object'&&!Array.isArray(e));
+   const last=events.at(-1);
+   if(!last||last['type']!=='result')
+    throw new AgentTransportError('agent_invalid_output');
+   result=last;
+  }else if(envelope&&typeof envelope==='object'){
+   result=envelope as Record<string,unknown>;
+  }else{
    throw new AgentTransportError('agent_invalid_output');
-  const result=envelope as Record<string,unknown>;
+  }
   if(result['type']==='result'&&(result['is_error']===true||result['subtype']==='error'))
    throw new AgentTransportError('agent_result_error');
   if(result['type']!=='result'||result['subtype']!=='success'||result['is_error']!==false||

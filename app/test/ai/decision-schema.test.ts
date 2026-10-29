@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {claudeDecisionSchema} from '../../src/ai/decision-schema.ts';
 import {DECISION_LIMITS,validateDecision} from '../../src/ai/decision.ts';
-import {buildClaudeArguments,claudeHelpRequirements,CLAUDE_FLAGS} from '../../src/ai/claude-invocation.ts';
+import {buildClaudeArguments,claudeHelpRequirements,claudeFlags} from '../../src/ai/claude-invocation.ts';
 
 type SchemaNode=Record<string,unknown>;
 const root=claudeDecisionSchema;
@@ -88,13 +88,14 @@ test('Claude numeric and text restrictions are enforced locally, even if remote 
   assert.throws(()=>validateDecision(value),/invalid_decision/);
  }
 });
-test('Claude preflight flags derive from invocation; hidden max-turns is the only deliberate exception',()=>{
+test('Claude preflight flags derive from invocation with no hidden exceptions',()=>{
  const args=buildClaudeArguments();
- assert.ok(args.includes('--max-turns'));
- assert.equal(args[args.indexOf('--max-turns')+1],'1');
+ // 结构化输出依赖内置 StructuredOutput 工具，必须放行；不得再用 * 全禁。
+ assert.equal(args[args.indexOf('--tools')+1],'StructuredOutput');
+ assert.equal(args.includes('--disallowedTools'),false);
+ // --max-turns 会截断结构化输出所需的工具回合，已移除。
+ assert.equal(args.includes('--max-turns'),false);
  assert.deepEqual(claudeHelpRequirements(),
-  CLAUDE_FLAGS.filter(x=>!x.hiddenFromHelp).map(x=>x.flag==='-p'?'--print':x.flag));
- assert.equal(CLAUDE_FLAGS.filter(x=>x.hiddenFromHelp).length,1);
- assert.equal(CLAUDE_FLAGS.filter(x=>x.hiddenFromHelp)[0]?.flag,'--max-turns');
+  claudeFlags({}).map(x=>x.flag==='-p'?'--print':x.flag));
  assert.ok(!args.join(' ').includes('PRIVATE_REAL_CHAT'));
 });
