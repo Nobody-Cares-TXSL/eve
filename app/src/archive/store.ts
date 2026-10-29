@@ -22,6 +22,7 @@ export class ArchiveError extends Error {readonly code:string;constructor(code:s
 const sql=readFileSync(new URL('./schema.sql',import.meta.url),'utf8');
 const sqlV2=readFileSync(new URL('./schema-v2.sql',import.meta.url),'utf8');
 const sqlV3=readFileSync(new URL('./schema-v3.sql',import.meta.url),'utf8');
+const sqlV4=readFileSync(new URL('./schema-v4.sql',import.meta.url),'utf8');
 function digest(r:Batch){return createHash('sha256').update(JSON.stringify([r.conversationId,r.source,r.gapReason??null,r.messages.map(m=>[m.conversationId,m.serverMessageId,m.clientMessageId,m.senderUid,m.fromSelf,m.text,m.kind,m.messageType,m.createTime,m.indexInConversation])])).digest('hex');}
 export class EveArchive {
  private closed=false;
@@ -55,7 +56,7 @@ export class EveArchive {
   try{
    db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=3000');
    const version=(db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-   if(version!==0&&version!==1&&version!==2&&version!==3)throw new ArchiveError('schema_unsupported');
+   if(version!==0&&version!==1&&version!==2&&version!==3&&version!==4)throw new ArchiveError('schema_unsupported');
    if(version===0){
     // SQLite user_version 0 has no versioned Eve schema. Only an EMPTY
     // pre-existing SQLite DB may safely initialize as v1.
@@ -96,7 +97,7 @@ export class EveArchive {
  upgradeToV2(injectFailure=false):void{
   this.check();
   const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-  if(version===2||version===3)return;
+  if(version===2||version===3||version===4)return;
   if(version!==1)throw new ArchiveError('schema_unsupported');
   this.db.exec('BEGIN IMMEDIATE');
   try{
@@ -111,7 +112,7 @@ export class EveArchive {
  upgradeToV3(injectFailure=false):void{
   this.check();
   const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-  if(version===3)return;
+  if(version===3||version===4)return;
   if(version!==2)throw new ArchiveError('migration_requires_v2');
   this.db.exec('BEGIN IMMEDIATE');
   try{
@@ -122,11 +123,169 @@ export class EveArchive {
    this.db.exec('COMMIT');
   }catch(e){this.db.exec('ROLLBACK');throw e;}
  }
+ /** T6 explicit migration: only invoke on a backed-up, authorized database. */
+ upgradeToV4(injectFailure=false):void{
+  this.check();
+  const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
+  if(version===4)return;
+  if(version!==3)throw new ArchiveError('migration_requires_v3');
+  this.db.exec('BEGIN IMMEDIATE');
+  try{
+   this.db.exec(sqlV4);
+   if(injectFailure)throw new ArchiveError('migration_injected_failure');
+   this.db.exec('UPDATE archive_meta SET schema_version=4 WHERE singleton=1');
+   this.db.exec('PRAGMA user_version=4');
+   this.db.exec('COMMIT');
+  }catch(e){this.db.exec('ROLLBACK');throw e;}
+ }
  private requireV3():void{
   this.check();
-  if((this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version!==3)
+  if((this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version<3)
    throw new ArchiveError('ai_requires_v3');
  }
+ private requireV4():void{
+  this.check();
+  if((this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version!==4)
+   throw new ArchiveError('send_requires_v4');
+ }
+
+ /** 终态码封闭集合：不接受任意字符串，避免审计里出现不可解释的状态。 */
+ /** 明确「未发送」的失败原因 —— 只有这些才能进 failed。 */
+ static readonly SEND_FAILURE_CODES=['rejected_before_dispatch','identity_changed','content_rejected','budget_blocked'] as const;
+ /** 结果不确定（超时、断线、崩溃）只允许 unknown。 */
+ static readonly SEND_UNKNOWN_CODES=['timeout','interrupted','ambiguous_result','transport_error'] as const;
+
+ /**
+  * T6-1b：保存经安全校验的发送意图。
+  *
+  * 幂等三重：intent_id 主键、UNIQUE(conversation_id, source_event_id)、
+  * 以及 send_intent_events 的 (conversation_id, server_message_id) 主键——
+  * 后者保证同一批合并消息不会被拆成多个意图。
+  *
+  * 正文写入独立表 send_text 并带过期时间；账本只留摘要。
+  * 返回 created=false 时表示已存在，调用方不得据此再次发送。
+  */
+ saveSendIntent(input:{
+  intentId:string;conversationId:string;sourceEventId:string;text:string;
+  textDigest:string;decisionDigest:string;eventIds:readonly string[];
+  now:number;retentionMs:number;failAtEvent?:number;
+ }):{created:boolean;intentId:string;existingStatus?:string;conflict?:'duplicate_intent'|'duplicate_event'}{
+  this.requireV4();
+  if(!input.intentId||!input.conversationId||!input.sourceEventId||
+     !Array.isArray(input.eventIds)||input.eventIds.length<1||
+     new Set(input.eventIds).size!==input.eventIds.length||
+     !Number.isSafeInteger(input.now)||!Number.isSafeInteger(input.retentionMs)||input.retentionMs<1)
+   throw new ArchiveError('rejected');
+  this.db.exec('BEGIN IMMEDIATE');
+  try{
+   const prior=this.db.prepare('SELECT intent_id,status FROM send_intents WHERE intent_id=? OR (conversation_id=? AND source_event_id=?)')
+    .get(input.intentId,input.conversationId,input.sourceEventId) as {intent_id:string;status:string}|undefined;
+   if(prior){this.db.exec('COMMIT');return {created:false,intentId:prior.intent_id,existingStatus:prior.status,conflict:'duplicate_intent'};}
+   for(const id of input.eventIds){
+    const taken=this.db.prepare('SELECT intent_id FROM send_intent_events WHERE conversation_id=? AND server_message_id=?')
+     .get(input.conversationId,id) as {intent_id:string}|undefined;
+    if(taken){this.db.exec('COMMIT');return {created:false,intentId:taken.intent_id,conflict:'duplicate_event'};}
+   }
+   this.db.prepare('INSERT INTO send_intents(intent_id,conversation_id,source_event_id,text_digest,decision_digest,status,attempt,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,0,?,?)')
+    .run(input.intentId,input.conversationId,input.sourceEventId,input.textDigest,input.decisionDigest,'pending',input.now,input.now);
+   this.db.prepare('INSERT INTO send_text(intent_id,body,created_at_ms,expires_at_ms) VALUES(?,?,?,?)')
+    .run(input.intentId,input.text,input.now,input.now+input.retentionMs);
+   input.eventIds.forEach((id,ordinal)=>{
+    if(ordinal===input.failAtEvent)throw new ArchiveError('send_save_injected_failure');
+    this.db.prepare('INSERT INTO send_intent_events(conversation_id,server_message_id,intent_id,ordinal) VALUES(?,?,?,?)')
+     .run(input.conversationId,id,input.intentId,ordinal);
+   });
+   this.db.exec('COMMIT');
+   return {created:true,intentId:input.intentId};
+  }catch(e){this.db.exec('ROLLBACK');throw e;}
+ }
+
+ /**
+  * pending → dispatching 的唯一入口：条件更新，两个 Worker 不可能同时成功。
+  * 返回 false 表示认领失败（已被认领或已是终态），调用方**不得发送**。
+  */
+ claimSendIntent(intentId:string,now:number):boolean{
+  this.requireV4();
+  if(!Number.isSafeInteger(now))throw new ArchiveError('rejected');
+  const r=this.db.prepare("UPDATE send_intents SET status='dispatching',attempt=attempt+1,claimed_at_ms=?,updated_at_ms=? WHERE intent_id=? AND status='pending'")
+   .run(now,now,intentId);
+  return Number(r.changes)===1;
+ }
+
+ /**
+  * dispatching → sent/failed/unknown。只允许从 dispatching 结算，终态不可再变。
+  *
+  * sent 必须有平台证据（回执 ID）；failed 必须是确定的「未发送」原因；
+  * 超时/断线/崩溃只能 unknown。unknown 永不自动重试。
+  */
+ settleSendIntent(intentId:string,settle:{status:'sent';evidence:string}|{status:'failed'|'unknown';reasonCode:string},now:number):boolean{
+  this.requireV4();
+  if(!Number.isSafeInteger(now))throw new ArchiveError('rejected');
+  let evidence:string|null=null,reason:string|null=null;
+  if(settle.status==='sent'){
+   if(typeof settle.evidence!=='string'||settle.evidence.trim()==='')
+    throw new ArchiveError('sent_requires_evidence');
+   evidence=settle.evidence;
+  }else{
+   const allowed:readonly string[]=settle.status==='failed'
+    ?EveArchive.SEND_FAILURE_CODES:EveArchive.SEND_UNKNOWN_CODES;
+   if(!allowed.includes(settle.reasonCode))throw new ArchiveError('invalid_reason_code');
+   reason=settle.reasonCode;
+  }
+  const r=this.db.prepare("UPDATE send_intents SET status=?,reason_code=?,evidence=?,settled_at_ms=?,updated_at_ms=? WHERE intent_id=? AND status='dispatching'")
+   .run(settle.status,reason,evidence,now,now,intentId);
+  return Number(r.changes)===1;
+ }
+
+ /**
+  * 崩溃恢复：所有遗留 dispatching 一律转 unknown。绝不自动重发。
+  * 必须在取得单实例锁之后、开始处理新意图之前调用。
+  */
+ recoverInterruptedSends(now:number):number{
+  this.requireV4();
+  if(!Number.isSafeInteger(now))throw new ArchiveError('rejected');
+  const r=this.db.prepare("UPDATE send_intents SET status='unknown',reason_code='interrupted',settled_at_ms=?,updated_at_ms=? WHERE status='dispatching'")
+   .run(now,now);
+  return Number(r.changes);
+ }
+
+ getSendIntent(intentId:string):{
+  intentId:string;conversationId:string;sourceEventId:string;status:string;attempt:number;
+  reasonCode:string|null;evidence:string|null;createdAtMs:number;settledAtMs:number|null;
+ }|null{
+  this.requireV4();
+  const row=this.db.prepare('SELECT intent_id,conversation_id,source_event_id,status,attempt,reason_code,evidence,created_at_ms,settled_at_ms FROM send_intents WHERE intent_id=?')
+   .get(intentId) as {intent_id:string;conversation_id:string;source_event_id:string;status:string;attempt:number;
+    reason_code:string|null;evidence:string|null;created_at_ms:number;settled_at_ms:number|null}|undefined;
+  if(!row)return null;
+  return {intentId:row.intent_id,conversationId:row.conversation_id,sourceEventId:row.source_event_id,
+   status:row.status,attempt:row.attempt,reasonCode:row.reason_code,evidence:row.evidence,
+   createdAtMs:row.created_at_ms,settledAtMs:row.settled_at_ms};
+ }
+
+ sendIntentEvents(intentId:string):readonly string[]{
+  this.requireV4();
+  const rows=this.db.prepare('SELECT server_message_id FROM send_intent_events WHERE intent_id=? ORDER BY ordinal')
+   .all(intentId) as {server_message_id:string}[];
+  return rows.map(r=>r.server_message_id);
+ }
+
+ /** 只有未过期的正文可取用；过期即视为不可发送（保守）。 */
+ getSendText(intentId:string,now:number):string|null{
+  this.requireV4();
+  const row=this.db.prepare('SELECT body,expires_at_ms FROM send_text WHERE intent_id=?')
+   .get(intentId) as {body:string;expires_at_ms:number}|undefined;
+  if(!row||now>=row.expires_at_ms)return null;
+  return row.body;
+ }
+
+ /** 保留期限清理：只删正文，账本与摘要保留供审计。 */
+ purgeExpiredSendText(now:number):number{
+  this.requireV4();
+  const r=this.db.prepare('DELETE FROM send_text WHERE expires_at_ms<=?').run(now);
+  return Number(r.changes);
+ }
+
  private valid(r:Batch,m:InboundMessage){
   const own=new Set(this.identity.ownUids),parts=r.conversationId.split(':');
   return parts.length===4&&parts[0]==='0'&&parts[1]==='1'&&
