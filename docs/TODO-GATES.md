@@ -812,3 +812,44 @@ T5 的 AI 决策模块进入**功能冻结**：接口不再随意改动（清单
 - 未调用真实模型、未发送消息、未写正式库；正式库仍 v2/`quick_check=ok`。
 
 **判定：T5 功能冻结完成（整体仍未完成）；T6-1 通过，真实发送仍被完全阻断。**
+
+### T6-1b 发送意图持久化与状态机（2026-10-30）
+
+**范围**：SQLite v4 发送账本 + 状态机，完全离线。不接平台、不调用 `sendMsg`、不迁移正式库、不开启真实账号自动回复。
+
+#### 实现
+
+- `app/src/archive/schema-v4.sql`：`send_intents` / `send_intent_events` / `send_text` 三表；`send_intents` 用 CHECK 约束保证每个状态的字段自洽（pending 未认领、dispatching 已认领未结算、终态已结算）。
+- `EveArchive.upgradeToV4()`：显式、事务性、幂等；要求 v3；拒绝其他版本。
+- 账本 API：`saveSendIntent` / `claimSendIntent` / `settleSendIntent` / `recoverInterruptedSends` / `getSendIntent` / `sendIntentEvents` / `getSendText` / `purgeExpiredSendText`。
+- `requireV3()` 放宽为 `<3` 才拒绝，使 v4 库仍可执行 T5 的 AI 账本操作。
+
+#### 五条约束的落地证据（新增 11 条测试）
+
+| 约束 | 测试 |
+|---|---|
+| 幂等：`(conversationId, sourceEventId)` 唯一 | 同 intentId / 同事件重复提交只创建一次，返回 `duplicate_intent` |
+| 批次不可拆 | 三事件批次建成后，复用其中任一事件的新意图被拒（`duplicate_event`）并指回原 `intentId` |
+| 原子认领 | 同一意图第二次 `claim` 返回 false；`attempt` 只增 1 |
+| 崩溃恢复 | 遗留 `dispatching` → `unknown`/`interrupted`；恢复后不可认领；重复恢复返回 0；重开库仍为 `unknown` |
+| 结果判定 | 空证据判 `sent` 抛错；跨集合原因码抛错；终态不可再变 |
+| 正文隔离与保留期 | 账本行内无正文；到期时刻即不可取；清理只删正文 |
+| 事务回滚 | 注入失败后意图/正文/事件关联均无残留，且同意图可重建 |
+| v4 边界 | v3 库调用发送 API 报 `send_requires_v4` |
+
+#### 过程中修正
+
+- 增加 `failAtEvent` 故障注入点（与既有 `injectFailure`/`failAt` 风格一致），用于验证事务回滚；此前无法在不作弊的前提下触发中途失败。
+
+#### 验证
+
+- `pnpm typecheck` 0 错；`pnpm test` **230/230**（219 + 11）。
+- 未调用真实模型、未发送消息、正式库仍 v2/`quick_check=ok`。
+
+#### 仍未完成
+
+- `SendPolicy` 与 `SendLedger` 尚未接线：目前是两个独立模块，谁在被拒绝时不落库、被允许时才落库，需要 T6-2 的组合根串起来。
+- 尚未接平台发送适配器（T6-2），`sent` 的证据来源仍是测试注入。
+- 英文正文/多语言长度按 UTF-16 code unit 计数，与平台侧计数口径是否一致未验证。
+
+**判定：T6-1b 通过；真实发送仍被完全阻断。**

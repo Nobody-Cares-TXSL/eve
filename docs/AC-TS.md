@@ -187,3 +187,10 @@
 - **AC-T6.4 正文不出审计**：`SendIntent.text` 仅存在于意图对象内；日志、审计、错误码、测试断言一律只用 `textDigest`，不得打印或断言正文内容。
 - **AC-T6.5 边界明确**：频率与静默时段的边界值（等于上限、区间端点、跨午夜）行为被测试固定；策略字段非法返回 `invalid_policy` 而非静默降级。
 - **AC-T6.6 与后续 Slice 的边界**：T6-1 不持久化、不产生状态机、不接平台；`SendIntent` 仅在内存返回。真实发送仍需 T6-6 的 L1 人工确认门。
+- **AC-T6.7 v4 迁移与账本隔离**：发送账本使用独立 SQLite v4，不修改 v3；迁移为显式操作且幂等；v4 之前调用发送账本 API 必须报 `send_requires_v4`。正式库不得自动迁移。
+- **AC-T6.8 幂等与批次不可拆**：`UNIQUE(conversation_id, source_event_id)`；`send_intent_events` 以 `(conversation_id, server_message_id)` 为主键，任一事件已属于某意图时新意图被拒绝并返回既有 `intentId`。
+- **AC-T6.9 原子认领**：`claim` 为条件更新（`WHERE status='pending'` 且检查 `changes===1`），同一意图并发认领只有一次成功。
+- **AC-T6.10 崩溃恢复**：遗留 `dispatching` 在重启后一律转 `unknown`（`interrupted`），且此后不可再认领、不可重发；恢复操作幂等。
+- **AC-T6.11 结果判定封闭**：`sent` 必须有非空平台证据；`failed` 仅接受确定未发送的原因码；`unknown` 仅接受超时/中断/歧义/传输错误码；跨集合原因码直接拒绝。终态不可再变。
+- **AC-T6.12 正文保留期**：正文独立存储并带 `expires_at_ms`；过期即 `getSendText` 返回 `null`；清理只删正文，账本与摘要保留。账本行内不得出现正文。
+- **AC-T6.13 事务回滚**：写入过程中断时不得残留意图、正文或事件关联，且失败后同一意图仍可正常创建。
