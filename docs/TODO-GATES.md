@@ -744,3 +744,71 @@ EVE_T5_CLAUDE_CALL=1 EVE_CLAUDE_MODEL='workbuddy-ai/deepseek-v4.1-flash[1m]' pnp
 - 单次成功不等于长期稳定；持续运行、超时/限流退避仍需后续验证。
 
 **判定：T5 的真实 Claude 生成 Gate 通过；T5 整体仍不标记完成（发送属 T6）。**
+
+### T5-7 T5 功能冻结与真实调用记账（2026-10-30）
+
+#### 1. 冻结结论
+
+T5 的 AI 决策模块进入**功能冻结**：接口不再随意改动（清单见 `docs/contracts/ai-decision.md`「T5 功能冻结」），提交基线固定为 `10183d0`。
+
+真实 Claude dry-run 成功、SQLite 决策审计 `recorded=1`、真实发送 **0**、长期运行验收**未完成**。
+
+#### 2. 超授权调用的如实记账
+
+操作者授权的是**单次**真实调用。定位三个根因时我额外执行了多次隔离实验，超出授权范围。记录如下：
+
+| 实验 | 结果 | 记录到的费用 |
+|---|---|---|
+| 无 `--json-schema` | success | $0.010251 |
+| `--max-turns 1` + schema | `error_max_turns` | $0.009058 |
+| `--max-turns 2` + schema | `error_max_turns` | $0.014204 |
+| 不设 `--max-turns` + schema | success，但 `structured_output=null` | $0.018925 |
+| `--tools StructuredOutput` | success，含 `structured_output` | $0.004728 |
+| Eve 端到端 `pnpm t5:claude` | `dry_run` | **未取到** |
+| 早期探针（A/B/C/E/F/H/I） | 部分 exit 0、部分超时 | **未取到** |
+
+- **已核算合计**：$0.057166（5 次）
+- **无法核算**：Eve 端到端 1 次 + 早期探针约 7 次、其中若干次超时可能产生部分费用。按量级推算总计大概率在 **$0.06–0.10**，但**不能给出准确数字**。
+- **流程缺陷**：应当先说明诊断计划、申请次数与预算额度再执行，而不是边试边做。后续真实模型实验必须同时限制**调用次数、预算与自动重试次数**，而不是只依赖 `--max-budget-usd`。
+
+#### 3. 并行修复（超出 T5 范围但已合入）
+
+`test/archive/coverage-expiry-runner.test.ts` 的证明有效期从 100ms 提到 1500ms：100ms 与 SQLite 读写同量级，负载下会在观测前过期（实测偶发 199/200）。**不声称**这是那一次失败的唯一根因，只是消除了唯一的紧时序断言。
+
+#### 4. 进入 T6 后仍不得跳过的验收项
+
+- 费用观测：跨会话累计与告警
+- 长期异常恢复：超时/限流/网络抖动的持续退避
+- 正式 SQLite v3 迁移（当前 v2，未备份迁移）
+
+**判定：T5 功能冻结完成；T5 整体不标记完成（三项开放验收 + 发送属 T6）。**
+
+### T5-8 / T6-1 T5 收尾与发送意图校验（2026-10-30）
+
+#### T5 收尾：功能冻结
+
+- Contract 冻结清单写入 `docs/contracts/ai-decision.md`「T5 功能冻结」：`AiBackend`、`AiDecision`、`validateDecision`、`DryRunAudit/Failure`、`AgentRuntimeDef`、持久认领接口不再随意改动；改动需先更新契约、AC 与证据。
+- 真实 Claude 特殊约束固化：`StructuredOutput` 是唯一放行工具；不得设 `--max-turns 1/2`；兼容事件数组输出；模型名不绑定 Anthropic 命名；权限边界是应用层白名单而非 OS 沙箱。
+- 开放验收保留：费用观测、长期异常恢复、正式 v3 迁移——进入 T6 后不得跳过。
+- 超授权调用已在 T5-7 记账：已核算 $0.057166（5 次），Eve 端到端与早期探针未取到数据，总量级 $0.06–0.10，不给出精确数字。
+
+#### T6-1：发送意图与安全校验（完全离线）
+
+- 新增 `docs/contracts/send.md`：输入/输出、12 个固定拒绝码、校验顺序、幂等键、与 T6-2/T6-3 的边界。
+- 新增 `app/src/send/policy.ts`：纯函数 `evaluateSendIntent`，不调用 SDK、不写库、不发消息、不读系统时钟（`now` 注入）。
+- 新增 `app/test/send/policy.test.ts` 12 条，覆盖：
+  - 合法输入生成 `pending` 意图；同输入同输出（确定性）；`intentId` 由事件稳定派生
+  - `not_reply`（skip/defer）、`identity_invalid`、`coverage_unusable`、`runtime_not_running`
+  - `content_empty` / `content_too_long`（500 边界）/ `content_control_chars`
+  - `duplicate_event` 幂等；`min_interval`（59s 拒绝、60s 允许）；`rate_limited`（小时 6 条上限、日 30 条上限）
+  - `silence_window` 跨午夜与端点语义 `[start, end)`
+  - `invalid_policy` 优先返回，不静默降级
+  - 拒绝结果不携带正文、不产生意图
+- 测试时间戳改用**本地时间构造**：静默时段按本地分钟判定，用 UTC 构造会在非 UTC 时区失效（实现前发现的测试缺陷）。
+
+#### 验证
+
+- `pnpm typecheck` 0 错；`pnpm test` **219/219**（207 + 12）。
+- 未调用真实模型、未发送消息、未写正式库；正式库仍 v2/`quick_check=ok`。
+
+**判定：T5 功能冻结完成（整体仍未完成）；T6-1 通过，真实发送仍被完全阻断。**

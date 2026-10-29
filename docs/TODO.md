@@ -76,7 +76,8 @@
 
 ### T6 — L0 自动发送与未知结果保护
 
-- [ ] T6-1：定义 docs/contracts/send.md：发送意图唯一键、pending → dispatching → sent/failed/unknown、错误重试分类、事务及冲突解决。
+- [x] T6-1：定义 docs/contracts/send.md，并实现**可离线的发送意图与安全校验纵切**（`src/send/policy.ts`，12 个固定拒绝码、幂等键、频率/静默边界；不调用 SDK、不写库、不发消息）。状态机与持久化顺延到 T6-2。
+- [ ] T6-1b：把 `SendIntent` 持久化到 SQLite（pending → dispatching → sent/failed/unknown）、错误重试分类、事务及冲突解决。
 - [ ] T6-2：pending 落盘成功后、**真正调用 SDK 前**必须持久化 dispatching；重启遗留 dispatching 保守进入 unknown，绝不盲目重发。
 - [ ] T6-3：调用 douyin-im Friend/ChatContact.sendMsg，按符合契约的服务端成功回执判 sent；不得宣称对端已显示或已读。
 - [ ] T6-4：在程序侧强制执行唯一白名单、频率/静默、消息长度、暂停、身份复核，AI 无权改写；发送前重新验一次。

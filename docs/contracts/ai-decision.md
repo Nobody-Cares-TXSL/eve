@@ -99,3 +99,35 @@ T5 仍未完成：真实 CLI 单次权限与输出兼容验收、跨进程/跨�
 - T5-4 剩余 Gate：真实 Claude 单次费用/额度的观测、正式持久预算配置及异常退避、长期运行校准、多条非文本/特殊内容组合、Prompt 注入与人工审批。测试通过不代表 T5 或 T5-4 全部完成。
 
 **上下文排序兼容说明**：如果当前消息没有可信 13 位毫秒时间戳、但有可解析的数字 `indexInConversation`，可以用该字段为**已存在且不晚于当前事件**的归档消息排序以构造有限上下文；不能用索引步长声称不存在漏收，也不能把索引作为连续消息合并的充分条件。两种排序线索都不成立时，AI 上下文只含当前事件。
+
+## T5 功能冻结（2026-10-30）
+
+T5 核心能力已通过端到端证据，接口在此冻结。**冻结不等于 T5 整体完成**；下列三项验收仍开放。
+
+### 冻结的接口（不得随意改动）
+
+| 接口 | 位置 | 冻结内容 |
+|---|---|---|
+| `AiBackend` | `src/ai/contracts.ts` | `evaluate(request, signal) → unknown`；只接收 `{instructions, turns}`；不持有平台端口、UID、messageId、SQLite 路径 |
+| `AiDecision` | `src/ai/contracts.ts` | `reply{text,reason,delayMs}` / `skip{reason}` / `defer{reason,delayMs}`，字段集合精确 |
+| `validateDecision` | `src/ai/decision.ts` | 唯一的语义边界：reply 0..600000、defer 1000..86400000、reason ≤120、text ≤500、未知字段拒绝 |
+| `DryRunAudit` / `DryRunFailure` | `src/ai/contracts.ts` | 审计只含 action、长度、摘要、错误码；错误码 = `AgentTransportCode` ∪ 引擎自身码，不再二次坍缩 |
+| `AgentRuntimeDef` | `src/ai/agent-registry.ts` | 注册表只接受 `capabilities` 全 false 的定义；不支持任意用户命令 |
+| 持久认领 | `src/archive/store.ts` | 同一 eligible 事件至多一次自动认领；崩溃后遗留为 `interrupted`，不自动重试 |
+
+改动上述任一接口，需先更新本文件、`docs/AC-TS.md` 对应 AC 与 `docs/TODO-GATES.md` 证据，再改代码。
+
+### 真实 Claude 的特殊约束（实现层必须遵守）
+
+1. **`StructuredOutput` 是唯一允许的工具**。`--json-schema` 依赖它；用 `--tools ''` 或 `--disallowedTools '*'` 会把它一并禁掉，导致 schema 永远无法满足。文件、Shell、浏览器、MCP、发送能力继续禁用。
+2. **不得设置 `--max-turns 1/2`**。结构化输出需要额外的工具回合，实测会被截断为 `error_max_turns`。资源边界由 `--max-budget-usd`、传输层超时与输出字节上限共同约束。
+3. **输出形态兼容两种**：单个 `result` 对象，或事件数组（取最后一个 `type='result'`）。
+4. **模型名不绑定 Anthropic 命名**：由 `EVE_CLAUDE_MODEL` 配置，只做注入安全校验。
+5. **权限边界是应用层工具白名单，不是 OS 沙箱**。不得对外声称已隔离文件系统或进程。
+
+### 仍然开放的验收项（进入 T6 后也不得跳过）
+
+- **费用观测**：目前只有单次 `--max-budget-usd 0.10` 上限与调用次数预算表，**没有跨会话的费用累计与告警**。
+- **长期异常恢复**：持续运行下的超时、限流、网络抖动的退避策略未做长期验证。
+- **正式 SQLite v3 迁移**：正式库仍为 v2；v3 迁移只在临时库验证过，未备份迁移到正式库。
+- **真实发送**：0 次。T5 全程 dry-run。
