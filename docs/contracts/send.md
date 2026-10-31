@@ -215,3 +215,48 @@ T6-1b 底层直接 `saveSendIntent` 的旧离线测试仍可省略 `expectedProo
 ### T6-3b 范围边界
 
 本阶段不建立 `PlatformPort.send()`，不接 Runner，不读取真实正文库，不调用 SDK 发送、不处理服务端回执、不迁移正式 v2。真实 SDK 成功/失败/超时和 `unknown` 三态分类、发送前原子 `dispatching` 认领、L1 凭证及重启锁、平台 Unicode 长度与风险设置属于 T6-3c 或更后的独立 Gate。绝不把 `prepareSdkTextDraft().ok=true` 当作 `可以发送` 的权限证明。
+
+## 12. T6-3c：受控发送执行与回执分类（离线，不真实发送）
+
+本阶段把「已审批的意图」交给一个**注入的**发送传输层，并按 SDK 回执做三态判定。**不引入真实 SDK 实例、不调用 `sendMsg`**；真实首次发送是单独授权的验收操作。
+
+### 12.1 输入必须是可信快照，且账本为准
+
+- `session`：账号唯一、`verified`、`online`，`uid`/`imUid` 与期望一致。**快照本身不构成活跃会话证明**——真实性由调用方（Runner 唯一实例锁）保证。
+- `contact`：只接受 `friend`/`stranger`；`blocked` **直接读真实实例的 `.blocked`**，`undefined` 保留为未知并拒绝（不得映射成 `false`）。
+- `transport`：由适配器绑定到已验证联系人的发送通道。本阶段只接受注入的 fake；`dispatch.ts` 不 import `douyin-im`。
+- 意图的会话、事件组、`ai_claim_id`、`not_before_ms`、`decision_digest`、正文**全部从 SQLite 读取**，不接受调用方提供。
+
+### 12.2 执行顺序（固定）
+
+1. 读取 v5 绑定：意图必须 `pending`、`attempt===0`、`ai_claim_id` 与 `not_before_ms` 同时存在。
+2. 校验 T5 claim：`state='recorded'`、`action='reply'`、`decision_digest` 一致；Proof Epoch 仍是当前 `coverageEpoch`。
+3. 校验 L1 审批：`approvalId` 格式、`intentId` 必须精确匹配、`approvedAtMs <= now < expiresAtMs`。
+4. 用 T6-3b 的 `prepareSdkTextDraft` 复核会话/联系人/内容/时间。
+5. `claimSendIntent` 条件更新（`pending → dispatching`）。
+6. **claim 之后重新读取绑定并复核**（堵住 await 窗口），任一不符立即结算 `failed`。
+7. 调用 `transport.sendText(draft.message)`，带超时。
+8. 按 §12.3 分类并结算。
+
+### 12.3 回执分类（封闭）
+
+`SendMessageResponse` 字段存在**不等于**送达。判定规则：
+
+| 条件 | 结果 | 原因码 |
+|---|---|---|
+| `statusCode !== 0` | `failed` | `platform_rejected` |
+| `statusCode === 0` 且 `checkCode === 8610` | `failed` | `risk_controlled` |
+| `statusCode === 0` 且 `serverMessageId` 为非空、非 `'0'` 字符串 | `sent` | 证据 = `serverMessageId` |
+| 其余（缺 ID、ID 为 `'0'`、字段类型异常） | `unknown` | `ambiguous_result` |
+| 超时 | `unknown` | `timeout` |
+| 传输层抛异常 | `unknown` | `transport_error` |
+
+`sent` 只表示**服务端回执**，不表示对方已显示或已读。`unknown` 永不自动重试。
+
+### 12.4 L1 审批的本阶段边界
+
+审批记录以注入对象传入（`approvalId`/`intentId`/`approvedAtMs`/`expiresAtMs`），执行时严格校验作用域与时效。**审批的持久化存储、签名与人工界面不在本阶段**；T6-3c 通过只证明「有审批才能发」这条判定成立，不证明审批系统已上线。
+
+### 12.5 不做
+
+不接真实 SDK、不调用 `sendMsg`、不迁移正式库、不自动重试、不开放 L0、不发送任何私信。

@@ -236,3 +236,17 @@
 - [x] 9 个专项测试覆盖合法 Friend/Stranger、身份/群/时钟/内容/来源拒绝及源码没有 SDK 运行时发送依赖。
 - [ ] 与真实活跃 SDK 实例绑定和从 SQLite v5 读取可信请求的生产路径尚未实现；Builder 的 snapshot 属性并非授权。
 - [ ] 平台真实长度计数、`SendMessageResponse` 的成功证据、`SendMessageError` 分类及 L1 审批/一次真实发信均未验收。正式 v2 不迁移。
+
+### AC-T6.3c · 受控发送执行与回执分类（**离线已实现**，2026-10-31）
+
+契约：`docs/contracts/send.md §12`。实现：`src/send/dispatch.ts`。证据：`app/test/send/dispatch.test.ts` 13 条。**全程不接真实 SDK、不调用 `sendMsg`。**
+
+- [x] AC-T6.3c.1 意图、事件组、`ai_claim_id`、`not_before_ms`、`decision_digest`、正文全部从 SQLite 读取，不接受调用方提供；`sendDispatchBinding` 为唯一读取入口。
+- [x] AC-T6.3c.2 T5 claim 必须 `state='recorded'`、`decision_digest` 一致、`reply_length` 与正文长度一致；Proof Epoch 必须仍是当前 `coverageEpoch`，否则 `proof_changed`。
+- [x] AC-T6.3c.3 L1 审批必须存在、`intentId` 精确匹配、`approvedAtMs <= now < expiresAtMs`；缺失/错配/过期均 `rejected` 且不调用传输层、不改变意图状态。
+- [x] AC-T6.3c.4 回执分类封闭：`statusCode!==0`→`failed/platform_rejected`；`checkCode===8610`→`failed/risk_controlled`；有效 `serverMessageId`→`sent`（证据即该 ID）；其余→`unknown/ambiguous_result`；超时→`unknown/timeout`；异常→`unknown/transport_error`。
+- [x] AC-T6.3c.5 `sent` 只表示服务端回执，不表示对方已显示或已读；`unknown` 永不自动重试；终态删除正文。
+- [x] AC-T6.3c.6 claim 之后重新读取绑定并复核，任一变即结算 `failed`；已终结意图再次派发被拒。
+- [x] AC-T6.3c.7 `dispatch.ts` 无 `douyin-im` 运行时依赖、无 `sendMsg`，测试以源码扫描固定该约束。
+- [ ] AC-T6.3c.8 **首次真实发送**：真实 SDK 实例绑定、真实 `sendMsg`、服务端回执实测——需单独授权，本阶段未做。
+- [ ] AC-T6.3c.9 L1 审批的持久化存储、签名与人工界面未实现；本阶段审批以注入对象传入，只证明「有审批才能发」的判定成立。

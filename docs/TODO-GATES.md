@@ -937,3 +937,35 @@ T5 的 AI 决策模块进入**功能冻结**：接口不再随意改动（清单
 - 正式 SQLite 只读结果：`PRAGMA user_version=2`、`quick_check=ok`、`messages=132`；Runner `phase=stopped,alive=false`；扫描 `app/src` 无真实 `sendMsg(` 调用。没有真实 Claude 请求、没有真实 SDK 发送、没有正式库迁移或新增 Git commit/push。
 - T6-3b 的公开出口仅为纯参数构造器，不获得 SDK 运行时实例：本地类型与安装的 douyin-im@1.1.0 的 SendableMessage 接口兼容，但 `session.verified`、`contact.blocked` 仍是传入快照、可以被调用者伪造。**此结果不授予发送权限**，T6-3c 必须从活跃 SDK 对象重新核实 `contact.account===activeAccount`、真实 Proof/v5 claim、L1 人工批准及真实回执的状态语义，必须对真实发信另行明确授权。
 - 当前 HEAD 仍是历史重写后的 `49cdd76`，工作区只有本轮 `outbound-request.ts`、其测试及文档的未提交修改。
+
+### T6-3c 受控发送执行与回执分类（离线，2026-10-31）
+
+**范围**：把已审批的意图交给注入的传输层，并按 SDK 回执做三态判定。不接真实 SDK、不调用 `sendMsg`、不迁移正式库。
+
+#### 实现
+
+- `src/send/dispatch.ts`：`dispatchOnce()` + `classifySendResponse()`。无 `douyin-im` 运行时依赖，传输层由调用方注入。
+- `EveArchive.sendDispatchBinding()`：发送前唯一可信读取入口，返回会话、事件组、`ai_claim_id`、`not_before_ms`、摘要、正文与 T5 claim 状态。
+- `SEND_FAILURE_CODES` 增加 `platform_rejected`、`risk_controlled`（`reason_code` 为自由 TEXT，无需迁移）。
+
+#### 执行顺序（与契约 §12.2 一致）
+
+读账本 → 校验 T5 claim 与 Proof Epoch → 校验 L1 审批 → 复用 T6-3b 构造器复核 → 原子认领 → claim 后复核 → 注入传输层（带超时）→ 分类结算。
+
+#### 测试（13 条）
+
+回执分类表（含 `statusCode` 非整数、`serverMessageId='0'`、空串）、sent 后正文删除、平台拒绝、风控 8610、缺 ID→unknown 且不可再认领、超时、传输异常、审批缺失/错配/过期/未生效且零副作用、会话与联系人 9 种异常且传输层零调用、Proof 换代、已终结意图再次派发被拒、`not_before` 未到、源码无 SDK 运行时依赖。
+
+#### 验证
+
+- `pnpm typecheck` 0 错；`pnpm test` **294/294**（281 + 13）。
+- 正式库仍 v2/`quick_check=ok`；`src` 无真实 `sendMsg`；本轮模型请求 0 次、私信发送 0 条。
+
+#### 仍未完成
+
+- **首次真实发送**：真实 SDK 实例绑定、真实 `sendMsg`、服务端回执实测——需单独授权。
+- L1 审批只有注入对象，无持久化、签名与人工界面。
+- `contact.blocked` 需由适配器直接读真实实例的 `.blocked` 并保留 `undefined`（本轮测试已固定该语义，但适配器本身未写）。
+- 平台字数口径、限流退避、长时间运行稳定性未验证。
+
+**判定：T6-3c 离线执行与回执分类 Gate 通过；真实发送 Gate 未开始。**
