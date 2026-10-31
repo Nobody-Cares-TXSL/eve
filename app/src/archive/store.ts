@@ -8,7 +8,7 @@ import type {AiDecision} from '../ai/contracts.ts';
 import {evaluateSendIntent} from '../send/policy.ts';
 import type {SendRejectCode} from '../send/policy.ts';
 /** 当前程序支持的最高 schema 版本；所有「版本区间」判断都应引用它。 */
-export const MAX_SCHEMA_VERSION=5;
+export const MAX_SCHEMA_VERSION=6;
 
 export type HandoffBlockReason='claim_inactive'|'coverage_changed'|'source_invalid'|'storage_unavailable'|'policy_invalid';
 export type HandoffNoIntentReason='not_reply'|'already_finalized'|SendRejectCode;
@@ -38,6 +38,7 @@ const sqlV2=readFileSync(new URL('./schema-v2.sql',import.meta.url),'utf8');
 const sqlV3=readFileSync(new URL('./schema-v3.sql',import.meta.url),'utf8');
 const sqlV4=readFileSync(new URL('./schema-v4.sql',import.meta.url),'utf8');
 const sqlV5=readFileSync(new URL('./schema-v5.sql',import.meta.url),'utf8');
+const sqlV6=readFileSync(new URL('./schema-v6.sql',import.meta.url),'utf8');
 function digest(r:Batch){return createHash('sha256').update(JSON.stringify([r.conversationId,r.source,r.gapReason??null,r.messages.map(m=>[m.conversationId,m.serverMessageId,m.clientMessageId,m.senderUid,m.fromSelf,m.text,m.kind,m.messageType,m.createTime,m.indexInConversation])])).digest('hex');}
 export class EveArchive {
  private closed=false;
@@ -71,7 +72,7 @@ export class EveArchive {
   try{
    db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=3000');
    const version=(db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-   if(version!==0&&version!==1&&version!==2&&version!==3&&version!==4&&version!==5)throw new ArchiveError('schema_unsupported');
+   if(version<0||version>MAX_SCHEMA_VERSION)throw new ArchiveError('schema_unsupported');
    if(version===0){
     // SQLite user_version 0 has no versioned Eve schema. Only an EMPTY
     // pre-existing SQLite DB may safely initialize as v1.
@@ -112,7 +113,7 @@ export class EveArchive {
  upgradeToV2(injectFailure=false):void{
   this.check();
   const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-  if(version>=2&&version<=5)return;
+  if(version>=2&&version<=MAX_SCHEMA_VERSION)return;
   if(version!==1)throw new ArchiveError('schema_unsupported');
   this.db.exec('BEGIN IMMEDIATE');
   try{
@@ -127,7 +128,7 @@ export class EveArchive {
  upgradeToV3(injectFailure=false):void{
   this.check();
   const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-  if(version>=3&&version<=5)return;
+  if(version>=3&&version<=MAX_SCHEMA_VERSION)return;
   if(version!==2)throw new ArchiveError('migration_requires_v2');
   this.db.exec('BEGIN IMMEDIATE');
   try{
@@ -142,7 +143,7 @@ export class EveArchive {
  upgradeToV4(injectFailure=false):void{
   this.check();
   const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-  if(version===4||version===5)return;
+  if(version>=4&&version<=MAX_SCHEMA_VERSION)return;
   if(version!==3)throw new ArchiveError('migration_requires_v3');
   this.db.exec('BEGIN IMMEDIATE');
   try{
@@ -167,7 +168,7 @@ export class EveArchive {
  upgradeToV5(injectFailure=false):void{
   this.check();
   const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-  if(version===5)return;
+  if(version===5||version===6)return;
   if(version!==4)throw new ArchiveError('migration_requires_v4');
   this.db.exec('BEGIN IMMEDIATE');
   try{
@@ -180,8 +181,93 @@ export class EveArchive {
  }
  private requireV5():void{
   this.check();
-  if((this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version!==5)
+  if((this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version<5)
    throw new ArchiveError('handoff_requires_v5');
+ }
+ /** T6-3c-real-A explicit migration: L1 approval ledger. */
+ upgradeToV6(injectFailure=false):void{
+  this.check();
+  const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
+  if(version===6)return;
+  if(version!==5)throw new ArchiveError('migration_requires_v5');
+  this.db.exec('BEGIN IMMEDIATE');
+  try{
+   this.db.exec(sqlV6);
+   if(injectFailure)throw new ArchiveError('migration_injected_failure');
+   this.db.exec('UPDATE archive_meta SET schema_version=6 WHERE singleton=1');
+   this.db.exec('PRAGMA user_version=6');
+   this.db.exec('COMMIT');
+  }catch(e){this.db.exec('ROLLBACK');throw e;}
+ }
+ private requireV6():void{
+  this.check();
+  if((this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version!==6)
+   throw new ArchiveError('approval_requires_v6');
+ }
+
+ /**
+  * 登记一份 L1 人工批准。绑定意图、接收方、正文摘要与有效期。
+  * 只能为**当前 pending 且尚未被批准过**的意图登记；摘要必须与账本一致。
+  */
+ createSendApproval(input:{
+  approvalId:string;intentId:string;recipientUid:string;textDigest:string;
+  approvedAtMs:number;expiresAtMs:number;
+ }):boolean{
+  this.requireV6();
+  if(!/^[A-Za-z0-9_-]{8,64}$/.test(input.approvalId)||
+     !/^[0-9]{1,64}$/.test(input.recipientUid)||
+     !/^[a-f0-9]{64}$/.test(input.textDigest)||
+     !Number.isSafeInteger(input.approvedAtMs)||!Number.isSafeInteger(input.expiresAtMs)||
+     input.expiresAtMs<=input.approvedAtMs)
+   throw new ArchiveError('invalid_approval');
+  this.db.exec('BEGIN IMMEDIATE');
+  try{
+   const intent=this.db.prepare(
+    'SELECT i.status,i.conversation_id,i.text_digest,e.recipient_uid FROM send_intents i '+
+    'LEFT JOIN send_approvals e ON e.intent_id=i.intent_id WHERE i.intent_id=?'
+   ).get(input.intentId) as {status:string;conversation_id:string;text_digest:string;recipient_uid:string|null}|undefined;
+   if(!intent||intent.status!=='pending'||intent.recipient_uid!==null)
+    throw new ArchiveError('approval_not_applicable');
+   if(intent.text_digest!==input.textDigest)throw new ArchiveError('approval_digest_mismatch');
+   // 接收方必须就是该会话白名单目标，防止批准对象与实际收件人不一致
+   if(input.recipientUid!==this.identity.targetUid)throw new ArchiveError('approval_recipient_mismatch');
+   this.db.prepare('INSERT INTO send_approvals(approval_id,intent_id,recipient_uid,text_digest,approved_at_ms,expires_at_ms) VALUES(?,?,?,?,?,?)')
+    .run(input.approvalId,input.intentId,input.recipientUid,input.textDigest,input.approvedAtMs,input.expiresAtMs);
+   this.db.exec('COMMIT');
+   return true;
+  }catch(e){this.db.exec('ROLLBACK');throw e;}
+ }
+
+ /**
+  * 消费审批：条件更新保证**只能成功一次**，且必须在有效期内。
+  * 返回 false 表示不可用（已消费、过期、未生效、绑定不符）。
+  */
+ consumeSendApproval(input:{
+  approvalId:string;intentId:string;recipientUid:string;textDigest:string;nowMs:number;
+ }):boolean{
+  this.requireV6();
+  if(!Number.isSafeInteger(input.nowMs))return false;
+  const r=this.db.prepare(
+   'UPDATE send_approvals SET consumed_at_ms=? '+
+   'WHERE approval_id=? AND intent_id=? AND recipient_uid=? AND text_digest=? '+
+   'AND consumed_at_ms IS NULL AND approved_at_ms<=? AND expires_at_ms>?'
+  ).run(input.nowMs,input.approvalId,input.intentId,input.recipientUid,input.textDigest,
+       input.nowMs,input.nowMs);
+  return Number(r.changes)===1;
+ }
+
+ sendApprovalState(intentId:string):{
+  approvalId:string;consumed:boolean;approvedAtMs:number;expiresAtMs:number;textDigest:string;recipientUid:string;
+ }|null{
+  this.requireV6();
+  const row=this.db.prepare(
+   'SELECT approval_id,consumed_at_ms,approved_at_ms,expires_at_ms,text_digest,recipient_uid FROM send_approvals WHERE intent_id=?'
+  ).get(intentId) as {approval_id:string;consumed_at_ms:number|null;approved_at_ms:number;
+   expires_at_ms:number;text_digest:string;recipient_uid:string}|undefined;
+  if(!row)return null;
+  return {approvalId:row.approval_id,consumed:row.consumed_at_ms!==null,
+   approvedAtMs:row.approved_at_ms,expiresAtMs:row.expires_at_ms,
+   textDigest:row.text_digest,recipientUid:row.recipient_uid};
  }
  private schemaVersion():number{
   return (this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;

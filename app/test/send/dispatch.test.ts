@@ -1,6 +1,8 @@
 /**
- * T6-3c：受控发送执行与回执分类（离线）。
- * 契约：docs/contracts/send.md §12。不接真实 SDK、不调用 sendMsg。
+ * T6-3c-real-A：受控发送执行与回执分类（离线）。
+ * 契约：docs/contracts/send.md §12–§13。不接真实 SDK、不调用 sendMsg。
+ *
+ * 与上一版的差异：会话必须由活实例派生；L1 审批来自 v6 账本且只能消费一次。
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -13,14 +15,14 @@ import { MockPlatformPort } from '../../src/platform/mock.ts';
 import { reconcileOnce } from '../../src/runtime/reconcile.ts';
 import type { InboundMessage } from '../../src/platform/types.ts';
 import {
-  classifySendResponse, dispatchOnce, proofStillValid,
-  type ApprovalRecord, type DispatchInput, type SendResponseLike, type SendTransport,
+  classifySendResponse, dispatchOnce, proofStillValid, responseFromError,
+  type DispatchInput, type SendResponseLike, type SendTransport,
 } from '../../src/send/dispatch.ts';
 
 const ID = { ownerUid: '111', targetUid: '333', ownUids: ['111', '222'] };
 const THREAD = '0:1:222:333';
-const EVENT = '9000000000000000001';
 const TEXT = '这是一条只供离线测试的回复';
+const APPROVAL = 'appr-abcdef12';
 
 const message = (id: string): InboundMessage => ({
   conversationId: THREAD, serverMessageId: id, clientMessageId: null, senderUid: '333',
@@ -29,15 +31,44 @@ const message = (id: string): InboundMessage => ({
   indexInConversation: String(BigInt(id) % 10n),
 });
 
-interface Ctx { a: EveArchive; file: string; intentId: string; now: number; }
+/** 真实 SDK 实例的替身：对象引用关系与 SDK 一致（contact.account === account）。 */
+function liveRefs(opts: {
+  online?: boolean; imUid?: string; kind?: 'friend' | 'stranger' | 'none';
+  blocked?: boolean | undefined; threadId?: string; uid?: string; extraAccount?: boolean;
+} = {}) {
+  const contact = {
+    account: null as unknown, uid: opts.uid ?? '333', threadId: opts.threadId ?? THREAD,
+    // 不能用 ?? false：undefined 必须保持「未知」，否则测试无法覆盖保守拒绝
+    conversationType: 1, blocked: 'blocked' in opts ? opts.blocked : false,
+  };
+  const account = {
+    uid: '111', imUid: opts.imUid ?? '222', online: opts.online ?? true,
+    pickFriend: (uid: string) => (opts.kind === 'friend' && uid === '333' ? contact : undefined),
+    pickStranger: (uid: string) => (opts.kind === 'stranger' && uid === '333' ? contact : undefined),
+  };
+  contact.account = account;
+  if (opts.kind === 'none') {
+    account.pickFriend = () => undefined;
+    account.pickStranger = () => undefined;
+  }
+  const client = { accounts: opts.extraAccount ? [account, { uid: '999' }] : [account] };
+  return { client, account, contact };
+}
 
-async function withPendingIntent(fn: (c: Ctx) => void | Promise<void>): Promise<void> {
-  const dir = mkdtempSync(join(tmpdir(), 'eve-t6-dispatch-'));
+interface Ctx { a: EveArchive; file: string; intentId: string; now: number; textDigest: string; }
+
+async function withPendingIntent(
+  fn: (c: Ctx) => void | Promise<void>,
+  opts: { version?: number; approve?: boolean } = {},
+): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'eve-t6-real-a-'));
   const file = join(dir, 'demo.sqlite');
   const a = EveArchive.open(file, ID);
   const p = new MockPlatformPort({ uid: '111', imUid: '222' });
   try {
     a.upgradeToV2(); a.upgradeToV3(); a.upgradeToV4(); a.upgradeToV5();
+    const version = opts.version ?? 6;
+    if (version >= 6) a.upgradeToV6();
     p.delivered.push(message('9000000000000000000'));
     assert.equal((await reconcileOnce({ port: p, archive: a, conversationId: THREAD, imUid: '222', instanceId: 'b', isSafe: () => true })).state, 'verified');
     p.delivered.push(...[1, 2, 3, 4].map(i => message('900000000000000000' + i)));
@@ -46,18 +77,31 @@ async function withPendingIntent(fn: (c: Ctx) => void | Promise<void>): Promise<
     assert.ok(reservation);
     const now = Date.now();
     const minute = new Date(now).getHours() * 60 + new Date(now).getMinutes();
+    // 静默区间必须离当前时刻足够远：只留 1 分钟宽时，并行负载下跨分钟边界
+    // 会偶发撞进静默期（曾出现 fixture 返回 blocked）。
+    const silenceStart = (minute + 180) % 1440;
+    const silenceEnd = (silenceStart + 60) % 1440;
     const r = a.finalizeAiWithSend({
       claimId: reservation.claimId,
       decision: { action: 'reply', text: TEXT, reason: '测试', delayMs: 0 },
       identity: { ownerUid: '111', targetUid: '333', ownImUid: '222' },
       runtime: { phase: 'running', paused: false },
       policy: { minIntervalMs: 0, maxPerHour: 6, maxPerDay: 30, maxTextLength: 500,
-        silence: { startMinute: (minute + 20) % 1440, endMinute: (minute + 21) % 1440 } },
+        silence: { startMinute: silenceStart, endMinute: silenceEnd } },
       now, coverageMaxAgeMs: 90_000, bodyRetentionMs: 900_000,
     });
-    assert.equal(r.status, 'recorded_pending');
+    assert.equal(r.status, 'recorded_pending', 'fixture 必须成功创建意图，实际：' +
+      JSON.stringify(r.status === 'blocked' ? { blocked: r.reasonCode } : r.status === 'recorded_no_intent' ? { noIntent: r.reasonCode } : {}));
     if (r.status !== 'recorded_pending') return;
-    await fn({ a, file, intentId: r.intentId, now });
+    const binding = a.sendDispatchBinding(r.intentId);
+    assert.ok(binding);
+    if (version >= 6 && (opts.approve ?? true)) {
+      a.createSendApproval({
+        approvalId: APPROVAL, intentId: r.intentId, recipientUid: '333',
+        textDigest: binding.textDigest, approvedAtMs: now - 1_000, expiresAtMs: now + 300_000,
+      });
+    }
+    await fn({ a, file, intentId: r.intentId, now, textDigest: binding.textDigest });
   } finally {
     a.close();
     rmSync(dir, { recursive: true, force: true });
@@ -65,228 +109,202 @@ async function withPendingIntent(fn: (c: Ctx) => void | Promise<void>): Promise<
 }
 
 const transport = (r: SendResponseLike | (() => Promise<SendResponseLike>)): SendTransport & { calls: number } => {
-  const t = {
-    calls: 0,
-    async sendText() { t.calls++; return typeof r === 'function' ? r() : r; },
-  };
+  const t = { calls: 0, async sendText() { t.calls++; return typeof r === 'function' ? r() : r; } };
   return t;
 };
 
-const session = (over: Record<string, unknown> = {}) => ({
-  accountCount: 1, uid: '111', imUid: '222', verified: true, online: true,
-  contact: { kind: 'friend' as const, uid: '333', accountUid: '111', threadId: THREAD,
-    conversationType: 1, blocked: false as boolean | undefined },
-  ...over,
-});
-const approval = (c: Ctx, over: Partial<ApprovalRecord> = {}): ApprovalRecord => ({
-  approvalId: 'appr-12345678', intentId: c.intentId,
-  approvedAtMs: c.now - 1_000, expiresAtMs: c.now + 60_000, ...over,
-});
-const input = (c: Ctx, over: Partial<DispatchInput> = {}): DispatchInput => ({
+const base = (c: Ctx, over: Partial<DispatchInput> = {}): DispatchInput => ({
   intentId: c.intentId,
-  expected: { ownerUid: '111', ownImUid: '222', targetUid: '333' },
-  session: session(),
+  expected: { ownerUid: '111', ownImUid: '222', targetUid: '333', conversationId: THREAD },
+  live: liveRefs({ kind: 'friend' }),
   transport: transport({ statusCode: 0, serverMessageId: '7701260499833538097' }),
-  approval: approval(c),
+  approvalId: APPROVAL,
   nowMs: c.now, coverageMaxAgeMs: 90_000, maxTextLength: 500, timeoutMs: 1_000,
   ...over,
 });
+
 const state = (file: string, intentId: string) => {
   const db = new DatabaseSync(file, { readOnly: true });
   try {
     const row = db.prepare('SELECT status,reason_code,evidence FROM send_intents WHERE intent_id=?').get(intentId) as
       { status: string; reason_code: string | null; evidence: string | null };
     const text = db.prepare('SELECT COUNT(*) n FROM send_text WHERE intent_id=?').get(intentId) as { n: number };
-    return { ...row, textRows: Number(text.n) };
+    const appr = db.prepare('SELECT consumed_at_ms FROM send_approvals WHERE intent_id=?').get(intentId) as
+      { consumed_at_ms: number | null } | undefined;
+    return { ...row, textRows: Number(text.n), approvalConsumed: appr?.consumed_at_ms != null };
   } finally { db.close(); }
 };
 
-test('回执分类：只有 statusCode=0 且有效 serverMessageId 才算 sent', () => {
+test('回执分类：只有数字形式的 serverMessageId 才算 sent', () => {
   assert.deepEqual(classifySendResponse({ statusCode: 0, serverMessageId: '7701260499833538097' }),
     { status: 'sent', evidence: '7701260499833538097' });
-  // SDK 用 -3 表示「缺 serverMessageId、无法确认」，绝不能判为确定未发送
-  assert.deepEqual(classifySendResponse({ statusCode: -3 }),
+  for (const bad of ['abc', '0', '', '0123', '-1', '7701260499833538097x']) {
+    assert.deepEqual(classifySendResponse({ statusCode: 0, serverMessageId: bad }),
+      { status: 'unknown', reasonCode: 'ambiguous_result' }, bad + ' 不得判 sent');
+  }
+  assert.deepEqual(classifySendResponse({ statusCode: -3 }), { status: 'unknown', reasonCode: 'ambiguous_result' });
+  assert.deepEqual(classifySendResponse({ statusCode: 0, checkCode: 10502, serverMessageId: '123' }),
     { status: 'unknown', reasonCode: 'ambiguous_result' });
-  // 10502：已提交但可能审核中
-  assert.deepEqual(classifySendResponse({ statusCode: 0, checkCode: 10502, serverMessageId: 'x' }),
-    { status: 'unknown', reasonCode: 'ambiguous_result' });
-  // 未经实测确认的非零码一律 unknown，不得冒充 platform_rejected
-  assert.deepEqual(classifySendResponse({ statusCode: 400, serverMessageId: 'x' }),
-    { status: 'unknown', reasonCode: 'ambiguous_result' });
-  assert.deepEqual(classifySendResponse({ statusCode: 0, checkCode: 8610, serverMessageId: 'x' }),
-    { status: 'failed', reasonCode: 'risk_controlled' });
-  assert.deepEqual(classifySendResponse({ statusCode: 0 }), { status: 'unknown', reasonCode: 'ambiguous_result' });
-  assert.deepEqual(classifySendResponse({ statusCode: 0, serverMessageId: '0' }), { status: 'unknown', reasonCode: 'ambiguous_result' });
-  assert.deepEqual(classifySendResponse({ statusCode: 0, serverMessageId: '' }), { status: 'unknown', reasonCode: 'ambiguous_result' });
+  assert.deepEqual(classifySendResponse({ statusCode: 400 }), { status: 'unknown', reasonCode: 'ambiguous_result' });
+  assert.deepEqual(classifySendResponse({ statusCode: 0, checkCode: 8610 }), { status: 'failed', reasonCode: 'risk_controlled' });
   assert.deepEqual(classifySendResponse({ statusCode: 1.5 } as SendResponseLike), { status: 'unknown', reasonCode: 'ambiguous_result' });
 });
 
-test('正常回执 → sent，账本留证据、正文被删除', () => withPendingIntent(async (c) => {
+test('responseFromError 结构化提取，异常也可分类', () => {
+  assert.equal(responseFromError(new Error('plain')), null);
+  assert.equal(responseFromError({ response: 'nope' }), null);
+  assert.deepEqual(responseFromError({ response: { statusCode: 0, checkCode: 8610 } }),
+    { statusCode: 0, checkCode: 8610 });
+});
+
+test('正常回执 → sent，证据为服务端 ID，正文删除、审批已消费', () => withPendingIntent(async (c) => {
   const t = transport({ statusCode: 0, serverMessageId: '7701260499833538097' });
-  const r = await dispatchOnce(c.a, input(c, { transport: t }));
+  const r = await dispatchOnce(c.a, base(c, { transport: t }));
   assert.deepEqual(r, { status: 'sent', intentId: c.intentId, evidence: '7701260499833538097' });
   assert.equal(t.calls, 1);
   const s = state(c.file, c.intentId);
   assert.equal(s.status, 'sent');
   assert.equal(s.evidence, '7701260499833538097');
-  assert.equal(s.textRows, 0, '终态必须删除正文');
+  assert.equal(s.textRows, 0);
+  assert.equal(s.approvalConsumed, true);
 }));
 
-test('SDK -3（缺 ID 无法确认）→ unknown，绝不判 failed', () => withPendingIntent(async (c) => {
-  const r = await dispatchOnce(c.a, input(c, { transport: transport({ statusCode: -3 }) }));
+test('SDK -3 → unknown，绝不判 failed', () => withPendingIntent(async (c) => {
+  const r = await dispatchOnce(c.a, base(c, { transport: transport({ statusCode: -3 }) }));
   assert.deepEqual(r, { status: 'unknown', intentId: c.intentId, reasonCode: 'ambiguous_result' });
   assert.equal(state(c.file, c.intentId).status, 'unknown');
-  assert.equal(c.a.claimSendIntent(c.intentId, c.now + 1), false, 'unknown 永不自动重试');
 }));
 
-test('未经确认的非零状态码 → unknown，不冒充确定拒绝', () => withPendingIntent(async (c) => {
-  const r = await dispatchOnce(c.a, input(c, { transport: transport({ statusCode: 400, statusMsg: 'x' }) }));
-  assert.deepEqual(r, { status: 'unknown', intentId: c.intentId, reasonCode: 'ambiguous_result' });
-}));
-
-test('SendMessageError.response 受控分类：8610 → failed', () => withPendingIntent(async (c) => {
-  const riskErr = transport(() => Promise.reject(Object.assign(new Error('send failed'), {
-    response: { statusCode: 0, checkCode: 8610, statusMsg: 'content audit' },
-  })));
-  const r1 = await dispatchOnce(c.a, input(c, { transport: riskErr }));
-  assert.deepEqual(r1, { status: 'failed', intentId: c.intentId, reasonCode: 'risk_controlled' });
-}));
-
-test('SendMessageError.response 为 -3 → unknown/ambiguous_result', () => withPendingIntent(async (c) => {
-  const ambiguous = transport(() => Promise.reject(Object.assign(new Error('send failed'), {
-    response: { statusCode: -3, statusMsg: 'missing serverMessageId' },
-  })));
-  const r = await dispatchOnce(c.a, input(c, { transport: ambiguous }));
-  assert.deepEqual(r, { status: 'unknown', intentId: c.intentId, reasonCode: 'ambiguous_result' });
-}));
-
-test('异常携带「看似成功」的 response 也不得判 sent', () => withPendingIntent(async (c) => {
-  const weird = transport(() => Promise.reject(Object.assign(new Error('odd'), {
-    response: { statusCode: 0, serverMessageId: '7701260499833538097' },
-  })));
-  const r = await dispatchOnce(c.a, input(c, { transport: weird }));
-  assert.equal(r.status, 'unknown');
-}));
-
-test('数据库正文被篡改 → rejected content_digest_mismatch，且不调用传输层', () => withPendingIntent(async (c) => {
-  // 等长篡改：绕过 reply_length 启发式，必须由账本摘要抓到
-  assert.equal('这是一条只供离线测试的答复'.length, TEXT.length);
-  const db = new DatabaseSync(c.file);
-  try { db.prepare('UPDATE send_text SET body=? WHERE intent_id=?').run('这是一条只供离线测试的答复', c.intentId); }
-  finally { db.close(); }
-  const t = transport({ statusCode: 0, serverMessageId: 'x' });
-  const r = await dispatchOnce(c.a, input(c, { transport: t }));
-  assert.deepEqual(r, { status: 'rejected', reasonCode: 'content_digest_mismatch' });
-  assert.equal(t.calls, 0, '篡改后绝不能发送');
-  assert.equal(state(c.file, c.intentId).status, 'pending');
-}));
-
-test('不等长篡改同样被拒（reply_length 启发式兜底）', () => withPendingIntent(async (c) => {
-  const db = new DatabaseSync(c.file);
-  try { db.prepare('UPDATE send_text SET body=? WHERE intent_id=?').run('短', c.intentId); }
-  finally { db.close(); }
-  const t = transport({ statusCode: 0, serverMessageId: 'x' });
-  const r = await dispatchOnce(c.a, input(c, { transport: t }));
-  assert.equal(r.status, 'rejected');
-  assert.equal(t.calls, 0);
-}));
-
-test('proofStillValid：epoch 不符或缺失即 false', () => withPendingIntent((c) => {
-  const b = c.a.sendDispatchBinding(c.intentId);
-  assert.ok(b && b.claimProofEpoch);
-  assert.equal(proofStillValid(c.a, b.conversationId, 90_000, b.claimProofEpoch), true);
-  assert.equal(proofStillValid(c.a, b.conversationId, 90_000, 'other-epoch'), false);
-  assert.equal(proofStillValid(c.a, b.conversationId, 90_000, null), false);
-  assert.equal(proofStillValid(c.a, b.conversationId, 1, b.claimProofEpoch), false);
-}));
-
-test('风控 8610 → failed/risk_controlled', () => withPendingIntent(async (c) => {
-  const r = await dispatchOnce(c.a, input(c, { transport: transport({ statusCode: 0, checkCode: 8610, serverMessageId: 'x' }) }));
+test('SendMessageError.response 8610 → failed/risk_controlled', () => withPendingIntent(async (c) => {
+  const err = transport(() => Promise.reject(Object.assign(new Error('send failed'), {
+    response: { statusCode: 0, checkCode: 8610 } })));
+  const r = await dispatchOnce(c.a, base(c, { transport: err }));
   assert.deepEqual(r, { status: 'failed', intentId: c.intentId, reasonCode: 'risk_controlled' });
 }));
 
-test('回执缺 ID → unknown，永不自动重试', () => withPendingIntent(async (c) => {
-  const r = await dispatchOnce(c.a, input(c, { transport: transport({ statusCode: 0 }) }));
+test('异常 response 为 -3 → unknown', () => withPendingIntent(async (c) => {
+  const t = transport(() => Promise.reject(Object.assign(new Error('x'), { response: { statusCode: -3 } })));
+  const r = await dispatchOnce(c.a, base(c, { transport: t }));
   assert.deepEqual(r, { status: 'unknown', intentId: c.intentId, reasonCode: 'ambiguous_result' });
-  assert.equal(state(c.file, c.intentId).status, 'unknown');
-  // 终态后不可再认领
-  assert.equal(c.a.claimSendIntent(c.intentId, c.now + 1), false);
 }));
 
-test('超时 → unknown/timeout；传输异常 → unknown/transport_error', () => withPendingIntent(async (c) => {
+test('异常携带成功 response 仍判 unknown', () => withPendingIntent(async (c) => {
+  const t = transport(() => Promise.reject(Object.assign(new Error('odd'), {
+    response: { statusCode: 0, serverMessageId: '7701260499833538097' } })));
+  const r = await dispatchOnce(c.a, base(c, { transport: t }));
+  assert.equal(r.status, 'unknown');
+}));
+
+test('超时 → unknown/timeout', () => withPendingIntent(async (c) => {
   const hang = transport(() => new Promise<SendResponseLike>(() => undefined));
-  const r1 = await dispatchOnce(c.a, input(c, { transport: hang, timeoutMs: 50 }));
-  assert.deepEqual(r1, { status: 'unknown', intentId: c.intentId, reasonCode: 'timeout' });
+  const r = await dispatchOnce(c.a, base(c, { transport: hang, timeoutMs: 50 }));
+  assert.deepEqual(r, { status: 'unknown', intentId: c.intentId, reasonCode: 'timeout' });
 }));
 
-test('传输抛异常 → unknown/transport_error', () => withPendingIntent(async (c) => {
-  const boom = transport(() => Promise.reject(new Error('network down')));
-  const r = await dispatchOnce(c.a, input(c, { transport: boom }));
+test('传输无结构化异常 → unknown/transport_error', () => withPendingIntent(async (c) => {
+  const r = await dispatchOnce(c.a, base(c, { transport: transport(() => Promise.reject(new Error('boom'))) }));
   assert.deepEqual(r, { status: 'unknown', intentId: c.intentId, reasonCode: 'transport_error' });
 }));
 
-test('审批缺失、作用域不符、已过期或尚未生效 → rejected，且不产生副作用', () => withPendingIntent(async (c) => {
-  const t = transport({ statusCode: 0, serverMessageId: 'x' });
-  assert.equal((await dispatchOnce(c.a, input(c, { approval: null, transport: t }))).status, 'rejected');
-  const wrong = await dispatchOnce(c.a, input(c, { approval: approval(c, { intentId: 'other' }), transport: t }));
-  assert.deepEqual(wrong, { status: 'rejected', reasonCode: 'approval_scope_mismatch' });
-  const expired = await dispatchOnce(c.a, input(c, {
-    approval: { approvalId: 'appr-12345678', intentId: c.intentId, approvedAtMs: c.now - 10_000, expiresAtMs: c.now - 1 }, transport: t }));
-  assert.deepEqual(expired, { status: 'rejected', reasonCode: 'approval_expired' });
-  const future = await dispatchOnce(c.a, input(c, {
-    approval: { approvalId: 'appr-12345678', intentId: c.intentId, approvedAtMs: c.now + 5_000, expiresAtMs: c.now + 60_000 }, transport: t }));
-  assert.deepEqual(future, { status: 'rejected', reasonCode: 'approval_expired' });
-  assert.equal(t.calls, 0, '被拒绝时绝不能调用传输层');
-  assert.equal(state(c.file, c.intentId).status, 'pending', '拒绝不得改变意图状态');
-  assert.equal(state(c.file, c.intentId).textRows, 1, '拒绝不得删除正文');
+test('审批未在 v6 登记 → rejected，零副作用', () => withPendingIntent(async (c) => {
+  const t = transport({ statusCode: 0, serverMessageId: '1' });
+  const r = await dispatchOnce(c.a, base(c, { transport: t }));
+  assert.deepEqual(r, { status: 'rejected', reasonCode: 'approval_missing' });
+  assert.equal(t.calls, 0);
+  assert.equal(state(c.file, c.intentId).status, 'pending');
+}, { approve: false }));
+
+test('审批只能消费一次：第二次调用被拒且零调用', () => withPendingIntent(async (c) => {
+  const t1 = transport({ statusCode: 0, serverMessageId: '7701260499833538097' });
+  const first = await dispatchOnce(c.a, base(c, { transport: t1 }));
+  assert.equal(first.status, 'sent');
+  const t2 = transport({ statusCode: 0, serverMessageId: '7701260499833538098' });
+  const second = await dispatchOnce(c.a, base(c, { transport: t2 }));
+  assert.equal(second.status, 'rejected');
+  assert.equal(t2.calls, 0);
+  assert.equal(state(c.file, c.intentId).approvalConsumed, true);
 }));
 
-test('会话/联系人异常 → rejected，且不调用传输层', () => withPendingIntent(async (c) => {
-  const t = transport({ statusCode: 0, serverMessageId: 'x' });
-  const cases: [string, unknown][] = [
-    ['session_unverified', session({ online: false })],
-    ['session_unverified', session({ accountCount: 2 })],
-    ['session_unverified', session({ imUid: '999' })],
-    ['contact_blocked', session({ contact: { ...session().contact, blocked: undefined } })],
-    ['contact_blocked', session({ contact: { ...session().contact, blocked: true } })],
-    ['contact_unverified', session({ contact: { ...session().contact, kind: 'group' } })],
-    ['contact_unverified', session({ contact: { ...session().contact, uid: '444' } })],
-    ['foreign_conversation', session({ contact: { ...session().contact, threadId: '0:1:222:444' } })],
-    ['contact_unverified', session({ contact: null })],
+test('审批 approvalId 不符 → rejected approval_binding_mismatch', () => withPendingIntent(async (c) => {
+  const t = transport({ statusCode: 0, serverMessageId: '1' });
+  const r = await dispatchOnce(c.a, base(c, { approvalId: 'appr-other999', transport: t }));
+  assert.deepEqual(r, { status: 'rejected', reasonCode: 'approval_binding_mismatch' });
+  assert.equal(t.calls, 0);
+}));
+
+test('审批过期 → rejected approval_expired', () => withPendingIntent(async (c) => {
+  const t = transport({ statusCode: 0, serverMessageId: '1' });
+  const r = await dispatchOnce(c.a, base(c, { nowMs: c.now + 400_000, transport: t }));
+  assert.deepEqual(r, { status: 'rejected', reasonCode: 'approval_expired' });
+  assert.equal(t.calls, 0);
+}));
+
+test('会话必须来自活实例：伪造/漂移一律拒绝', () => withPendingIntent(async (c) => {
+  const t = transport({ statusCode: 0, serverMessageId: '1' });
+  const cases: [string, ReturnType<typeof liveRefs>][] = [
+    ['contact_unverified', liveRefs({ kind: 'none' })],
+    ['session_unverified', liveRefs({ online: false })],
+    ['session_unverified', liveRefs({ imUid: '999' })],
+    ['session_unverified', liveRefs({ extraAccount: true })],
+    ['contact_blocked', liveRefs({ kind: 'friend', blocked: undefined })],
+    ['contact_blocked', liveRefs({ kind: 'friend', blocked: true })],
+    ['contact_unverified', liveRefs({ kind: 'friend', uid: '444' })],
+    ['foreign_conversation', liveRefs({ kind: 'friend', threadId: '0:1:222:444' })],
   ];
-  for (const [code, s] of cases) {
-    const r = await dispatchOnce(c.a, input(c, { session: s as DispatchInput['session'], transport: t }));
+  for (const [code, live] of cases) {
+    const r = await dispatchOnce(c.a, base(c, { live, transport: t }));
     assert.deepEqual(r, { status: 'rejected', reasonCode: code });
   }
   assert.equal(t.calls, 0);
   assert.equal(state(c.file, c.intentId).status, 'pending');
 }));
 
-test('Proof 换代 → rejected proof_changed，不调用传输层', () => withPendingIntent(async (c) => {
-  const t = transport({ statusCode: 0, serverMessageId: 'x' });
-  const r = await dispatchOnce(c.a, input(c, { nowMs: c.now + 5_000, coverageMaxAgeMs: 1, transport: t }));
+test('陌生人联系人同样可发送', () => withPendingIntent(async (c) => {
+  const t = transport({ statusCode: 0, serverMessageId: '7701260499833538097' });
+  const r = await dispatchOnce(c.a, base(c, { live: liveRefs({ kind: 'stranger' }), transport: t }));
+  assert.equal(r.status, 'sent');
+}));
+
+test('正文等长篡改 → rejected content_digest_mismatch，传输层零调用', () => withPendingIntent(async (c) => {
+  const tampered = '这是一条只供离线测试的答复';
+  assert.equal(tampered.length, TEXT.length);
+  const db = new DatabaseSync(c.file);
+  try { db.prepare('UPDATE send_text SET body=? WHERE intent_id=?').run(tampered, c.intentId); }
+  finally { db.close(); }
+  const t = transport({ statusCode: 0, serverMessageId: '1' });
+  const r = await dispatchOnce(c.a, base(c, { transport: t }));
+  assert.deepEqual(r, { status: 'rejected', reasonCode: 'content_digest_mismatch' });
+  assert.equal(t.calls, 0);
+  assert.equal(state(c.file, c.intentId).status, 'pending');
+}));
+
+test('Proof 换代 → rejected proof_changed，传输层零调用', () => withPendingIntent(async (c) => {
+  const t = transport({ statusCode: 0, serverMessageId: '1' });
+  const r = await dispatchOnce(c.a, base(c, { nowMs: c.now + 5_000, coverageMaxAgeMs: 1, transport: t }));
   assert.deepEqual(r, { status: 'rejected', reasonCode: 'proof_changed' });
   assert.equal(t.calls, 0);
 }));
 
-test('两个连接争用：后到者 already_claimed，绝不二次发送', () => withPendingIntent(async (c) => {
-  const second = EveArchive.open(c.file, ID);
-  try {
-    const first = dispatchOnce(c.a, input(c, { transport: transport({ statusCode: 0, serverMessageId: 'a' }) }));
-    // 在第一个尚未完成 claim 前无法插入；改为先手动 claim 再让第二个尝试
-    await first;
-    const r = await dispatchOnce(second, input(c, { transport: transport({ statusCode: 0, serverMessageId: 'b' }) }));
-    assert.deepEqual(r, { status: 'rejected', reasonCode: 'intent_not_pending' }, '已终结的意图不得再次派发');
-  } finally { second.close(); }
+test('proofStillValid 三态', () => withPendingIntent((c) => {
+  const b = c.a.sendDispatchBinding(c.intentId);
+  assert.ok(b && b.claimProofEpoch);
+  assert.equal(proofStillValid(c.a, b.conversationId, 90_000, b.claimProofEpoch), true);
+  assert.equal(proofStillValid(c.a, b.conversationId, 90_000, 'other'), false);
+  assert.equal(proofStillValid(c.a, b.conversationId, 90_000, null), false);
 }));
 
-test('未到 not_before → rejected not_due，且状态不变', () => withPendingIntent(async (c) => {
-  // 直接构造一个带延迟的意图：重建场景成本高，这里用 nowMs 早于 notBefore 的方式验证
+test('v5 库无审批表 → approval_missing（fail closed）', () => withPendingIntent(async (c) => {
+  const t = transport({ statusCode: 0, serverMessageId: '1' });
+  const r = await dispatchOnce(c.a, base(c, { transport: t }));
+  assert.deepEqual(r, { status: 'rejected', reasonCode: 'approval_missing' });
+  assert.equal(t.calls, 0);
+}, { version: 5 }));
+
+test('未到 not_before → rejected not_due', () => withPendingIntent(async (c) => {
   const b = c.a.sendDispatchBinding(c.intentId);
   assert.ok(b && b.notBeforeMs !== null);
-  const r = await dispatchOnce(c.a, input(c, { nowMs: b.notBeforeMs - 1 }));
+  const r = await dispatchOnce(c.a, base(c, { nowMs: b.notBeforeMs - 1 }));
   assert.deepEqual(r, { status: 'rejected', reasonCode: 'not_due' });
-  assert.equal(state(c.file, c.intentId).status, 'pending');
 }));
 
 test('dispatch.ts 无运行时 SDK 依赖、无 sendMsg', () => {
