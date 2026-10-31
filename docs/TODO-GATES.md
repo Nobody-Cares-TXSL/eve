@@ -1106,3 +1106,19 @@ SDK `-3` → unknown 且不可再认领；未确认非零码 → unknown；`Send
 **仍未完成**：真实终端中由人手动输入 `CONFIRM` 的端到端交互。Claude 无法伪造 TTY，必须由操作者在自己的终端里执行一次 `pnpm t6:approval-tty`。self-test 只证明判定链正确，不证明「人看到的界面」符合预期。
 
 **判定：AC-realB0.7 部分通过（非 TTY 拒绝与判定链已实证；人工交互待操作者执行）。B1 仍未授权。**
+
+#### 3. TTY 验收脚本的交互缺陷（已修复）
+
+操作者首次执行 `pnpm t6:approval-tty` 时，输出停在 `ExperimentalWarning` 后无响应——脚本挂起。
+
+**根因（我的设计错误）**：原脚本在交互模式下调用 `promptOnTerminal('')`，传入**空字符串**。屏幕只显示一个 `> ` 光标，**接收方与正文完全没有展示**，人等于在盲输。审批的第一要义是「看到发什么、发给谁」，这个交互把最关键的信息藏起来了。
+
+**修复**：
+
+- 每轮交互先用 `formatApprovalPrompt()` 打印完整审批信息（接收方 UID、完整正文、时间窗），再读一行输入；
+- 第 1 轮故意接受任意输入以验证「非 CONFIRM → declined 且零记录」；第 2 轮再展示一次并确认；
+- 非 TTY 仍然直接拒绝，不进入交互。
+
+修复后 self-test 复跑：`declined` + 零记录 → `approved` → 重复批准 `unavailable`，总判定 pass；非 TTY 复跑仍为 `rejected_non_tty`。
+
+**仍需操作者执行**：在真实终端里跑一次 `pnpm t6:approval-tty`，确认屏幕上确实完整显示了接收方与正文，并按提示输入两次。self-test 证明判定链正确，但证明不了「人看到的界面」。
