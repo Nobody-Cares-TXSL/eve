@@ -230,11 +230,11 @@ T6-1b 底层直接 `saveSendIntent` 的旧离线测试仍可省略 `expectedProo
 ### 12.2 执行顺序（固定）
 
 1. 读取 v5 绑定：意图必须 `pending`、`attempt===0`、`ai_claim_id` 与 `not_before_ms` 同时存在。
-2. 校验 T5 claim：`state='recorded'`、`action='reply'`、`decision_digest` 一致；Proof Epoch 仍是当前 `coverageEpoch`。
+2. 校验 T5 claim：`state='recorded'`、`action='reply'`、`decision_digest` 一致；**正文必须与账本保存的 `text_digest` 比对**（不得用当前正文重算摘要自证）；Proof Epoch 仍是当前 `coverageEpoch`。
 3. 校验 L1 审批：`approvalId` 格式、`intentId` 必须精确匹配、`approvedAtMs <= now < expiresAtMs`。
 4. 用 T6-3b 的 `prepareSdkTextDraft` 复核会话/联系人/内容/时间。
 5. `claimSendIntent` 条件更新（`pending → dispatching`）。
-6. **claim 之后重新读取绑定并复核**（堵住 await 窗口），任一不符立即结算 `failed`。
+6. **claim 之后重新读取绑定并复核**（正文、`text_digest`、决策摘要、事件组**以及 Proof Epoch**），任一不符立即结算 `failed`。
 7. 调用 `transport.sendText(draft.message)`，带超时。
 8. 按 §12.3 分类并结算。
 
@@ -244,12 +244,18 @@ T6-1b 底层直接 `saveSendIntent` 的旧离线测试仍可省略 `expectedProo
 
 | 条件 | 结果 | 原因码 |
 |---|---|---|
-| `statusCode !== 0` | `failed` | `platform_rejected` |
-| `statusCode === 0` 且 `checkCode === 8610` | `failed` | `risk_controlled` |
+| `checkCode === 8610`（SDK 明确「内容安全检查未通过，消息未投递」） | `failed` | `risk_controlled` |
+| `checkCode === 10502`（已提交但可能审核中） | `unknown` | `ambiguous_result` |
+| `statusCode === -3`（SDK 源码 `content.js:326`：缺 `serverMessageId`，**结果无法确认**） | `unknown` | `ambiguous_result` |
 | `statusCode === 0` 且 `serverMessageId` 为非空、非 `'0'` 字符串 | `sent` | 证据 = `serverMessageId` |
+| `statusCode` 为其他非零值 | `unknown` | `ambiguous_result` |
 | 其余（缺 ID、ID 为 `'0'`、字段类型异常） | `unknown` | `ambiguous_result` |
 | 超时 | `unknown` | `timeout` |
-| 传输层抛异常 | `unknown` | `transport_error` |
+| 传输层抛异常且无可分类响应 | `unknown` | `transport_error` |
+
+**`failed` 必须是「确定未发送」**。SDK 的非零状态码语义没有实测证据时一律按 `unknown` 处理；`CONFIRMED_REJECTION_CODES` 白名单为空，新增码必须附实测证据并同步本契约。
+
+SDK 会抛 `SendMessageError`，其 `.response` 携带真实 `SendMessageResponse`。分类器**必须优先结构化解析该响应**（`responseFromError`），只有拿不到结构化响应时才退化为 `transport_error`。异常路径即使 response 看起来像成功也**绝不判 `sent`**。
 
 `sent` 只表示**服务端回执**，不表示对方已显示或已读。`unknown` 永不自动重试。
 

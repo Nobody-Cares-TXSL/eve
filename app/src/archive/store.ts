@@ -511,16 +511,18 @@ export class EveArchive {
  sendDispatchBinding(intentId:string):{
   conversationId:string;sourceEventId:string;status:string;attempt:number;
   aiClaimId:string|null;notBeforeMs:number|null;decisionDigest:string;
+  /** 账本保存的原始正文摘要：调用方必须用它校验正文，不得自行重算后自证。 */
+  textDigest:string;
   expiresAtMs:number|null;text:string|null;eventIds:readonly string[];
   claimState:string|null;claimProofEpoch:string|null;claimDecisionDigest:string|null;claimReplyLength:number|null;
  }|null{
   this.requireV5();
   const row=this.db.prepare(
    'SELECT i.conversation_id,i.source_event_id,i.status,i.attempt,i.ai_claim_id,i.not_before_ms,'+
-   'i.decision_digest,t.body,t.expires_at_ms FROM send_intents i '+
+   'i.decision_digest,i.text_digest,t.body,t.expires_at_ms FROM send_intents i '+
    'LEFT JOIN send_text t ON t.intent_id=i.intent_id WHERE i.intent_id=?'
   ).get(intentId) as {conversation_id:string;source_event_id:string;status:string;attempt:number;
-   ai_claim_id:string|null;not_before_ms:number|null;decision_digest:string;
+   ai_claim_id:string|null;not_before_ms:number|null;decision_digest:string;text_digest:string;
    body:string|null;expires_at_ms:number|null}|undefined;
   if(!row)return null;
   const claim=row.ai_claim_id===null?undefined:this.db.prepare(
@@ -530,6 +532,7 @@ export class EveArchive {
    conversationId:row.conversation_id,sourceEventId:row.source_event_id,
    status:row.status,attempt:row.attempt,aiClaimId:row.ai_claim_id,
    notBeforeMs:row.not_before_ms,decisionDigest:row.decision_digest,
+   textDigest:row.text_digest,
    expiresAtMs:row.expires_at_ms,text:row.body,
    eventIds:this.sendIntentEvents(intentId),
    claimState:claim?.state??null,claimProofEpoch:claim?.proof_epoch_id??null,

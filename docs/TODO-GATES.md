@@ -969,3 +969,43 @@ T5 的 AI 决策模块进入**功能冻结**：接口不再随意改动（清单
 - 平台字数口径、限流退避、长时间运行稳定性未验证。
 
 **判定：T6-3c 离线执行与回执分类 Gate 通过；真实发送 Gate 未开始。**
+
+### T6-3c 审查修正：两个 P0 fail-closed 缺陷（2026-10-31）
+
+操作者审查发现两处在 T6-3c 合并前必须修的问题，均已修复并补回归测试。
+
+#### P0-1 不确定的发送结果被误判为 failed
+
+`classifySendResponse` 原为 `statusCode !== 0 → failed/platform_rejected`。核对已安装 `douyin-im@1.1.0` 源码 `services/im/content.js:326`：
+
+```js
+statusCode: statusCode !== 0 ? statusCode : sendStatus !== 0 ? sendStatus : envelopeOk ? 0 : -3
+```
+
+`-3` 表示「envelope 与 sendStatus 都为 0，但拿不到有效 `serverMessageId`」，即**结果无法确认**，不是确定未发送。原逻辑会把它归入 `failed`，破坏「`unknown` 不自动重试、`failed` 必须有确定未发送证据」的不变量。
+
+修正：
+
+- `checkCode === 8610` → `failed/risk_controlled`（SDK 明确「内容安全检查未通过，消息未投递」）
+- `checkCode === 10502`（已提交但可能审核中）→ `unknown/ambiguous_result`
+- `statusCode === -3` → `unknown/ambiguous_result`
+- 其他非零码 → `unknown/ambiguous_result`，除非命中 `CONFIRMED_REJECTION_CODES` 白名单（**当前为空**，新增码必须附实测证据）
+- 新增：对 SDK 抛出的 `SendMessageError.response` 做结构化分类（`responseFromError`），不再一律退化为 `transport_error`；异常携带看似成功的 response 也绝不判 `sent`
+
+#### P0-2 正文完整性校验被绕过
+
+`sendDispatchBinding()` 取出了 `send_text.body` 却没返回账本保存的 `send_intents.text_digest`；`dispatchOnce` 又用 `sha256(b.text)` 现算摘要喂给 T6-3b 构造器——**数据库正文被篡改时校验必然通过**，属于自证正确。
+
+修正：绑定返回值增加 `textDigest`（取自 `send_intents.text_digest`），派发前先比对 `sha256(body) !== textDigest → content_digest_mismatch`，并把账本原始摘要传给构造器。
+
+另外补上 claim 之后复核里缺失的 **Proof Epoch 检查**（连同 `text_digest` 一起）。
+
+#### 新增回归测试（7 条，dispatch 共 20 条）
+
+SDK `-3` → unknown 且不可再认领；未确认非零码 → unknown；`SendMessageError.response` 8610 → failed、`-3` → unknown、「看似成功」的异常 response 不判 sent；等长篡改正文 → `content_digest_mismatch` 且传输层零调用；不等长篡改同样被拒；`proofStillValid` 单元三态。
+
+#### 验证
+
+`pnpm typecheck` 0 错；`pnpm test` **301/301**（294 + 7）。正式库仍 v2；`src` 无真实 `sendMsg`；本轮真实模型与私信发送均为 0。
+
+**说明**：因尚未真实发送，这两个缺陷未造成实际错误投递；但若带入 T6-3c-real 会使 UNKNOWN 安全原则失效，故在合并前修复。真实发送仍未授权。

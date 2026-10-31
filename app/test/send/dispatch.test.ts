@@ -13,7 +13,7 @@ import { MockPlatformPort } from '../../src/platform/mock.ts';
 import { reconcileOnce } from '../../src/runtime/reconcile.ts';
 import type { InboundMessage } from '../../src/platform/types.ts';
 import {
-  classifySendResponse, dispatchOnce,
+  classifySendResponse, dispatchOnce, proofStillValid,
   type ApprovalRecord, type DispatchInput, type SendResponseLike, type SendTransport,
 } from '../../src/send/dispatch.ts';
 
@@ -104,8 +104,15 @@ const state = (file: string, intentId: string) => {
 test('回执分类：只有 statusCode=0 且有效 serverMessageId 才算 sent', () => {
   assert.deepEqual(classifySendResponse({ statusCode: 0, serverMessageId: '7701260499833538097' }),
     { status: 'sent', evidence: '7701260499833538097' });
-  assert.deepEqual(classifySendResponse({ statusCode: 1, serverMessageId: 'x' }),
-    { status: 'failed', reasonCode: 'platform_rejected' });
+  // SDK 用 -3 表示「缺 serverMessageId、无法确认」，绝不能判为确定未发送
+  assert.deepEqual(classifySendResponse({ statusCode: -3 }),
+    { status: 'unknown', reasonCode: 'ambiguous_result' });
+  // 10502：已提交但可能审核中
+  assert.deepEqual(classifySendResponse({ statusCode: 0, checkCode: 10502, serverMessageId: 'x' }),
+    { status: 'unknown', reasonCode: 'ambiguous_result' });
+  // 未经实测确认的非零码一律 unknown，不得冒充 platform_rejected
+  assert.deepEqual(classifySendResponse({ statusCode: 400, serverMessageId: 'x' }),
+    { status: 'unknown', reasonCode: 'ambiguous_result' });
   assert.deepEqual(classifySendResponse({ statusCode: 0, checkCode: 8610, serverMessageId: 'x' }),
     { status: 'failed', reasonCode: 'risk_controlled' });
   assert.deepEqual(classifySendResponse({ statusCode: 0 }), { status: 'unknown', reasonCode: 'ambiguous_result' });
@@ -125,10 +132,72 @@ test('正常回执 → sent，账本留证据、正文被删除', () => withPend
   assert.equal(s.textRows, 0, '终态必须删除正文');
 }));
 
-test('平台拒绝与风控拦截 → failed，不重试', () => withPendingIntent(async (c) => {
-  const rejectedRun = await dispatchOnce(c.a, input(c, { transport: transport({ statusCode: 400, statusMsg: 'x' }) }));
-  assert.deepEqual(rejectedRun, { status: 'failed', intentId: c.intentId, reasonCode: 'platform_rejected' });
-  assert.equal(state(c.file, c.intentId).status, 'failed');
+test('SDK -3（缺 ID 无法确认）→ unknown，绝不判 failed', () => withPendingIntent(async (c) => {
+  const r = await dispatchOnce(c.a, input(c, { transport: transport({ statusCode: -3 }) }));
+  assert.deepEqual(r, { status: 'unknown', intentId: c.intentId, reasonCode: 'ambiguous_result' });
+  assert.equal(state(c.file, c.intentId).status, 'unknown');
+  assert.equal(c.a.claimSendIntent(c.intentId, c.now + 1), false, 'unknown 永不自动重试');
+}));
+
+test('未经确认的非零状态码 → unknown，不冒充确定拒绝', () => withPendingIntent(async (c) => {
+  const r = await dispatchOnce(c.a, input(c, { transport: transport({ statusCode: 400, statusMsg: 'x' }) }));
+  assert.deepEqual(r, { status: 'unknown', intentId: c.intentId, reasonCode: 'ambiguous_result' });
+}));
+
+test('SendMessageError.response 受控分类：8610 → failed', () => withPendingIntent(async (c) => {
+  const riskErr = transport(() => Promise.reject(Object.assign(new Error('send failed'), {
+    response: { statusCode: 0, checkCode: 8610, statusMsg: 'content audit' },
+  })));
+  const r1 = await dispatchOnce(c.a, input(c, { transport: riskErr }));
+  assert.deepEqual(r1, { status: 'failed', intentId: c.intentId, reasonCode: 'risk_controlled' });
+}));
+
+test('SendMessageError.response 为 -3 → unknown/ambiguous_result', () => withPendingIntent(async (c) => {
+  const ambiguous = transport(() => Promise.reject(Object.assign(new Error('send failed'), {
+    response: { statusCode: -3, statusMsg: 'missing serverMessageId' },
+  })));
+  const r = await dispatchOnce(c.a, input(c, { transport: ambiguous }));
+  assert.deepEqual(r, { status: 'unknown', intentId: c.intentId, reasonCode: 'ambiguous_result' });
+}));
+
+test('异常携带「看似成功」的 response 也不得判 sent', () => withPendingIntent(async (c) => {
+  const weird = transport(() => Promise.reject(Object.assign(new Error('odd'), {
+    response: { statusCode: 0, serverMessageId: '7701260499833538097' },
+  })));
+  const r = await dispatchOnce(c.a, input(c, { transport: weird }));
+  assert.equal(r.status, 'unknown');
+}));
+
+test('数据库正文被篡改 → rejected content_digest_mismatch，且不调用传输层', () => withPendingIntent(async (c) => {
+  // 等长篡改：绕过 reply_length 启发式，必须由账本摘要抓到
+  assert.equal('这是一条只供离线测试的答复'.length, TEXT.length);
+  const db = new DatabaseSync(c.file);
+  try { db.prepare('UPDATE send_text SET body=? WHERE intent_id=?').run('这是一条只供离线测试的答复', c.intentId); }
+  finally { db.close(); }
+  const t = transport({ statusCode: 0, serverMessageId: 'x' });
+  const r = await dispatchOnce(c.a, input(c, { transport: t }));
+  assert.deepEqual(r, { status: 'rejected', reasonCode: 'content_digest_mismatch' });
+  assert.equal(t.calls, 0, '篡改后绝不能发送');
+  assert.equal(state(c.file, c.intentId).status, 'pending');
+}));
+
+test('不等长篡改同样被拒（reply_length 启发式兜底）', () => withPendingIntent(async (c) => {
+  const db = new DatabaseSync(c.file);
+  try { db.prepare('UPDATE send_text SET body=? WHERE intent_id=?').run('短', c.intentId); }
+  finally { db.close(); }
+  const t = transport({ statusCode: 0, serverMessageId: 'x' });
+  const r = await dispatchOnce(c.a, input(c, { transport: t }));
+  assert.equal(r.status, 'rejected');
+  assert.equal(t.calls, 0);
+}));
+
+test('proofStillValid：epoch 不符或缺失即 false', () => withPendingIntent((c) => {
+  const b = c.a.sendDispatchBinding(c.intentId);
+  assert.ok(b && b.claimProofEpoch);
+  assert.equal(proofStillValid(c.a, b.conversationId, 90_000, b.claimProofEpoch), true);
+  assert.equal(proofStillValid(c.a, b.conversationId, 90_000, 'other-epoch'), false);
+  assert.equal(proofStillValid(c.a, b.conversationId, 90_000, null), false);
+  assert.equal(proofStillValid(c.a, b.conversationId, 1, b.claimProofEpoch), false);
 }));
 
 test('风控 8610 → failed/risk_controlled', () => withPendingIntent(async (c) => {

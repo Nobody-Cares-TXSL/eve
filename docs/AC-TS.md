@@ -244,9 +244,11 @@
 - [x] AC-T6.3c.1 意图、事件组、`ai_claim_id`、`not_before_ms`、`decision_digest`、正文全部从 SQLite 读取，不接受调用方提供；`sendDispatchBinding` 为唯一读取入口。
 - [x] AC-T6.3c.2 T5 claim 必须 `state='recorded'`、`decision_digest` 一致、`reply_length` 与正文长度一致；Proof Epoch 必须仍是当前 `coverageEpoch`，否则 `proof_changed`。
 - [x] AC-T6.3c.3 L1 审批必须存在、`intentId` 精确匹配、`approvedAtMs <= now < expiresAtMs`；缺失/错配/过期均 `rejected` 且不调用传输层、不改变意图状态。
-- [x] AC-T6.3c.4 回执分类封闭：`statusCode!==0`→`failed/platform_rejected`；`checkCode===8610`→`failed/risk_controlled`；有效 `serverMessageId`→`sent`（证据即该 ID）；其余→`unknown/ambiguous_result`；超时→`unknown/timeout`；异常→`unknown/transport_error`。
+- [x] AC-T6.3c.4 回执分类封闭（修正版）：`checkCode===8610`→`failed/risk_controlled`；`checkCode===10502`、`statusCode===-3`、以及**任何未经实测确认的非零码**→`unknown/ambiguous_result`；仅 `statusCode===0` 且 `serverMessageId` 非空非 `'0'` → `sent`；超时→`timeout`；无结构化响应的异常→`transport_error`。`platform_rejected` 仅在 `CONFIRMED_REJECTION_CODES` 白名单命中时产生（当前为空，新增码须附实测证据）。
 - [x] AC-T6.3c.5 `sent` 只表示服务端回执，不表示对方已显示或已读；`unknown` 永不自动重试；终态删除正文。
-- [x] AC-T6.3c.6 claim 之后重新读取绑定并复核，任一变即结算 `failed`；已终结意图再次派发被拒。
+- [x] AC-T6.3c.6 claim 之后重新读取绑定并复核**正文、`text_digest`、决策摘要、事件组与 Proof Epoch**，任一变即结算 `failed`；已终结意图再次派发被拒。
+- [x] AC-T6.3c.10 正文完整性使用账本保存的 `send_intents.text_digest` 与当前正文重算值比对；等长篡改必须被拒且传输层零调用。禁止用当前正文生成的摘要反喂校验器（自证正确）。
+- [x] AC-T6.3c.11 SDK `SendMessageError.response` 必须被结构化分类；异常携带「看似成功」的 response 也不得判 `sent`。
 - [x] AC-T6.3c.7 `dispatch.ts` 无 `douyin-im` 运行时依赖、无 `sendMsg`，测试以源码扫描固定该约束。
 - [ ] AC-T6.3c.8 **首次真实发送**：真实 SDK 实例绑定、真实 `sendMsg`、服务端回执实测——需单独授权，本阶段未做。
 - [ ] AC-T6.3c.9 L1 审批的持久化存储、签名与人工界面未实现；本阶段审批以注入对象传入，只证明「有审批才能发」的判定成立。
