@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
+import {MockSendPort,dispatchMockOnce} from '../../src/send/mock-dispatcher.ts';
 import {test} from 'node:test';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
@@ -17,7 +19,7 @@ const eventId='9000000000000000001';
 const message=(id:string):InboundMessage=>({
  conversationId:THREAD,serverMessageId:id,clientMessageId:null,senderUid:'333',
  fromSelf:false,text:'今晚聊聊？',kind:'text',messageType:7,
- createTime:String(Date.now()-2000),indexInConversation:'1',
+ createTime:String(Date.now()-2000+Number(BigInt(id)%10n)),indexInConversation:String(BigInt(id)%10n),
 });
 
 async function withV4(fn:(a:EveArchive,p:MockPlatformPort,input:PrepareSendInput,file:string)=>Promise<void>,version=4){
@@ -32,7 +34,7 @@ async function withV4(fn:(a:EveArchive,p:MockPlatformPort,input:PrepareSendInput
    port:p,archive:a,conversationId:THREAD,imUid:'222',instanceId:'baseline',
    isSafe:()=>true,
   })).state,'verified');
-  p.delivered.push(message(eventId));
+  p.delivered.push(...[1,2,3,4].map(i=>message('900000000000000000'+i)));
   assert.equal((await reconcileOnce({
    port:p,archive:a,conversationId:THREAD,imUid:'222',instanceId:'new',
    isSafe:()=>true,
@@ -209,4 +211,151 @@ test('T6-2a: definitively failed sends release conservative reservation',()=>wit
   policy:{...input.policy,maxPerDay:1},
  });
  assert.equal(next.status,'created');
+}));
+
+test('T6-2b AC: unknown and baseline-only events are not eligible, cannot be written',()=>withV4(async(a,_,input,file)=>{
+ const unknown=prepareSendIntent(a,{...input,eventIds:[eventId,'9000000000000000099']});
+ assert.deepEqual(unknown,{status:'rejected',reasonCode:'invalid_event_group'});
+ const baseline=prepareSendIntent(a,{...input,eventIds:[eventId,'9000000000000000000']});
+ assert.deepEqual(baseline,{status:'rejected',reasonCode:'invalid_event_group'});
+ assert.equal(rows(file,'send_intents'),0);
+}));
+test('T6-2b AC: processed/claimed eligible events cannot be saved',()=>withV4(async(a,_,input,file)=>{
+ const db=new DatabaseSync(file);
+ try{
+  db.prepare("UPDATE eligible_events SET state='processed' WHERE conversation_id=? AND server_message_id=?")
+   .run(THREAD,'9000000000000000002');
+ }finally{db.close();}
+ assert.deepEqual(prepareSendIntent(a,{...input,eventIds:[eventId,'9000000000000000002']}),
+  {status:'rejected',reasonCode:'invalid_event_group'});
+ assert.equal(rows(file,'send_intents'),0);
+}));
+test('T6-2b AC: one T5-claimed batch cannot be partially sent or mixed',()=>withV4(async(a,_,input,file)=>{
+ const c=a.claimAiDryRun({conversationId:THREAD,maxAgeMs:input.coverageMaxAgeMs,
+  backendId:'claude_code',backendKind:'agent-runtime',maxBatchEvents:2});
+ assert.ok(c);
+ if(!c)return;
+ assert.equal(c.candidate.eventIds.length,2);
+ assert.deepEqual(prepareSendIntent(a,{...input,sourceEventId:c.candidate.eventId,
+  eventIds:[c.candidate.eventId]}),{status:'rejected',reasonCode:'invalid_event_group'});
+ assert.deepEqual(prepareSendIntent(a,{...input,sourceEventId:c.candidate.eventId,
+  eventIds:[...c.candidate.eventIds,'9000000000000000003']}),{
+  status:'rejected',reasonCode:'invalid_event_group'});
+ assert.equal(rows(file,'send_intents'),0);
+}));
+
+function recordedMockIntent(a:EveArchive,input:PrepareSendInput):string{
+ const claim=a.claimAiDryRun({
+  conversationId:THREAD,maxAgeMs:input.coverageMaxAgeMs,
+  backendId:'claude_code',backendKind:'agent-runtime',maxBatchEvents:1,
+ });
+ assert.ok(claim,'fixture must produce real T5 ledger reservation');
+ assert.equal(claim?.candidate.eventId,eventId);
+ const decision=input.decision;
+ assert.equal(decision.action,'reply');
+ if(decision.action!=='reply'||!claim)throw Error('invalid_mock_setup');
+ const digest=createHash('sha256').update(JSON.stringify(decision)).digest('hex');
+ assert.deepEqual(a.finishAiDryRun({
+  claimId:claim.claimId,maxAgeMs:input.coverageMaxAgeMs,
+  outcome:{status:'recorded',action:'reply',replyLength:decision.text.length,
+   decisionDigest:digest},
+ }),{status:'recorded',reasonCode:null});
+ const saved=prepareSendIntent(a,input);
+ assert.equal(saved.status,'created');
+ if(saved.status!=='created')throw Error('mock_intent_not_created');
+ return saved.intentId;
+}
+function mockOptions(input:PrepareSendInput,intentId:string){
+ return {
+  intentId,now:input.now,maxAgeMs:input.coverageMaxAgeMs,maxLength:500,
+  timeoutMs:50,identity:input.identity,runtime:input.runtime,
+  allowMockOnly:true as const,
+ };
+}
+
+test('T6-2b: unrecorded T5 output must never reach even a mock port',()=>withV4(async(a,_,input)=>{
+ const saved=prepareSendIntent(a,input);
+ assert.equal(saved.status,'created');
+ if(saved.status!=='created')return;
+ const port=new MockSendPort('confirmed');
+ assert.deepEqual(await dispatchMockOnce(a,port,mockOptions(input,saved.intentId)),
+  {status:'blocked',reason:'source_unverified'});
+ assert.equal(port.calls,0);
+ assert.equal(a.getSendIntent(saved.intentId)?.status,'pending');
+}));
+test('T6-2b: recorded T5 reply -> mock-confirmed only, no second claim or platform',()=>withV4(async(a,p,input)=>{
+ const id=recordedMockIntent(a,input),port=new MockSendPort('confirmed');
+ const result=await dispatchMockOnce(a,port,mockOptions(input,id));
+ assert.deepEqual(result,{status:'mock_sent',intentId:id});
+ assert.equal(a.getSendIntent(id)?.status,'sent');
+ assert.match(a.getSendIntent(id)?.evidence??'',/^mock:[0-9a-f]{64}$/);
+ assert.equal(a.getSendIntent(id)?.attempt,1);
+ assert.equal(port.calls,1);
+ assert.equal(JSON.stringify(result).includes('离线测试'),false);
+ assert.deepEqual(await dispatchMockOnce(a,port,mockOptions(input,id)),
+  {status:'blocked',reason:'source_unverified'});
+ assert.equal(port.calls,1);
+ assert.equal(p.startCount,0);
+}));
+test('T6-2b: confirmed not-sent mock rejection -> failed and terminal',()=>withV4(async(a,_,input)=>{
+ const id=recordedMockIntent(a,input),port=new MockSendPort('rejected_before_dispatch');
+ assert.deepEqual(await dispatchMockOnce(a,port,mockOptions(input,id)),{status:'failed',intentId:id});
+ assert.equal(a.getSendIntent(id)?.reasonCode,'rejected_before_dispatch');
+ assert.equal(a.claimSendIntent(id,input.now+5),false);
+}));
+test('T6-2b: ambiguous/transport/timeout are unknown, never auto retried',async()=>{
+ for(const [mode,reason] of [
+  ['ambiguous','ambiguous_result'],['throws','transport_error'],['hang','timeout']
+ ] as const){
+  await withV4(async(a,_,input)=>{
+   const id=recordedMockIntent(a,input),port=new MockSendPort(mode);
+   const result=await dispatchMockOnce(a,port,mockOptions(input,id));
+   assert.deepEqual(result,{status:'unknown',intentId:id,reason});
+   assert.equal(a.getSendIntent(id)?.status,'unknown');
+   assert.equal(a.getSendIntent(id)?.attempt,1);
+   assert.equal(a.claimSendIntent(id,input.now+100),false);
+   assert.equal(port.calls,1);
+  });
+ }
+});
+test('T6-2b: identity/runtime/proof/expired text failures stop before mock send',()=>withV4(async(a,_,input)=>{
+ const id=recordedMockIntent(a,input),port=new MockSendPort('confirmed');
+ assert.equal((await dispatchMockOnce(a,port,{...mockOptions(input,id),
+  identity:{...input.identity,targetUid:'999'}})).status,'blocked');
+ assert.equal((await dispatchMockOnce(a,port,{...mockOptions(input,id),
+  runtime:{phase:'paused_manual',paused:true}})).status,'blocked');
+ assert.equal((await dispatchMockOnce(a,port,{...mockOptions(input,id),
+  now:input.now+input.retentionMs+1})).status,'blocked');
+ a.invalidateCurrentCoverage();
+ assert.deepEqual(await dispatchMockOnce(a,port,mockOptions(input,id)),
+  {status:'blocked',reason:'source_unverified'});
+ assert.equal(port.calls,0);
+ assert.equal(a.getSendIntent(id)?.status,'pending');
+}));
+test('T6-2b: persisted decision digest mismatch rejects mock dispatch',()=>withV4(async(a,_,input,file)=>{
+ const id=recordedMockIntent(a,input),port=new MockSendPort('confirmed');
+ const db=new DatabaseSync(file);
+ try{db.prepare('UPDATE send_intents SET decision_digest=? WHERE intent_id=?')
+   .run('c'.repeat(64),id);}finally{db.close();}
+ assert.deepEqual(await dispatchMockOnce(a,port,mockOptions(input,id)),
+  {status:'blocked',reason:'source_unverified'});
+ assert.equal(port.calls,0);
+}));
+
+test('T6-2b AC: event valid in another authorized conversation is invalid in this one',()=>withV4(async(a,p,input,file)=>{
+ const other='0:1:111:333';
+ const copy=(id:string):InboundMessage=>({...message(id),conversationId:other});
+ p.delivered.push(copy('9000000000000000098'));
+ assert.equal((await reconcileOnce({
+  port:p,archive:a,conversationId:other,imUid:'111',instanceId:'other-baseline',
+  isSafe:()=>true,
+ })).state,'verified');
+ p.delivered.push(copy('9000000000000000099'));
+ assert.equal((await reconcileOnce({
+  port:p,archive:a,conversationId:other,imUid:'111',instanceId:'other-update',
+  isSafe:()=>true,
+ })).state,'verified');
+ const result=prepareSendIntent(a,{...input,eventIds:[eventId,'9000000000000000099']});
+ assert.deepEqual(result,{status:'rejected',reasonCode:'invalid_event_group'});
+ assert.equal(rows(file,'send_intents'),0);
 }));

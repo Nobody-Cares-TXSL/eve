@@ -86,6 +86,7 @@ export function prepareSendIntent(archive:EveArchive,input:PrepareSendInput):Pre
    if(e.code==='send_coverage_changed'||e.code==='coverage_unusable')
     return reject('coverage_unusable');
    if(e.code==='rejected')return reject('identity_invalid');
+   if(e.code==='invalid_event_group')return reject('invalid_event_group');
    if(e.code==='send_rate_limited')return reject('rate_limited');
    if(e.code==='send_min_interval')return reject('min_interval');
    if(e.code==='send_clock_rollback'||e.code==='invalid_send_rate_policy')

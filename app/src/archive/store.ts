@@ -226,6 +226,44 @@ export class EveArchive {
      .get(input.conversationId,id) as {intent_id:string}|undefined;
     if(taken){this.db.exec('COMMIT');return {created:false,intentId:taken.intent_id,conflict:'duplicate_event'};}
    }
+   // Only the trusted coordinator passes a proof epoch. Inside the same write
+   // transaction, demand actual eligible messages of this exact conversation.
+   // A caller-supplied numeric ID is NEVER proof of an eligible event.
+   if(input.expectedProofEpoch!==undefined){
+    const lookup=this.db.prepare(
+     'SELECT e.state,m.sender_uid,m.from_self,m.kind,m.text '+
+     'FROM eligible_events e JOIN messages m ON e.conversation_id=m.conversation_id '+
+     'AND e.server_message_id=m.server_message_id '+
+     'WHERE e.conversation_id=? AND e.server_message_id=?'
+    );
+    for(const id of input.eventIds){
+     const row=lookup.get(input.conversationId,id) as {
+      state:string;sender_uid:string;from_self:number;kind:string;text:string
+     }|undefined;
+     if(!row||row.state!=='pending'||row.sender_uid!==this.identity.targetUid||
+        row.from_self!==0||row.kind!=='text'||!row.text.trim())
+      throw new ArchiveError('invalid_event_group');
+    }
+    // Already AI-claimed groups may not be mixed, reshuffled, or split.
+    const claimed=this.db.prepare(
+     'SELECT claim_id,server_message_id FROM ai_batch_items '+
+     'WHERE conversation_id=? AND server_message_id=?'
+    );
+    const assignments=input.eventIds.map(id=>claimed.get(input.conversationId,id) as {
+     claim_id:string;server_message_id:string
+    }|undefined);
+    if(assignments.some(Boolean)){
+     const claim=assignments[0]?.claim_id;
+     if(!claim||assignments.some(x=>x?.claim_id!==claim))
+      throw new ArchiveError('invalid_event_group');
+     const entire=this.db.prepare(
+      'SELECT server_message_id FROM ai_batch_items WHERE claim_id=? ORDER BY ordinal'
+     ).all(claim) as {server_message_id:string}[];
+     if(entire.length!==input.eventIds.length||
+        entire.some((r,i)=>r.server_message_id!==input.eventIds[i]))
+      throw new ArchiveError('invalid_event_group');
+    }
+   }
    if(input.ratePolicy){
     const p=input.ratePolicy;
     if(!Number.isSafeInteger(p.minIntervalMs)||p.minIntervalMs<0||
@@ -329,6 +367,52 @@ export class EveArchive {
  }
 
  /** 只有未过期的正文可取用；过期即视为不可发送（保守）。 */
+ /** T6-2b MOCK ONLY: proven T5 decision + unchanged epoch + exact event group. */
+ mockDispatchCandidate(intentId:string,now:number,maxAgeMs:number):
+  {conversationId:string;text:string}|null{
+  this.requireV4();
+  if(!Number.isSafeInteger(now)||!Number.isSafeInteger(maxAgeMs)||maxAgeMs<1)return null;
+  const row=this.db.prepare(
+   'SELECT i.conversation_id,i.source_event_id,i.status,i.text_digest,i.decision_digest,'+
+   't.body,t.expires_at_ms FROM send_intents i LEFT JOIN send_text t ON t.intent_id=i.intent_id '+
+   'WHERE i.intent_id=?'
+  ).get(intentId) as {
+   conversation_id:string;source_event_id:string;status:string;text_digest:string;
+   decision_digest:string;body:string|null;expires_at_ms:number|null
+  }|undefined;
+  if(!row||(row.status!=='pending'&&row.status!=='dispatching')||!row.body||row.expires_at_ms===null||
+     now>=row.expires_at_ms||
+     createHash('sha256').update(row.body).digest('hex')!==row.text_digest)return null;
+  const claim=this.db.prepare(
+   "SELECT claim_id,proof_epoch_id,decision_digest,reply_length FROM ai_decision_attempts "+
+   "WHERE conversation_id=? AND server_message_id=? AND state='recorded' AND action='reply'"
+  ).get(row.conversation_id,row.source_event_id) as {
+   claim_id:string;proof_epoch_id:string;decision_digest:string;reply_length:number
+  }|undefined;
+  if(!claim||claim.decision_digest!==row.decision_digest||
+     claim.reply_length!==row.body.length||
+     this.coverageEpoch(row.conversation_id,maxAgeMs)!==claim.proof_epoch_id)return null;
+  const sendItems=this.sendIntentEvents(intentId);
+  const aiItems=this.db.prepare(
+   'SELECT server_message_id FROM ai_batch_items WHERE claim_id=? ORDER BY ordinal'
+  ).all(claim.claim_id) as {server_message_id:string}[];
+  if(sendItems.length!==aiItems.length||
+     sendItems.some((id,i)=>id!==aiItems[i]?.server_message_id))return null;
+  const eligible=this.db.prepare(
+   'SELECT e.state,m.sender_uid,m.from_self,m.kind FROM eligible_events e '+
+   'JOIN messages m ON e.conversation_id=m.conversation_id AND e.server_message_id=m.server_message_id '+
+   'WHERE e.conversation_id=? AND e.server_message_id=?'
+  );
+  for(const id of sendItems){
+   const x=eligible.get(row.conversation_id,id) as {
+    state:string;sender_uid:string;from_self:number;kind:string
+   }|undefined;
+   if(!x||x.state!=='pending'||x.sender_uid!==this.identity.targetUid||
+      x.from_self!==0||x.kind!=='text')return null;
+  }
+  return {conversationId:row.conversation_id,text:row.body};
+ }
+
  getSendText(intentId:string,now:number):string|null{
   this.requireV4();
   const row=this.db.prepare('SELECT body,expires_at_ms FROM send_text WHERE intent_id=?')
