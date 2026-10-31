@@ -1009,3 +1009,34 @@ SDK `-3` → unknown 且不可再认领；未确认非零码 → unknown；`Send
 `pnpm typecheck` 0 错；`pnpm test` **301/301**（294 + 7）。正式库仍 v2；`src` 无真实 `sendMsg`；本轮真实模型与私信发送均为 0。
 
 **说明**：因尚未真实发送，这两个缺陷未造成实际错误投递；但若带入 T6-3c-real 会使 UNKNOWN 安全原则失效，故在合并前修复。真实发送仍未授权。
+
+### T6-3c-real-A 真实实例绑定、审批持久化与证据收紧（2026-11-01）
+
+按操作者要求把 `T6-3c-real` 拆成 real-A（离线）/ real-B（真实单次，需单独授权）。本阶段完成 real-A。
+
+#### 三个关口的落地
+
+| 关口 | 实现 | 测试 |
+|---|---|---|
+| 真实 SDK 对象绑定 | `deriveSendSession()` 核验单账号、在线、`uid/imUid`、`contact.account === account`、联系人由 `pickFriend/pickStranger` 真实返回、`blocked` 直接读 | 9 条（含伪造替身、多账号、离线、`blocked: undefined`） |
+| L1 审批持久化 | `schema-v6.sql` 的 `send_approvals`；`createSendApproval` / `consumeSendApproval`（条件更新，只能成功一次） | 审批缺失、只能消费一次、`approvalId` 不符、过期 |
+| 服务端证据收紧 | `SERVER_ID = /^[1-9][0-9]{0,63}$/`；`'0'`/空串/前导零/非数字一律 `unknown` | 6 种非法 ID 逐项断言不得判 `sent` |
+
+#### 过程中发现并修复的实现缺陷
+
+`sessionStillLive()` 最初只逐字段比对。测试「联系人被替换成字段完全相同的新实例」时返回 `true`——**字段相同但对象不同，不是同一个会话**。修正为额外校验 `account`/`contact` 的对象引用；`dispatch.ts` 调用点同步传入 baseline。
+
+另修正两处测试夹具问题：`liveRefs` 用 `blocked ?? false` 会把 `undefined` 变成 `false`（掩盖了保守拒绝路径）；`ownImUid === ownerUid` 会先被 session 检查拦下而非 `identity_invalid`。
+
+#### 验证
+
+- `pnpm typecheck` 0 错；`pnpm test` **311/311**（302 + 9）。
+- 正式库仍 v2/`quick_check=ok`；`src` 无真实 `sendMsg`；本轮模型请求 0 次、私信发送 0 条。
+
+#### 仍未完成
+
+- **T6-3c-real-B**：真实 SDK 实例、真实 `sendMsg`、指定接收方与内容的单次验收——需操作者单独授权。
+- 审批的人工界面、签名与来源认证。
+- 平台字数口径、限流退避、正式库 v6 备份迁移。
+
+**判定：T6-3c-real-A 通过；real-B 未授权、未开始。**

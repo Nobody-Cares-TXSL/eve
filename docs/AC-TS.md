@@ -252,3 +252,17 @@
 - [x] AC-T6.3c.7 `dispatch.ts` 无 `douyin-im` 运行时依赖、无 `sendMsg`，测试以源码扫描固定该约束。
 - [ ] AC-T6.3c.8 **首次真实发送**：真实 SDK 实例绑定、真实 `sendMsg`、服务端回执实测——需单独授权，本阶段未做。
 - [ ] AC-T6.3c.9 L1 审批的持久化存储、签名与人工界面未实现；本阶段审批以注入对象传入，只证明「有审批才能发」的判定成立。
+
+### AC-T6.3c-real-A · 真实实例绑定、审批持久化与证据收紧（**离线已实现**，2026-11-01）
+
+契约：`docs/contracts/send.md §13`。实现：`src/platform/outbound-session.ts`、`schema-v6.sql`、重写的 `src/send/dispatch.ts`。证据：`outbound-session.test.ts` 9 条 + `dispatch.test.ts` 21 条。**真实发送 0 次。**
+
+- [x] AC-realA.1 会话快照只能由活实例派生；`contact.account === account`、`contact` 必须由 `pickFriend/pickStranger` 真实返回、单账号、在线、`uid/imUid` 匹配。
+- [x] AC-realA.2 `blocked` 直接读真实属性，`undefined` 保守拒绝；`sessionStillLive` 额外校验**对象引用**，字段相同的新实例同样判为漂移。
+- [x] AC-realA.3 L1 审批持久化到 v6 `send_approvals`，绑定 `intent_id`/`recipient_uid`/`text_digest`/有效期；一个意图至多一份。
+- [x] AC-realA.4 审批消费为条件更新，**只能成功一次**；消费失败即结算 `failed` 且不发消息。
+- [x] AC-realA.5 `sent` 证据必须是 `^[1-9][0-9]{0,63}$` 形式的 `serverMessageId`；`'0'`/空串/前导零/非数字一律 `unknown`。
+- [x] AC-realA.6 正文完整性用账本 `text_digest` 比对；等长篡改被拒且传输层零调用。
+- [x] AC-realA.7 发送前复核包含绑定、正文摘要、事件组、Proof Epoch 与实例引用。
+- [ ] AC-realA.8 审批的人工界面、签名与来源认证未实现；本阶段只保证「审批是数据库记录且用过即废」。
+- [ ] AC-realA.9 **T6-3c-real-B**：真实 SDK 实例、真实 `sendMsg`、指定接收方与消息内容的单次平台验收——需单独授权，未开始。

@@ -266,3 +266,55 @@ SDK 会抛 `SendMessageError`，其 `.response` 携带真实 `SendMessageRespons
 ### 12.5 不做
 
 不接真实 SDK、不调用 `sendMsg`、不迁移正式库、不自动重试、不开放 L0、不发送任何私信。
+
+## 13. T6-3c-real-A：真实实例绑定、审批持久化与证据收紧（离线）
+
+本阶段把前一轮「调用方自带快照 + 自带审批对象」的信任假设全部拆除。**仍不真实发送。**
+
+### 13.1 会话快照只能由活实例派生
+
+`src/platform/outbound-session.ts` 的 `deriveSendSession()` 接受真实的 `client` / `account` / `contact`，并逐项核验：
+
+| 检查 | 不成立时 |
+|---|---|
+| `client.accounts.length === 1` 且 `accounts[0] === account` | `session_unverified` |
+| `account.online === true`、`uid`/`imUid` 与期望一致 | `session_unverified` |
+| `contact.account === account`（**同一对象引用**） | `contact_unverified` |
+| `contact` 由 `account.pickFriend(uid)` 或 `pickStranger(uid)` **真实返回** | `contact_unverified` |
+| `contact.uid`、`conversationType === 1`、`threadId` 与期望会话一致 | `contact_unverified` / `foreign_conversation` |
+| `contact.blocked === false`（`undefined` 视为未知，保守拒绝） | `contact_blocked` |
+
+`sessionStillLive()` 在发送前重新派生，并**额外校验对象引用**：账号或联系人被替换成字段相同的新实例，同样视为漂移。只比字段会漏掉这种替换。
+
+### 13.2 L1 审批必须是可核验的持久记录（v6）
+
+`schema-v6.sql` 新增 `send_approvals`：
+
+```sql
+send_approvals(approval_id PK, intent_id UNIQUE, recipient_uid,
+               text_digest, approved_at_ms, expires_at_ms, consumed_at_ms)
+```
+
+- 一个意图至多一份审批（唯一索引），终态后无法再批准重发。
+- 登记时校验：意图必须 `pending` 且尚未有审批；`text_digest` 必须等于账本 `send_intents.text_digest`；`recipient_uid` 必须等于该库的 `target_uid`。
+- 消费用条件更新：`consumed_at_ms IS NULL AND approved_at_ms <= now < expires_at_ms`，且四元组（approval_id / intent_id / recipient_uid / text_digest）全部匹配。**只能成功一次**。
+- 审批消费失败时，意图结算为 `failed/rejected_before_dispatch`，不发消息。
+
+审批的**人工界面与签名**仍不在本阶段：这里保证的是「审批必须是数据库里的真实记录，且用过即废」，不是「审批系统已上线」。
+
+### 13.3 `sent` 证据收紧
+
+`serverMessageId` 来自 protobuf Long，必须是 `^[1-9][0-9]{0,63}$`。`'0'`、空串、前导零、非数字、含字母一律**不构成送达证据**，归入 `unknown`。这是对「任意非空字符串都能当 sent」的收紧。
+
+### 13.4 执行顺序（real-A 版）
+
+```
+读账本 → 校验 claim/摘要/Proof → 派生会话快照 → 核对会话一致性
+→ 校验 v6 审批绑定 → T6-3b 构造器复核 → 原子认领 → 消费审批
+→ 发送前再复核（绑定/正文/事件/Proof/实例引用）
+→ 注入传输层（带超时）→ 分类结算
+```
+
+### 13.5 不做
+
+不接真实 SDK 实例、不调用 `sendMsg`、不迁移正式库、不自动重试、不开放 L0。真实发送属 **T6-3c-real-B**，需单独授权指定接收方与消息内容。
