@@ -3,6 +3,20 @@ import {readFileSync,mkdirSync,lstatSync,existsSync,chmodSync,openSync,closeSync
 import {resolve,dirname} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import type {InboundMessage,HistoryPage} from '../platform/types.ts';
+import type {AiDecision} from '../ai/contracts.ts';
+// 纯函数、无 I/O、无反向依赖：仅用于在事务内做发送策略判定。
+import {evaluateSendIntent} from '../send/policy.ts';
+import type {SendRejectCode} from '../send/policy.ts';
+/** 当前程序支持的最高 schema 版本；所有「版本区间」判断都应引用它。 */
+export const MAX_SCHEMA_VERSION=5;
+
+export type HandoffBlockReason='claim_inactive'|'coverage_changed'|'source_invalid'|'storage_unavailable'|'policy_invalid';
+export type HandoffNoIntentReason='not_reply'|'already_finalized'|SendRejectCode;
+export type HandoffResult=
+ |{readonly status:'recorded_no_intent';readonly reasonCode:HandoffNoIntentReason}
+ |{readonly status:'recorded_pending';readonly intentId:string;readonly notBeforeMs:number;readonly expiresAtMs:number}
+ |{readonly status:'blocked';readonly reasonCode:HandoffBlockReason};
+
 export interface ArchiveIdentity {ownerUid:string;targetUid:string;ownUids:readonly string[]}
 export interface Batch {batchId:string;conversationId:string;source:'live'|'history';messages:readonly InboundMessage[];gapReason?:string}
 export interface BatchResult {outcomes:readonly ('new'|'matched'|'ambiguous')[];replayed:boolean;requiresReconcile:true}
@@ -23,6 +37,7 @@ const sql=readFileSync(new URL('./schema.sql',import.meta.url),'utf8');
 const sqlV2=readFileSync(new URL('./schema-v2.sql',import.meta.url),'utf8');
 const sqlV3=readFileSync(new URL('./schema-v3.sql',import.meta.url),'utf8');
 const sqlV4=readFileSync(new URL('./schema-v4.sql',import.meta.url),'utf8');
+const sqlV5=readFileSync(new URL('./schema-v5.sql',import.meta.url),'utf8');
 function digest(r:Batch){return createHash('sha256').update(JSON.stringify([r.conversationId,r.source,r.gapReason??null,r.messages.map(m=>[m.conversationId,m.serverMessageId,m.clientMessageId,m.senderUid,m.fromSelf,m.text,m.kind,m.messageType,m.createTime,m.indexInConversation])])).digest('hex');}
 export class EveArchive {
  private closed=false;
@@ -56,7 +71,7 @@ export class EveArchive {
   try{
    db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=3000');
    const version=(db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-   if(version!==0&&version!==1&&version!==2&&version!==3&&version!==4)throw new ArchiveError('schema_unsupported');
+   if(version!==0&&version!==1&&version!==2&&version!==3&&version!==4&&version!==5)throw new ArchiveError('schema_unsupported');
    if(version===0){
     // SQLite user_version 0 has no versioned Eve schema. Only an EMPTY
     // pre-existing SQLite DB may safely initialize as v1.
@@ -97,7 +112,7 @@ export class EveArchive {
  upgradeToV2(injectFailure=false):void{
   this.check();
   const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-  if(version===2||version===3||version===4)return;
+  if(version>=2&&version<=5)return;
   if(version!==1)throw new ArchiveError('schema_unsupported');
   this.db.exec('BEGIN IMMEDIATE');
   try{
@@ -112,7 +127,7 @@ export class EveArchive {
  upgradeToV3(injectFailure=false):void{
   this.check();
   const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-  if(version===3||version===4)return;
+  if(version>=3&&version<=5)return;
   if(version!==2)throw new ArchiveError('migration_requires_v2');
   this.db.exec('BEGIN IMMEDIATE');
   try{
@@ -127,7 +142,7 @@ export class EveArchive {
  upgradeToV4(injectFailure=false):void{
   this.check();
   const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-  if(version===4)return;
+  if(version===4||version===5)return;
   if(version!==3)throw new ArchiveError('migration_requires_v3');
   this.db.exec('BEGIN IMMEDIATE');
   try{
@@ -145,8 +160,31 @@ export class EveArchive {
  }
  private requireV4():void{
   this.check();
-  if((this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version!==4)
+  if((this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version<4)
    throw new ArchiveError('send_requires_v4');
+ }
+ /** T6-3a explicit migration: handoff binding + not_before_ms. */
+ upgradeToV5(injectFailure=false):void{
+  this.check();
+  const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
+  if(version===5)return;
+  if(version!==4)throw new ArchiveError('migration_requires_v4');
+  this.db.exec('BEGIN IMMEDIATE');
+  try{
+   this.db.exec(sqlV5);
+   if(injectFailure)throw new ArchiveError('migration_injected_failure');
+   this.db.exec('UPDATE archive_meta SET schema_version=5 WHERE singleton=1');
+   this.db.exec('PRAGMA user_version=5');
+   this.db.exec('COMMIT');
+  }catch(e){this.db.exec('ROLLBACK');throw e;}
+ }
+ private requireV5():void{
+  this.check();
+  if((this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version!==5)
+   throw new ArchiveError('handoff_requires_v5');
+ }
+ private schemaVersion():number{
+  return (this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
  }
 
  /**
@@ -303,8 +341,13 @@ export class EveArchive {
  claimSendIntent(intentId:string,now:number):boolean{
   this.requireV4();
   if(!Number.isSafeInteger(now))throw new ArchiveError('rejected');
-  const r=this.db.prepare("UPDATE send_intents SET status='dispatching',attempt=attempt+1,claimed_at_ms=?,updated_at_ms=? WHERE intent_id=? AND status='pending'")
-   .run(now,now,intentId);
+  // v5 起：未到 not_before_ms 的意图不得被认领（delayMs 必须真正生效）。
+  // v4 行没有该列，保持原行为。
+  const r=this.schemaVersion()>=5
+   ?this.db.prepare("UPDATE send_intents SET status='dispatching',attempt=attempt+1,claimed_at_ms=?,updated_at_ms=? WHERE intent_id=? AND status='pending' AND (not_before_ms IS NULL OR not_before_ms<=?)")
+    .run(now,now,intentId,now)
+   :this.db.prepare("UPDATE send_intents SET status='dispatching',attempt=attempt+1,claimed_at_ms=?,updated_at_ms=? WHERE intent_id=? AND status='pending'")
+    .run(now,now,intentId);
   return Number(r.changes)===1;
  }
 
@@ -330,7 +373,135 @@ export class EveArchive {
   }
   const r=this.db.prepare("UPDATE send_intents SET status=?,reason_code=?,evidence=?,settled_at_ms=?,updated_at_ms=? WHERE intent_id=? AND status='dispatching'")
    .run(settle.status,reason,evidence,now,now,intentId);
-  return Number(r.changes)===1;
+  if(Number(r.changes)!==1)return false;
+  // 终态即清理正文：账本保留摘要与证据供审计，正文不再可读。
+  this.db.prepare('DELETE FROM send_text WHERE intent_id=?').run(intentId);
+  return true;
+ }
+
+ /**
+  * T6-3a：受信内部交接 —— T5 决策结算与 T6 发送意图入库在**同一个事务**内完成。
+  *
+  * 契约：docs/contracts/ai-send-handoff.md。
+  * 只有 reply 且通过发送策略才写 send_text；skip/defer/被拒一律只写 recorded 审计。
+  * 任何异常整体回滚，claim 保持 claimed，重启后由恢复流程标记 interrupted。
+  */
+ finalizeAiWithSend(input:{
+  claimId:string;
+  decision:AiDecision;
+  identity:{ownerUid:string;targetUid:string;ownImUid?:string};
+  runtime:{phase:string;paused:boolean};
+  policy:{minIntervalMs:number;maxPerHour:number;maxPerDay:number;
+   silence:{startMinute:number;endMinute:number};maxTextLength:number};
+  now:number;
+  coverageMaxAgeMs:number;
+  bodyRetentionMs:number;
+  failAfterWrites?:boolean;
+ }):HandoffResult{
+  try{this.requireV5();}catch{return {status:'blocked',reasonCode:'storage_unavailable'};}
+  if(!Number.isSafeInteger(input.now)||!Number.isSafeInteger(input.coverageMaxAgeMs)||
+     input.coverageMaxAgeMs<1||!Number.isSafeInteger(input.bodyRetentionMs)||
+     input.bodyRetentionMs<1||input.bodyRetentionMs>3_600_000)
+   return {status:'blocked',reasonCode:'policy_invalid'};
+  if(!this.matchSendIdentity(input.identity))return {status:'blocked',reasonCode:'source_invalid'};
+
+  const sha=(v:string)=>createHash('sha256').update(v).digest('hex');
+  this.db.exec('BEGIN IMMEDIATE');
+  try{
+   const claim=this.db.prepare('SELECT claim_id,conversation_id,server_message_id,proof_epoch_id,state FROM ai_decision_attempts WHERE claim_id=?')
+    .get(input.claimId) as {claim_id:string;conversation_id:string;server_message_id:string;proof_epoch_id:string;state:string}|undefined;
+   if(!claim){this.db.exec('ROLLBACK');return {status:'blocked',reasonCode:'claim_inactive'};}
+
+   // 重放：已终结的 claim 不得产生第二条意图，也不得覆盖旧正文
+   if(claim.state!=='claimed'){
+    const existing=this.db.prepare('SELECT intent_id,not_before_ms FROM send_intents WHERE ai_claim_id=?')
+     .get(input.claimId) as {intent_id:string;not_before_ms:number|null}|undefined;
+    const exp=existing?this.db.prepare('SELECT expires_at_ms FROM send_text WHERE intent_id=?')
+     .get(existing.intent_id) as {expires_at_ms:number}|undefined:undefined;
+    this.db.exec('ROLLBACK');
+    if(existing&&existing.not_before_ms!==null)
+     return {status:'recorded_pending',intentId:existing.intent_id,
+      notBeforeMs:existing.not_before_ms,expiresAtMs:exp?.expires_at_ms??0};
+    return {status:'recorded_no_intent',reasonCode:'already_finalized'};
+   }
+
+   // Proof 必须仍是该 claim 签发时的同一个 epoch
+   if(this.coverageEpoch(claim.conversation_id,input.coverageMaxAgeMs)!==claim.proof_epoch_id)
+    throw new ArchiveError('handoff_coverage_changed');
+
+   // 事件组以数据库为准，绝不相信调用方
+   const items=(this.db.prepare('SELECT server_message_id FROM ai_batch_items WHERE claim_id=? ORDER BY ordinal')
+    .all(input.claimId) as {server_message_id:string}[]).map(r=>r.server_message_id);
+   if(items.length<1)throw new ArchiveError('handoff_source_invalid');
+   const elig=this.db.prepare('SELECT e.state,m.sender_uid,m.from_self,m.kind FROM eligible_events e '+
+    'JOIN messages m ON e.conversation_id=m.conversation_id AND e.server_message_id=m.server_message_id '+
+    'WHERE e.conversation_id=? AND e.server_message_id=?');
+   for(const id of items){
+    const x=elig.get(claim.conversation_id,id) as {state:string;sender_uid:string;from_self:number;kind:string}|undefined;
+    if(!x||x.state!=='pending'||x.sender_uid!==this.identity.targetUid||
+       x.from_self!==0||x.kind!=='text')throw new ArchiveError('handoff_source_invalid');
+   }
+
+   const decisionDigest=sha(JSON.stringify(input.decision));
+   const replyLength=input.decision.action==='reply'?input.decision.text.length:0;
+   const finish=()=>{
+    const r=this.db.prepare("UPDATE ai_decision_attempts SET state='recorded',finished_at_ms=?,action=?,decision_digest=?,reply_length=?,failure_code=NULL WHERE claim_id=? AND state='claimed'")
+     .run(input.now,input.decision.action,decisionDigest,replyLength,input.claimId);
+    if(Number(r.changes)!==1)throw new ArchiveError('handoff_claim_inactive');
+   };
+
+   if(input.decision.action!=='reply'){
+    finish();this.db.exec('COMMIT');
+    return {status:'recorded_no_intent',reasonCode:'not_reply'};
+   }
+
+   const text=input.decision.text;
+   const notBeforeMs=input.now+input.decision.delayMs;
+   const expiresAtMs=input.now+input.bodyRetentionMs;
+   if(!Number.isSafeInteger(notBeforeMs)||notBeforeMs>=expiresAtMs)
+    throw new ArchiveError('handoff_policy_invalid');
+
+   const snapshot=this.sendPolicySnapshot(claim.conversation_id,input.now);
+   const coverage=this.coverageStatus(claim.conversation_id,input.coverageMaxAgeMs);
+   const evaluation=evaluateSendIntent({
+    decision:input.decision,conversationId:claim.conversation_id,
+    sourceEventId:claim.server_message_id,identity:input.identity,
+    coverage:{usable:coverage.usable,state:coverage.state},
+    runtime:input.runtime,now:input.now,
+    policy:{...input.policy,recentSends:snapshot.recentSends},
+    priorIntents:snapshot.priorIntents,
+   });
+   if(!evaluation.ok){
+    // 决策本身有效，仍要记账；只是不产生发送意图与正文
+    finish();this.db.exec('COMMIT');
+    return {status:'recorded_no_intent',reasonCode:evaluation.code};
+   }
+
+   const intentId=evaluation.intent.intentId;
+   this.db.prepare('INSERT INTO send_intents(intent_id,conversation_id,source_event_id,text_digest,decision_digest,status,attempt,created_at_ms,updated_at_ms,ai_claim_id,not_before_ms) VALUES(?,?,?,?,?,?,0,?,?,?,?)')
+    .run(intentId,claim.conversation_id,claim.server_message_id,
+     sha(text),decisionDigest,'pending',input.now,input.now,input.claimId,notBeforeMs);
+   this.db.prepare('INSERT INTO send_text(intent_id,body,created_at_ms,expires_at_ms) VALUES(?,?,?,?)')
+    .run(intentId,text,input.now,expiresAtMs);
+   items.forEach((id,ordinal)=>{
+    this.db.prepare('INSERT INTO send_intent_events(conversation_id,server_message_id,intent_id,ordinal) VALUES(?,?,?,?)')
+     .run(claim.conversation_id,id,intentId,ordinal);
+   });
+   if(input.failAfterWrites)throw new ArchiveError('handoff_injected_failure');
+   finish();
+   this.db.exec('COMMIT');
+   return {status:'recorded_pending',intentId,notBeforeMs,expiresAtMs};
+  }catch(e){
+   this.db.exec('ROLLBACK');
+   if(e instanceof ArchiveError){
+    if(e.code==='handoff_coverage_changed')return {status:'blocked',reasonCode:'coverage_changed'};
+    if(e.code==='handoff_source_invalid')return {status:'blocked',reasonCode:'source_invalid'};
+    if(e.code==='handoff_policy_invalid')return {status:'blocked',reasonCode:'policy_invalid'};
+    if(e.code==='handoff_claim_inactive')return {status:'blocked',reasonCode:'claim_inactive'};
+    if(e.code==='handoff_injected_failure')return {status:'blocked',reasonCode:'storage_unavailable'};
+   }
+   return {status:'blocked',reasonCode:'storage_unavailable'};
+  }
  }
 
  /**
@@ -482,8 +653,10 @@ export class EveArchive {
  }
   private requireV2():void{
     this.check();
+    // 对账依赖 v2 引入的表，但结构在 v3/v4/v5 中只增不改，因此向上兼容。
+    // 新增 schema 版本时必须同步上调这个上限（曾两次因写死版本号导致回归）。
     const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-    if(version<2||version>4)throw new ArchiveError('reconcile_requires_v2');
+    if(version<2||version>MAX_SCHEMA_VERSION)throw new ArchiveError('reconcile_requires_v2');
   }
   private validThread(thread:string):boolean {
     const p=thread.split(':'), own=new Set(this.identity.ownUids);
