@@ -318,3 +318,39 @@ send_approvals(approval_id PK, intent_id UNIQUE, recipient_uid,
 ### 13.5 不做
 
 不接真实 SDK 实例、不调用 `sendMsg`、不迁移正式库、不自动重试、不开放 L0。真实发送属 **T6-3c-real-B**，需单独授权指定接收方与消息内容。
+
+## 14. T6-3c-real-B0：可信出口与人工审批（离线）
+
+拆成两个 Gate：**B0（离线）** 与 **B1（单次真实发送，需单独授权）**。本节只覆盖 B0。
+
+### 14.1 L1 审批必须是人的动作
+
+上一版 `createSendApproval()` 是 `EveArchive` 上的公开方法：任何代码路径都能直接造一条合法审批记录。它校验的是**记录内容合法**，不是**审批者是你本人**。
+
+`src/send/approval-cli.ts` 把批准变成一次本机交互：
+
+- 必须在 TTY 中运行（`canPromptInteractively()`；非 TTY 拒绝，防脚本静默批准）。
+- 屏幕同时显示**接收方 UID** 与**完整待发正文**（正文只在本机终端出现，不进日志、不进返回值）。
+- 输入必须精确等于 `CONFIRM`——**不做 trim**，`'CONFIRM '`、`'confirm'`、空回车一律取消。
+- 登记前用**当前正文重算的摘要**与账本 `text_digest` 比对；只比「两次读到的账本值相同」不够（账本被整体改写时仍会通过）。
+- 一个意图至多一份审批（v6 唯一索引），重复批准返回 `unavailable`。
+
+### 14.2 发送能力必须由 Port 内部绑定
+
+`SendTransport` 原是结构接口——任何 `{ sendText() {} }` 都能获得发送路径，「谁能发消息」由调用方决定。这不可接受。
+
+`src/platform/outbound-transport.ts` 引入一次性令牌：
+
+- `issueTrustedSendPort()` 只允许 **DouyinReadOnlyPort 内部**调用（它持有真实 SDK `Contact`）。
+- 出口携带 `conversationId` 与 `recipientUid`；`dispatchOnce` 校验它们与意图/审批一致。
+- 未登记的出口 → `untrusted_transport`，**传输层零调用**。
+- `revokeTrustedSendPort()` 在 Port 关闭时撤销，旧出口立即失效。
+
+注意：TypeScript 的结构类型仍无法**证明**对象来自真实 SDK；令牌机制把「任意构造」降级为「必须经过 Port 内部登记」。真正的证明来自 B1 的真实联调。
+
+### 14.3 B1 的前置条件（未开始）
+
+- B0 全部通过；
+- 正式库完成**经批准的备份 + v6 迁移**；
+- 操作者明确指定接收方、精确消息内容，并授权**最多一次** `sendMsg()`；
+- 遇 `unknown` 不重试、不补发，不自动开启 L0。

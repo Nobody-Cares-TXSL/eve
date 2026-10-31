@@ -266,3 +266,16 @@
 - [x] AC-realA.7 发送前复核包含绑定、正文摘要、事件组、Proof Epoch 与实例引用。
 - [ ] AC-realA.8 审批的人工界面、签名与来源认证未实现；本阶段只保证「审批是数据库记录且用过即废」。
 - [ ] AC-realA.9 **T6-3c-real-B**：真实 SDK 实例、真实 `sendMsg`、指定接收方与消息内容的单次平台验收——需单独授权，未开始。
+
+### AC-T6.3c-real-B0 · 可信出口与人工审批（**离线已实现**，2026-11-01）
+
+契约：`docs/contracts/send.md §14`。实现：`src/send/approval-cli.ts`、`src/platform/outbound-transport.ts`。证据：`approval-cli.test.ts` 7 条 + `dispatch.test.ts` 新增 3 条。**真实发送 0 次。**
+
+- [x] AC-realB0.1 审批必须经本机交互：屏幕展示接收方与完整正文，输入精确 `CONFIRM`（不 trim）才登记；非 TTY 不可用。
+- [x] AC-realB0.2 登记前用当前正文重算摘要与账本 `text_digest` 比对；篡改即 `digest_mismatch` 且不留审批记录。
+- [x] AC-realB0.3 同一意图至多一份审批，重复批准被拒。
+- [x] AC-realB0.4 发送能力必须来自 Port 内部登记的出口；外部构造的 `{ sendText }` → `untrusted_transport`，传输层零调用。
+- [x] AC-realB0.5 出口绑定的 `conversationId`/`recipientUid` 必须与意图和审批一致。
+- [x] AC-realB0.6 出口撤销后立即不可用。
+- [ ] AC-realB0.7 `canPromptInteractively()` 的 TTY 检测未在真实终端做端到端验证（仅单元覆盖）。
+- [ ] AC-realB0.8 **B1**：真实 SDK 出口绑定、正式库备份迁移、单次 `sendMsg` 验收——需单独授权，未开始。
