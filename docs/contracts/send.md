@@ -151,3 +151,16 @@ pending --claim--> dispatching --settle--> sent
 ### 8.6 本 Slice 的边界
 
 **不做**：不接平台发送适配器、不调用 `sendMsg`、不迁移正式 v2/v3 库、不开启真实账号自动回复。T6-2 才讨论平台适配与受控发送 Gate。
+
+## 9. T6-2a：安全组合层（离线 pending 意图）· 2026-10-31
+
+本阶段仅实现 T6-2 的第一段，不等于平台发送适配器或受控真实发送 Gate。新增 `src/send/coordinator.ts`，组合 **T4 当前可用 Proof → T6-1 Policy → T6-1b SQLite v4 pending 账本**。不会调用 SDK、`sendMsg`、模型，也不自动把正式库迁移到 v4。
+
+- 可信身份：Policy 的 `identity` 增加可选 `ownImUid`，适配 SDK 使用 `0:1:<自己的 IM UID>:<目标 UID>` 的线程；`EveArchive.matchSendIdentity` 必须核对它属于已认证 `ownUids`，绝不从线程文本反推可信 IM UID。归档会话白名单还要通过 `coverageStatus` 的 `validThread`。
+- 运行态与 Coverage：调用者必须提供 Runner 当前运行态（目前仅离线模拟，尚未接 Runner）；Coverage 的 `verified/usable` 从归档数据库查询，不信任调用者。调用 `coverageEpoch` 获取 Proof ID，`saveSendIntent` 在 `BEGIN IMMEDIATE` 事务内**再次检查同一 Proof Epoch**，失效即拒绝落库。
+- 预算与幂等：调用者无法注入最近发送历史。账本 `sendPolicySnapshot` 从 SQLite v4 读取已有意图作为 `priorIntents`，将 `pending/dispatching/sent/unknown` 视为保守的调用预算预留（按意图创建时间统计），仅确定未发送的 `failed` 不占预留；未来时间戳按时钟异常拒绝。随后同一 `BEGIN IMMEDIATE` 写入事务内再次检查最小间隔、滚动小时/24h 配额，避免两个独立 Worker 使用同一旧预算快照同时入库。重复意图和重叠事件组仍按唯一约束指回原意图。
+- 事件组：输入 `eventIds` 必须去重、包含 `sourceEventId`、上限 3；违反者给出 `invalid_event_group`，不写账本。T5 决策使用本地 `validateDecision`；非法输出给出 `invalid_decision`。所有错误结果只含固定码、不会返回消息正文。
+- 隐私：正文仍仅写 `send_text`，保存期不超过 7 天（实际值由配置传入），返回仅包含 `intentId` 或拒绝码，不记录正文。测试中所有数据为虚构，正式 v2 保持不动。
+- v4 兼容缺口修复：`requireV2()` 原仅接受版本 2/3，导致升级到 v4 后 T4 `reconcileOnce` 抛 `reconcile_requires_v2`；现允许 2/3/4，继续拒绝 v1。T4 与 T5 在临时 v4 库上实际集成验证。
+
+**剩余硬 Gate，不得标记完成**：① 当前 `prepareSendIntent` 尚未由 Runner 的真实 T5 决策与经过认证的运行态调用；T5 的 dry-run 审计只保留摘要，尚无安全的决策正文交接/来源证明；② 尚无 Mock Dispatcher 的调度、SDK 回执映射或真实平台发送适配器；③ 发送前的再次验证、过期正文、时区与 UTF-16 字数口径、`UNKNOWN` 结果的人工核查、单实例锁和正式库 v4 备份迁移均待后续 T6-2b / 受控发送 Gate。无独立实际发送授权前，绝不能触发真实 `sendMsg`。

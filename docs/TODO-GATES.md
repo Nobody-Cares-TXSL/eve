@@ -853,3 +853,17 @@ T5 的 AI 决策模块进入**功能冻结**：接口不再随意改动（清单
 - 英文正文/多语言长度按 UTF-16 code unit 计数，与平台侧计数口径是否一致未验证。
 
 **判定：T6-1b 通过；真实发送仍被完全阻断。**
+
+### T6-2a 离线接线阶段（2026-10-31）
+
+- 设备 Remote Desktop Commander 2360108124 已恢复 Online；只读检查 HEAD 为 `6dc5507`，工作区在本轮开始时干净。基于用户已确认的 T6-1b 开始首个 T6-2 离线切片。
+- 发现并修复 T6-1b 遗留的 v4 `requireV2` 漏接，以及 Policy 单认 owner UID、不认认证 IM UID 的跨层矛盾。旧发送状态机保持不变，正式库未迁移。
+- 新增 `sendPolicySnapshot` 从真实账本取得去重和配额历史；同时在 `saveSendIntent` 的 `BEGIN IMMEDIATE` 内校验预算与 Proof Epoch，防止旧快照及过期证明被误用于创建意图。重复事件优先指回原记录。
+- `coordinator.ts` 只负责生成 pending，绝不 claim、dispatch、调用 Claude、调用 SDK 或实际发送。完整模拟发送的 Adapter 测试以及 T5 正文交接仍属下一段，**不能对外宣称 T6-2 全部完成**。
+
+### T6-2a 全量最终验收（2026-10-31）
+
+- `pnpm typecheck` **0 错**；`pnpm test` **243/243 通过，fail=0**（原 230 + 新增 Policy 1 条及 Coordinator 12 条）；`git diff --check` 通过。
+- 关键专项证据：授权 IM UID 与归档身份双重一致、当前可用 Coverage 从库读取、Proof Epoch 在写事务内防换代、暂停/skip/非法决策拒绝、事件批次不能拆、时钟异常关闭门控、SQLite 保存前二次预算检查、两个独立 SQLite 连接不能超过 maxPerHour、UNKNOWN 继续占用额度、确定未发送的 failed 可释放预留；v4 T4 对账和 T5 AI 账本继续可运行。
+- 正式库只读 `PRAGMA user_version=2`、`quick_check=ok`；CLI 状态 `phase=stopped`、`alive=false`。扫描 `app/src` 没有 `sendMsg(` 调用。**无真实 Claude 请求、无真实 SDK 发送、无正式库迁移、无 Git Commit**。
+- 当前 HEAD `6dc5507`，本轮工作区保持未提交，新增 `app/src/send/coordinator.ts`、`app/test/send/coordinator.test.ts` 和相关 T6 Policy / Archive / Docs 修改。T6-2a 仅通过 pending 意图阶段，不要把它写成 T6-2 整体验收或允许自动回复。
