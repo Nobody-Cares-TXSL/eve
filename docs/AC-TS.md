@@ -204,3 +204,12 @@
 - [x] 重叠事件组在账本层优先指回既有 intentId，不会拆组；不输出正文。
 - [x] v4 临时库的 T4 对账与 T5 AI 账本仍正常；v3 不自动升级。
 - [ ] T5 完整决策结果来源证明、Runner 受信上下文接线、Mock Sender、平台 SDK 适配、正式迁移和人工受控单发尚未验收。
+
+### T6-2b Mock Dispatcher 验收 AC（2026-10-31）
+
+- [x] 对假 ID、仅基线事件、已消费 claimed/processed、**另一个真实会话的 eligible 事件**拒绝 `invalid_event_group` 且 SQLite 无新增意图。
+- [x] T5 `ai_batch_items` 一旦认领，传入部分、混组的 eventIds 均拒绝；整组检查在保存事务内执行。
+- [x] 无已记录 T5 决策/摘要不符、Proof Epoch 换代、正文到期、身份或运行态错误：Mock Port 不获正文也不发起调用。
+- [x] Fake T5 recorded 决策 + 同批次事件 + 当前可用 Proof → 单次 Mock 成功，返回 `mock_sent`、证据为 `mock:...`，重复调用不得产生第二次 Mock 发送。
+- [x] Mock 确定未发送 → failed；timeout / throw / ambiguous → unknown，并断言 attempt=1，不能再次 claim；返回不带原文。
+- [ ] 真实 AI 文本交接、Runner 注入的可信状态、真实 SDK adapter 与回执语义、L1 人工审核、真实平台字符限制、生产库迁移及长时间限流/断线测量均未完成。

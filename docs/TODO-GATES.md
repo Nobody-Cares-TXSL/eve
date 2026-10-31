@@ -867,3 +867,18 @@ T5 的 AI 决策模块进入**功能冻结**：接口不再随意改动（清单
 - 关键专项证据：授权 IM UID 与归档身份双重一致、当前可用 Coverage 从库读取、Proof Epoch 在写事务内防换代、暂停/skip/非法决策拒绝、事件批次不能拆、时钟异常关闭门控、SQLite 保存前二次预算检查、两个独立 SQLite 连接不能超过 maxPerHour、UNKNOWN 继续占用额度、确定未发送的 failed 可释放预留；v4 T4 对账和 T5 AI 账本继续可运行。
 - 正式库只读 `PRAGMA user_version=2`、`quick_check=ok`；CLI 状态 `phase=stopped`、`alive=false`。扫描 `app/src` 没有 `sendMsg(` 调用。**无真实 Claude 请求、无真实 SDK 发送、无正式库迁移、无 Git Commit**。
 - 当前 HEAD `6dc5507`，本轮工作区保持未提交，新增 `app/src/send/coordinator.ts`、`app/test/send/coordinator.test.ts` 和相关 T6 Policy / Archive / Docs 修改。T6-2a 仅通过 pending 意图阶段，不要把它写成 T6-2 整体验收或允许自动回复。
+
+### T6-2b 安全 Mock Gate（2026-10-31）
+
+- Remote Desktop Commander 上直接核对：本轮基线 HEAD `3d8a811`，工作区最初干净。T6-2a 的输入 ID 格式不能保证真实数据库归属，已在 v4 写事务中补充 eligible_events/messages 跨表绑定和已有 T5 批次完整性。
+- 新增 `app/src/send/mock-dispatcher.ts`，只接受测试用 `MockSendPort`，不触碰真实平台。新增 `EveArchive.mockDispatchCandidate` 要求匹配已 recorded 的 T5 决策摘要/回复长度/批次/当前 Proof Epoch/正文 SHA256；Mock 调用前做身份、运行态、文本到期校验；认领后再复核。
+- 特殊注意：只有模拟结果 `mock_sent` 和模拟证据 `mock:sha256`；这不是抖音服务端回执，**绝不允许据此开放真实发送**。
+- 专项测试在临时 v4 库验证跨会话/未归档/已 consumed 事件拒绝；已 recorded 证据的模拟成功、重复不可发送、明确未送达 failed、不明确/异常/超时 unknown、Proof/摘要/正文过期拒绝。
+- 正式 SQLite 不迁移；不触发 T5 Claude 模型、不调用真实抖音 SDK sendMsg、不做 Git 提交。阶段分类为 T6-2b Mock only；下一阶段须继续真实 SDK 的人工批准与授权 Gate，不能标记 T6 实盘就绪。
+
+### T6-2b 完整回归结果与上线隔离（2026-10-31）
+
+- 在设备 2360108124 运行 `pnpm typecheck` **0 错**，`pnpm test` **253/253 pass、0 fail**（本阶段新增 10 项，包含 T6-2b 3 条事件安全负例、Mock Sender 6 类回执/超时验证、跨会话真实 eligible 归属）；`git diff --check` 通过。
+- 正式 `data/eve.sqlite` 只读证明：`user_version=2`、`quick_check=ok`、`messages=132`；Runner `phase=stopped,alive=false`；`app/src` 无真实 `sendMsg(` 调用。
+- 工作区变动未提交，HEAD 保持 `3d8a811`。没有真实 Claude 调用、没有真实私信发送、没有正式库迁移。
+- 本阶段模拟 T5 recorded 数据和 `MockSendPort` 只证明**离线**决策与状态机闭环。尚未证明真实模型正文交接、真实 SDK 回执真实性、平台长度、人工授权、真实运行时断线/暂停和单实例串行化；任何 mock 的 `sent` 不等于抖音平台已收到信息。

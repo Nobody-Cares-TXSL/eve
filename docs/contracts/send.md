@@ -164,3 +164,27 @@ pending --claim--> dispatching --settle--> sent
 - v4 兼容缺口修复：`requireV2()` 原仅接受版本 2/3，导致升级到 v4 后 T4 `reconcileOnce` 抛 `reconcile_requires_v2`；现允许 2/3/4，继续拒绝 v1。T4 与 T5 在临时 v4 库上实际集成验证。
 
 **剩余硬 Gate，不得标记完成**：① 当前 `prepareSendIntent` 尚未由 Runner 的真实 T5 决策与经过认证的运行态调用；T5 的 dry-run 审计只保留摘要，尚无安全的决策正文交接/来源证明；② 尚无 Mock Dispatcher 的调度、SDK 回执映射或真实平台发送适配器；③ 发送前的再次验证、过期正文、时区与 UTF-16 字数口径、`UNKNOWN` 结果的人工核查、单实例锁和正式库 v4 备份迁移均待后续 T6-2b / 受控发送 Gate。无独立实际发送授权前，绝不能触发真实 `sendMsg`。
+
+## 10. T6-2b：真实事件归属验证与 Mock Dispatcher（2026-10-31）
+
+**边界：本节只有临时 SQLite v4 与纯内存 MockSendPort。模拟 `mock_sent` 不是平台真的收到消息；此处没有接入真实 douyin-im、没有 `sendMsg` 调用，也没有取得真实发送授权。**
+
+### 10.1 修复 eventIds 可信性漏洞
+
+原 T6-2a Coordinator 仅校验输入 ID 格式，允许调用方编造数字串。现在 `saveSendIntent` 在 Coordinator 提供 `expectedProofEpoch` 的情况下，会在同一个 `BEGIN IMMEDIATE` 事务中，对每个事件 JOIN `eligible_events` 与 `messages`，确认属于确切的 `conversationId`、`eligible_events.state='pending'`、`sender_uid=targetUid`、`from_self=0`、kind=text 且正文非空。不存在、其他会话的 eligible、仅初始基线未 eligible、已 claimed/processed 的事件均返回 `invalid_event_group`，无意图落库。若事件属于 T5 `ai_batch_items`，整组必须与同一 `claim_id` 的全量批次及顺序严格一致，禁止部分、混组或换顺序。
+
+T6-1b 底层直接 `saveSendIntent` 的旧离线测试仍可省略 `expectedProofEpoch`；这是测试级底层存储 API，**不构成生产发送权限**。所有 T6-2 协调流程都必须提供可信 Proof，真正发送阶段也必须独立复核 T5 来源。
+
+### 10.2 T5 来源 Gate（仅 Mock）
+
+`EveArchive.mockDispatchCandidate` 在任何 Mock 调用前同时核对：未过期 `send_text` 与正文 SHA256 摘要一致；匹配一个 `ai_decision_attempts.state='recorded',action='reply'` 的 T5 决策，且 `decision_digest`、`reply_length` 与该次发送完全匹配；发送关联批次与 `ai_batch_items` 全量一致；所有成员仍为当前线程目标用户的 eligible pending；**T5 原 `proof_epoch_id` 必须与当前可用 Proof Epoch 相同**。失败直接 `source_unverified`，不认领、不接触 Mock Port。
+
+`dispatchMockOnce` 仅接受 `MockSendPort` 的实例与显式 `allowMockOnly:true`。运行态/白名单、正文长度在认领前检查，`pending→dispatching` 仍通过原有条件更新；认领后即时再复核 T5 来源，失效则确认未发送并 `failed/rejected_before_dispatch`。Port 整个实现只在内存模拟 `confirmed` / `rejected_before_dispatch` / `ambiguous` / `throws` / `hang`，绝不导入 douyin-im。
+
+**模拟输出：** `confirmed` 只产生 `mock:<SHA256>` 证据并写入测试库 `sent`，外部返回状态 `mock_sent`；模拟明确未发送写 `failed`；模糊结果、异常、超时分别写 `unknown/ambiguous_result`、`unknown/transport_error`、`unknown/timeout`；这三种 `unknown` 绝不再自动认领或重发。所有结果只含固定码和 `intentId`，不回显发送正文。
+
+### 10.3 未完成的真实发送硬 Gate
+
+1. 此 Mock Dispatcher 没有接真实 Runner 的经过认证的运行态/单实例锁，也没有生产 SDK 适配器；测试通过不等于部署安全。
+2. T5 目前只持久化决策摘要，正式的模型决策正文如何安全、及时地交接 T6，且避免伪造 `recorded` 证据，仍待设计/验收；本节通过**虚构的 T5 recorded 测试账本**验证来源链，绝不反推历史正文。
+3. 生产 SDK 收发的回执 ID 语义、发送前权限复核与中途断线、超时是否实际送达、平台字符计数（UTF-16 与平台差异）、人工 L1 许可、正式 SQLite v2→v4 备份迁移及 UNKNOWN 人工核实均未完成。不得直接复制 `MockSendPort` 的成功判定到真实 SDK。
