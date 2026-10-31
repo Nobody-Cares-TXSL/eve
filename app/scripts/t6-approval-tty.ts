@@ -95,37 +95,62 @@ try {
       notBeforeMs: binding.notBeforeMs ?? now, expiresAtMs: now + ttl,
     });
 
-    // 第 1 轮：展示完整信息后读一次输入。故意先给错误答案以验证「拒绝且零记录」。
-    const firstAnswer = selfTest ? 'not confirm' : await askOnce(view);
-    const declined = await runInteractiveApproval({
-      archive: a, promptText: async () => firstAnswer,
-      now, ttlMs: ttl, approvalId: 'appr-tty0001',
-    }, intentId);
-    report['firstAnswer'] = firstAnswer === 'CONFIRM' ? 'CONFIRM' : 'other';
-    report['declinedResult'] = declined.status;
-    report['noRecordAfterDecline'] = a.sendApprovalState(intentId) === null;
+    if (selfTest) {
+      // 自动模式：先故意给错误输入，验证「拒绝且零记录」，再给正确输入
+      const declined = await runInteractiveApproval({
+        archive: a, promptText: async () => 'not confirm',
+        now, ttlMs: ttl, approvalId: 'appr-tty0001',
+      }, intentId);
+      report['declinedResult'] = declined.status;
+      report['noRecordAfterDecline'] = a.sendApprovalState(intentId) === null;
 
-    // 第 2 轮：再展示一次并确认。真实终端里需要人再输一次 CONFIRM。
-    const secondAnswer = selfTest ? 'CONFIRM' : await askOnce(view);
-    const confirmed = await runInteractiveApproval({
-      archive: a, promptText: async () => secondAnswer,
-      now, ttlMs: ttl, approvalId: 'appr-tty0002',
-    }, intentId);
-    report['confirmResult'] = confirmed.status;
-    const st = a.sendApprovalState(intentId);
-    report['approvalRegistered'] = st !== null && !st.consumed;
-    report['approvalRecipient'] = st?.recipientUid ?? null;
+      const confirmed = await runInteractiveApproval({
+        archive: a, promptText: async () => 'CONFIRM',
+        now, ttlMs: ttl, approvalId: 'appr-tty0002',
+      }, intentId);
+      report['confirmResult'] = confirmed.status;
 
-    // 第 3 轮：重复批准必须被拒（无需再问人）
-    const dup = await runInteractiveApproval({
-      archive: a, promptText: async () => 'CONFIRM',
-      now, ttlMs: ttl, approvalId: 'appr-tty0003',
-    }, intentId);
-    report['duplicateResult'] = dup.status;
+      const dup = await runInteractiveApproval({
+        archive: a, promptText: async () => 'CONFIRM',
+        now, ttlMs: ttl, approvalId: 'appr-tty0003',
+      }, intentId);
+      report['duplicateResult'] = dup.status;
 
-    const pass = declined.status === 'declined' && confirmed.status === 'approved' && dup.status === 'unavailable';
-    report['verdict'] = pass ? 'pass' : 'fail';
-    exitCode = pass ? 0 : 1;
+      const pass = declined.status === 'declined' && confirmed.status === 'approved' && dup.status === 'unavailable';
+      report['verdict'] = pass ? 'pass' : 'fail';
+      exitCode = pass ? 0 : 1;
+    } else {
+      // 真实交互：只问一次。人看到完整信息后输入的结果就是最终结果。
+      const answer = await askOnce(view);
+      const first = await runInteractiveApproval({
+        archive: a, promptText: async () => answer,
+        now, ttlMs: ttl, approvalId: 'appr-tty0001',
+      }, intentId);
+      report['firstAnswer'] = answer === 'CONFIRM' ? 'CONFIRM' : 'other';
+      report['firstResult'] = first.status;
+
+      const st = a.sendApprovalState(intentId);
+      report['approvalRegistered'] = st !== null && !st.consumed;
+      report['approvalRecipient'] = st?.recipientUid ?? null;
+      report['noRecordWhenNotConfirmed'] = answer === 'CONFIRM' ? null : st === null;
+
+      // 无论第一次结果如何，再试一次批准：已批准时必须被拒
+      const dup = await runInteractiveApproval({
+        archive: a, promptText: async () => 'CONFIRM',
+        now, ttlMs: ttl, approvalId: 'appr-tty0002',
+      }, intentId);
+      report['secondAttemptResult'] = dup.status;
+
+      // 通过条件：输入 CONFIRM → approved 且已登记；非 CONFIRM → declined 且无记录。
+      // 第二次尝试必须 unavailable（一个意图至多一份审批）。
+      const confirmedPath = answer === 'CONFIRM' && first.status === 'approved' &&
+        st !== null && !st.consumed && dup.status === 'unavailable';
+      const declinedPath = answer !== 'CONFIRM' && first.status === 'declined' &&
+        st === null && dup.status === 'approved';
+      const pass = confirmedPath || declinedPath;
+      report['verdict'] = pass ? 'pass' : 'fail';
+      exitCode = pass ? 0 : 1;
+    }
   }
 } catch (e) {
   report['verdict'] = 'error';
