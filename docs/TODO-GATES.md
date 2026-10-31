@@ -1074,3 +1074,35 @@ SDK `-3` → unknown 且不可再认领；未确认非零码 → unknown；`Send
 - 令牌机制无法从类型上**证明**对象来自真实 SDK；真正的证明只能由 B1 的真实联调给出。
 
 **判定：T6-3c-real-B0 通过；B1 未授权、未开始。**
+
+### T6-3c-real-B0 补充：TTY 验收与正式库备份核对（2026-11-01）
+
+#### 1. 正式库备份（操作者执行，本机二次校验）
+
+| 项 | 值 |
+|---|---|
+| 备份路径 | `/home/duan/tmp/eve-backups/eve-prod-v2-20261031T173021664881Z.sqlite` |
+| 方式 | `sqlite3.Connection.backup`（源 `mode=ro`，正确处理 WAL） |
+| SHA-256 | `59c450cd…323bc4`（清单与实测**完全一致**） |
+| 内容 | `user_version=2`、`quick_check=ok`、messages=132、batches=26 |
+| 权限 | 目录 700、文件 600 |
+
+本机独立复核：`sha256sum` 与清单一致；只读打开确认版本/完整性/条数。**未迁移、未启动 Runner、未调用模型或 `sendMsg`。**
+
+已知局限（操作者已指出）：备份与源库在同一台机器上，不能防整盘故障；异地副本待后续。
+
+#### 2. AC-realB0.7 TTY 验收
+
+新增 `app/scripts/t6-approval-tty.ts`（`pnpm t6:approval-tty`），使用临时 v6 库，不读正式库、不接 SDK、不发送。
+
+| 场景 | 结果 |
+|---|---|
+| 管道/重定向（`isTTY:false`） | **`rejected_non_tty`** —— 已实证非 TTY 会被拒绝 |
+| `--self-test` 错误输入 | `declined`，且 `noRecordAfterDecline: true` |
+| `--self-test` 正确输入 | `approved`，`approvalRegistered: true`、接收方 `333` |
+| `--self-test` 重复批准 | `unavailable` |
+| `--self-test` 总判定 | **pass** |
+
+**仍未完成**：真实终端中由人手动输入 `CONFIRM` 的端到端交互。Claude 无法伪造 TTY，必须由操作者在自己的终端里执行一次 `pnpm t6:approval-tty`。self-test 只证明判定链正确，不证明「人看到的界面」符合预期。
+
+**判定：AC-realB0.7 部分通过（非 TTY 拒绝与判定链已实证；人工交互待操作者执行）。B1 仍未授权。**
