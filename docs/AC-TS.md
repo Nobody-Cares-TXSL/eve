@@ -213,3 +213,16 @@
 - [x] Fake T5 recorded 决策 + 同批次事件 + 当前可用 Proof → 单次 Mock 成功，返回 `mock_sent`、证据为 `mock:...`，重复调用不得产生第二次 Mock 发送。
 - [x] Mock 确定未发送 → failed；timeout / throw / ambiguous → unknown，并断言 attempt=1，不能再次 claim；返回不带原文。
 - [ ] 真实 AI 文本交接、Runner 注入的可信状态、真实 SDK adapter 与回执语义、L1 人工审核、真实平台字符限制、生产库迁移及长时间限流/断线测量均未完成。
+
+### AC-T6.3a · 可信决策正文交接（**离线实现已通过**，2026-10-31）
+
+设计文件：`docs/contracts/ai-send-handoff.md`。实现：`EveArchive.finalizeAiWithSend` + `schema-v5.sql`。证据：`app/test/send/handoff.test.ts` 19 条，全部在临时 v5 库上运行。**离线通过不等于真实发送 Gate。**
+
+- [x] AC-T6.3a.1 T5 对外的 `DryRunAudit`、`AiBackend`、`AiDecision` 及原 `durableDryRunOne` dry-run 行为保持兼容；仅新增受信的内部已验证 `AiDecision` 交接，不接受任意外部 JSON 冒充原始回复。
+- [x] AC-T6.3a.2 同一 `BEGIN IMMEDIATE` 事务提交 T5 `recorded` + T6 `pending` + `send_intent_events` + `send_text`；逐环节注入失败与进程崩溃无半状态。Policy 拒绝或 skip/defer 仅 recorded 不存正文。
+- [x] AC-T6.3a.3 原始 T5 `claimId` 必须在 DB 中已 claimed、批次完全对应、Proof Epoch 未过期/未换代；同 claim 只能创建一次意图。无可信 claim 的旧 v4 pending 不可升级成可发送。
+- [x] AC-T6.3a.4 `reply.delayMs` 生成 `not_before_ms`，写库时拒绝整数溢出及 `expiresAt<=notBefore`；早到/刚到/过期边界已测。**人工 L1 晚批准边界待 T6-3c。**
+- [x] AC-T6.3a.5 终态（sent/failed/unknown）即删除正文、过期不可读已实现并测试；**`getSendText`/`mockDispatchCandidate` 的可达性收紧待 T6-3c**（当前仍是 archive 上的公开方法）。数据库明文存储、WAL 与备份敏感性已写入契约，未做加密。
+- [x] AC-T6.3a.6 两个连接争用相同 claim/event、预算、Proof 和 pause ABA 均 fail-closed；失败不自动再次调用 Backend，不发送任何真实私信。
+- [x] AC-T6.3a.7 提供 v4→v5 显式迁移、幂等和回滚/重启测试；v2/v3/v4 历史兼容。正式库仍 v2，未经备份和独立授权不得迁移。
+- [x] AC-T6.3a.8 `pnpm typecheck`、全量单测、git diff --check 通过，并确保测试运行没有真实 Claude 调用、没有 `sendMsg`，T6-3a 成功也不等于真实发送 Gate 通过。

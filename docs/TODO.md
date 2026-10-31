@@ -78,6 +78,11 @@
 
 - [x] T6-1：定义 docs/contracts/send.md，并实现**可离线的发送意图与安全校验纵切**（`src/send/policy.ts`，12 个固定拒绝码、幂等键、频率/静默边界；不调用 SDK、不写库、不发消息）。状态机与持久化顺延到 T6-2。
 - [x] T6-1b：把 `SendIntent` 持久化到 SQLite v4（pending → dispatching → sent/failed/unknown）、错误重试分类、事务及冲突解决。11 条测试覆盖幂等、批次不可拆、原子认领、崩溃恢复、非法转换、回滚与正文保留期。
+- [x] T6-2a：SendPolicy / SQLite v4 pending 组合层、可信 IM UID、Proof Epoch 与事务内额度复核（离线）；243/243 通过。
+- [x] T6-2b：事件归属/完整批次验证、T5 recorded 来源 Mock Gate、超时/异常进入 unknown（离线）；253/253 通过。
+- [x] T6-3a：正文安全交接离线实现通过——SQLite v5（`ai_claim_id`/`not_before_ms` + 半绑定触发器）、`finalizeAiWithSend` 单事务完成 recorded+pending+正文、终态删正文；19 条测试。真实发送仍被阻断。
+- [ ] T6-3b：真实 SDK 请求构造与参数验证（不实际发送），只在完成 T6-3a 后开始。
+- [ ] T6-3c：L1 人工批准一次、单次 SDK 联调（必须另行明确授权），不自动开放 L0。
 - [ ] T6-2：pending 落盘成功后、**真正调用 SDK 前**必须持久化 dispatching；重启遗留 dispatching 保守进入 unknown，绝不盲目重发。
 - [ ] T6-3：调用 douyin-im Friend/ChatContact.sendMsg，按符合契约的服务端成功回执判 sent；不得宣称对端已显示或已读。
 - [ ] T6-4：在程序侧强制执行唯一白名单、频率/静默、消息长度、暂停、身份复核，AI 无权改写；发送前重新验一次。
@@ -109,6 +114,6 @@
 
 ## 当前下一步
 
-**R-01～R-04、T0～T4 已完成；T5 的 AI 决策引擎、持久认领与真实 Claude 生成 Gate 已通过（证据见 docs/TODO-GATES.md T5-6），但 T5 整体未标记完成——发送属 T6。下一步：T5 收尾（持续运行下的超时/限流退避与费用测量），随后进入 T6 发送链路。** 不变约束：领取消息前必须检查 `coverageStatus().usable`，不得仅凭 `sync_state=verified` 或 `eligible_events` 存在就放行。 下一次开始编程前先完成：本 Slice 的四问、Contract、可重复 AC、测试设计、理解关口。通过后才勾选，未完成任务不提前标记完成。
+**当前基线：T0～T4 已完成，T5 真实 Claude dry-run Gate 已通过；T6-1 / T6-1b / T6-2a / T6-2b 的离线 Gate 已通过。** T6-3a 只完成 Contract/AC 设计（`docs/contracts/ai-send-handoff.md`），下一步是依次实现、用临时 SQLite v5 验证原子交接及模型结果来源、审批和正文 TTL；之后才进入 T6-3b / T6-3c 的单次受控真实发送。T5 长期费用/异常恢复与正式库迁移仍为强制未完成 Gate。现在不允许真实发送、不允许自动迁移正式 v2。下次开始编程前按四问、Contract、AC、Gate 和 Understanding Gate 逐步落实。
 
 **当前最重要的边界**：SDK 已验证的是可行性，不是 Eve 整体完成；不修改上游账号凭证，不在未经准备的情况下触发真实自动发送。

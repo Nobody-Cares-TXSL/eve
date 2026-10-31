@@ -188,3 +188,9 @@ T6-1b 底层直接 `saveSendIntent` 的旧离线测试仍可省略 `expectedProo
 1. 此 Mock Dispatcher 没有接真实 Runner 的经过认证的运行态/单实例锁，也没有生产 SDK 适配器；测试通过不等于部署安全。
 2. T5 目前只持久化决策摘要，正式的模型决策正文如何安全、及时地交接 T6，且避免伪造 `recorded` 证据，仍待设计/验收；本节通过**虚构的 T5 recorded 测试账本**验证来源链，绝不反推历史正文。
 3. 生产 SDK 收发的回执 ID 语义、发送前权限复核与中途断线、超时是否实际送达、平台字符计数（UTF-16 与平台差异）、人工 L1 许可、正式 SQLite v2→v4 备份迁移及 UNKNOWN 人工核实均未完成。不得直接复制 `MockSendPort` 的成功判定到真实 SDK。
+
+## 11. T6-3a 正文交接设计入口（2026-10-31）
+
+已建立独立契约 `docs/contracts/ai-send-handoff.md`，并完成**离线实现**（`finalizeAiWithSend` + `schema-v5.sql`，19 条测试）。推荐 T5 不新建正文表；由受信 Engine 在**一次 SQLite 写事务**中把已验证回复的 T5 `recorded` 审计与 T6 `pending` 意图、完整事件组和 `send_text` 一起提交。对 `skip/defer` 或 T6 拒绝只记录 T5 审计，不落回复正文。旧 `durableDryRunOne` 仍只返回脱敏审计，不擅自改变已冻结的 T5 公共契约。
+
+本设计要求独立 SQLite v5 显式迁移：绑定 `ai_claim_id`（原始 T5 claim）和 `not_before_ms`（真实兑现 reply.delayMs），不修改已有 v4 Schema；发送正文默认短期保留 15 分钟、最长 60 分钟，且必须在最早发送时刻后仍未到期。未来分发需有真实 Runner/单实例锁、Proof、L1 人工确认和真实 SDK Gate；本合同**不提供**真实发送权限。

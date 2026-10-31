@@ -131,3 +131,9 @@ T5 核心能力已通过端到端证据，接口在此冻结。**冻结不等于
 - **长期异常恢复**：持续运行下的超时、限流、网络抖动的退避策略未做长期验证。
 - **正式 SQLite v3 迁移**：正式库仍为 v2；v3 迁移只在临时库验证过，未备份迁移到正式库。
 - **真实发送**：0 次。T5 全程 dry-run。
+
+## T6-3a 合同扩展：T5 → T6 正文交接（2026-10-31，**离线已实现**）
+
+**已实现为 `EveArchive.finalizeAiWithSend`（v5）。T5 公共 API 未改动。** 详见 `docs/contracts/ai-send-handoff.md`。保留 `AiBackend`、`AiDecision`、`validateDecision`、`DryRunAudit` 和既有 `durableDryRunOne` 的已验收语义：审计不会回传/持久化回复正文。
+
+后续如启用独立的受信 Runner 发送模式，应在 Engine 的**内部**保留一次已验证的 `AiDecision`，通过新的联合事务入口原子终结 T5 claim 与创建可选 T6 pending；`skip/defer` 与拒发不存正文，事务失败不允许重跑模型。实施之前必须同步更新本文件、T6 send 契约、AC、Gate 并提供新旧路径回归证据。未验收前，T5 仍严格执行 dry-run-only。

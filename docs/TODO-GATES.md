@@ -882,3 +882,44 @@ T5 的 AI 决策模块进入**功能冻结**：接口不再随意改动（清单
 - 正式 `data/eve.sqlite` 只读证明：`user_version=2`、`quick_check=ok`、`messages=132`；Runner `phase=stopped,alive=false`；`app/src` 无真实 `sendMsg(` 调用。
 - 工作区变动未提交，HEAD 保持 `3d8a811`。没有真实 Claude 调用、没有真实私信发送、没有正式库迁移。
 - 本阶段模拟 T5 recorded 数据和 `MockSendPort` 只证明**离线**决策与状态机闭环。尚未证明真实模型正文交接、真实 SDK 回执真实性、平台长度、人工授权、真实运行时断线/暂停和单实例串行化；任何 mock 的 `sent` 不等于抖音平台已收到信息。
+
+### T6-3a · 2026-10-31 契约设计记录（实现 Gate 未通过）
+
+- Remote Desktop Commander 在线，核查 HEAD `4ad6acf`，工作区开始时干净。T6-2b 253/253 离线 Mock Gate 是已交付证据；T6-3a 此轮没有新增代码或模型调用。
+- 阅读 `app/src/ai/engine.ts`：`evaluateCandidate()` 将已验证 `AiDecision` 转为纯 `DryRunAudit`，`durableDryRunOne()` 经 `finishAiDryRun()` 单独事务只写摘要；没有 T6 发送正文交接。阅读 `app/src/archive/store.ts`：`saveSendIntent()` 同样独立使用另一个事务。**现有两段接口不能假称原子。**
+- 已拟定新文档 `docs/contracts/ai-send-handoff.md`：内部受信 T5 决策经新联合写事务，按 T6 Policy 决定是否原子创建 pending 和一条受限正文；旧 T5 dry-run 行为保留；需要 v5 扩展 `ai_claim_id` 与 `not_before_ms`，不直接改 v4；默认正文 TTL 15 分钟、最长 60 分钟（实施前可按安全评审调校）；`reply.delayMs` 必须实际执行。
+- 2026-10-31 **只完成 Contract + AC + 后续 Gate 设计**，不宣称 T6-3a 的功能测试/原子写入已实现。实际方案仍需先实现、离线故障注入和独立审查；Runner 真实正文来源、L1 人工许可、SDK 适配、回执/长度核验、生产备份迁移均未授权。
+
+### T6-3a 决策正文安全交接：离线实现（2026-10-31）
+
+**范围**：SQLite v5 + 受信内部交接。不接平台、不调用 `sendMsg`、不迁移正式库、不调用模型。
+
+#### 实现
+
+- `schema-v5.sql`：`send_intents` 增加 `ai_claim_id`（REFERENCES `ai_decision_attempts`，唯一索引）与 `not_before_ms`；触发器 `trg_send_intents_handoff_binding` 拒绝「只有来源没有延迟」或「只有延迟没有来源」的半绑定。
+- `EveArchive.upgradeToV5()`：显式、事务、幂等，要求 v4；故障注入可回滚。
+- `EveArchive.finalizeAiWithSend()`：单一 `BEGIN IMMEDIATE` 内完成 T5 `recorded` + 可选 T6 `pending` + `send_text` + `send_intent_events`。所有输入以数据库为准，不接受调用方提供的 eventIds/摘要/recorded 状态。
+- `claimSendIntent` 在 v5 起增加 `not_before_ms` 条件——`delayMs` 不再只停留在决策里。
+- `settleSendIntent` 进入终态后立即删除 `send_text`。
+
+#### 修复的回归
+
+`requireV2()` 在 T6-2a 被放宽到 `2..4`，引入 v5 后再次挡住 T4 对账（`reconcile_requires_v2`）。现抽出 `MAX_SCHEMA_VERSION=5` 常量，版本区间判断统一引用，避免每次加版本都漏改。
+
+#### 测试（19 条，临时 v5 库 + 真实 reconcile 夹具）
+
+同事务成功、skip/defer 不落正文、策略拒绝仍记 recorded、事务中途失败全回滚且 claim 保持 claimed、同 claim 重放不重复、skip 后重放 `already_finalized`、Proof 换代拒绝、`delayMs` 早到/刚到边界、延迟超保留期拒绝、正文到期不可读、v4 库拒绝交接、身份不符、返回值不含正文、终态删正文、v5 迁移幂等与版本对齐、半绑定被触发器拒绝、两连接争用同一 claim、v5 迁移故障注入回滚。
+
+#### 验证
+
+- `pnpm typecheck` 0 错；`pnpm test` **272/272**（253 + 19）。
+- 正式库仍 v2/`quick_check=ok`；`src` 无真实 `sendMsg`；本轮模型请求 0 次。
+
+#### 仍未完成（不得视为可发送）
+
+- `getSendText` / `mockDispatchCandidate` 仍是 archive 上的公开方法，**正文可达性未收紧**；真实阶段必须限制在受信发送控制器内。
+- 未接 Runner：`finalizeAiWithSend` 目前只被测试调用，生产路径尚未串起来。
+- 未接平台 SDK、无 L1 人工批准、无真实回执语义、平台字数口径未对齐、正式库未迁移。
+- SQLite 明文存储正文；WAL 与备份的保留/加密策略未定。
+
+**判定：T6-3a 离线正文交接 Gate 通过；真实发送 Gate 仍未开始。**
