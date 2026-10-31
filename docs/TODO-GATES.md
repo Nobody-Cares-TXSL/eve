@@ -1122,3 +1122,34 @@ SDK `-3` → unknown 且不可再认领；未确认非零码 → unknown；`Send
 修复后 self-test 复跑：`declined` + 零记录 → `approved` → 重复批准 `unavailable`，总判定 pass；非 TTY 复跑仍为 `rejected_non_tty`。
 
 **仍需操作者执行**：在真实终端里跑一次 `pnpm t6:approval-tty`，确认屏幕上确实完整显示了接收方与正文，并按提示输入两次。self-test 证明判定链正确，但证明不了「人看到的界面」。
+
+#### 4. AC-realB0.7 完成：真实 TTY 端到端（操作者执行）
+
+操作者在真实终端执行 `pnpm t6:approval-tty`，结果：
+
+```json
+{
+  "mode": "interactive", "isTTY": true,
+  "firstAnswer": "CONFIRM", "firstResult": "approved",
+  "approvalRegistered": true, "approvalRecipient": "333",
+  "secondAttemptResult": "unavailable", "verdict": "pass"
+}
+```
+
+屏幕实测显示：接收方 UID、意图 ID、正文摘要、**完整待发正文**（含边框）、最早发送时间与审批有效期。
+
+这一项验证了单测抓不到的东西——**真人看到的界面是否符合预期**。此前两次脚本缺陷（空提示盲输、判定写死「第一轮必输错」）都只有真实交互能暴露。
+
+**AC-realB0.7 关闭。** B0 至此全部通过。
+
+#### 5. B0 阶段总结
+
+| Gate | 状态 |
+|---|---|
+| 审批必须为人动作（TTY、完整展示、精确 CONFIRM） | ✅ 含真实终端验收 |
+| 摘要重算校验（防账本整体改写） | ✅ |
+| 一个意图至多一份审批 | ✅ 真实终端二次尝试被拒 |
+| 可信出口令牌（仅 Port 内部登记） | ✅ 离线 3 条测试 |
+| 非 TTY 拒绝 | ✅ 管道实测 |
+
+**B1 仍未授权。** 前置条件不变：正式库备份（已就绪）→ v2→v6 迁移 → 操作者指定接收方与内容 → 单次 `sendMsg`。

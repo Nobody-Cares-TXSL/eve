@@ -277,5 +277,5 @@
 - [x] AC-realB0.4 发送能力必须来自 Port 内部登记的出口；外部构造的 `{ sendText }` → `untrusted_transport`，传输层零调用。
 - [x] AC-realB0.5 出口绑定的 `conversationId`/`recipientUid` 必须与意图和审批一致。
 - [x] AC-realB0.6 出口撤销后立即不可用。
-- [x] AC-realB0.7 TTY 检测已实证：管道/重定向下 `isTTY:false` → `rejected_non_tty`（`pnpm t6:approval-tty` 实测）。`--self-test` 全链通过（错误输入 declined 且零记录、正确输入 approved、重复批准 unavailable）。**真实终端的人工交互仍待操作者亲手执行一次**（Claude 无法伪造 TTY）。
+- [x] AC-realB0.7 TTY 端到端已由操作者在真实终端完成（2026-11-01）：`isTTY:true`、屏幕完整显示接收方 `333` 与完整正文、输入 `CONFIRM` → `approved` 且 `approvalRegistered:true`、第二次尝试 `unavailable`、`verdict:pass`。非 TTY（管道）实测 `rejected_non_tty`；`--self-test` 覆盖「先错后对」路径。
 - [ ] AC-realB0.8 **B1**：真实 SDK 出口绑定、正式库备份迁移、单次 `sendMsg` 验收——需单独授权，未开始。
