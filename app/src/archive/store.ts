@@ -220,7 +220,7 @@ export class EveArchive {
 
  /** 终态码封闭集合：不接受任意字符串，避免审计里出现不可解释的状态。 */
  /** 明确「未发送」的失败原因 —— 只有这些才能进 failed。 */
- static readonly SEND_FAILURE_CODES=['rejected_before_dispatch','identity_changed','content_rejected','budget_blocked'] as const;
+ static readonly SEND_FAILURE_CODES=['rejected_before_dispatch','identity_changed','content_rejected','budget_blocked','platform_rejected','risk_controlled'] as const;
  /** 结果不确定（超时、断线、崩溃）只允许 unknown。 */
  static readonly SEND_UNKNOWN_CODES=['timeout','interrupted','ambiguous_result','transport_error'] as const;
 
@@ -502,6 +502,39 @@ export class EveArchive {
    }
    return {status:'blocked',reasonCode:'storage_unavailable'};
   }
+ }
+
+ /**
+  * T6-3c：发送执行前读取可信账本绑定。
+  * 调用方不得自带会话/事件/摘要——一律以本方法返回的数据库事实为准。
+  */
+ sendDispatchBinding(intentId:string):{
+  conversationId:string;sourceEventId:string;status:string;attempt:number;
+  aiClaimId:string|null;notBeforeMs:number|null;decisionDigest:string;
+  expiresAtMs:number|null;text:string|null;eventIds:readonly string[];
+  claimState:string|null;claimProofEpoch:string|null;claimDecisionDigest:string|null;claimReplyLength:number|null;
+ }|null{
+  this.requireV5();
+  const row=this.db.prepare(
+   'SELECT i.conversation_id,i.source_event_id,i.status,i.attempt,i.ai_claim_id,i.not_before_ms,'+
+   'i.decision_digest,t.body,t.expires_at_ms FROM send_intents i '+
+   'LEFT JOIN send_text t ON t.intent_id=i.intent_id WHERE i.intent_id=?'
+  ).get(intentId) as {conversation_id:string;source_event_id:string;status:string;attempt:number;
+   ai_claim_id:string|null;not_before_ms:number|null;decision_digest:string;
+   body:string|null;expires_at_ms:number|null}|undefined;
+  if(!row)return null;
+  const claim=row.ai_claim_id===null?undefined:this.db.prepare(
+   'SELECT state,proof_epoch_id,decision_digest,reply_length FROM ai_decision_attempts WHERE claim_id=?'
+  ).get(row.ai_claim_id) as {state:string;proof_epoch_id:string;decision_digest:string|null;reply_length:number|null}|undefined;
+  return {
+   conversationId:row.conversation_id,sourceEventId:row.source_event_id,
+   status:row.status,attempt:row.attempt,aiClaimId:row.ai_claim_id,
+   notBeforeMs:row.not_before_ms,decisionDigest:row.decision_digest,
+   expiresAtMs:row.expires_at_ms,text:row.body,
+   eventIds:this.sendIntentEvents(intentId),
+   claimState:claim?.state??null,claimProofEpoch:claim?.proof_epoch_id??null,
+   claimDecisionDigest:claim?.decision_digest??null,claimReplyLength:claim?.reply_length??null,
+  };
  }
 
  /**
