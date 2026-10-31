@@ -14,6 +14,7 @@ import { EveArchive } from '../../src/archive/store.ts';
 import { MockPlatformPort } from '../../src/platform/mock.ts';
 import { reconcileOnce } from '../../src/runtime/reconcile.ts';
 import type { InboundMessage } from '../../src/platform/types.ts';
+import { issueTrustedSendPort, revokeTrustedSendPort } from '../../src/platform/outbound-transport.ts';
 import {
   classifySendResponse, dispatchOnce, proofStillValid, responseFromError,
   type DispatchInput, type SendResponseLike, type SendTransport,
@@ -109,8 +110,14 @@ async function withPendingIntent(
 }
 
 const transport = (r: SendResponseLike | (() => Promise<SendResponseLike>)): SendTransport & { calls: number } => {
-  const t = { calls: 0, async sendText() { t.calls++; return typeof r === 'function' ? r() : r; } };
-  return t;
+  const t = {
+    calls: 0,
+    conversationId: THREAD,
+    recipientUid: '333',
+    async sendText() { t.calls++; return typeof r === 'function' ? r() : r; },
+  };
+  // 测试扮演「Port 内部」：显式登记为可信出口
+  return issueTrustedSendPort(t);
 };
 
 const base = (c: Ctx, over: Partial<DispatchInput> = {}): DispatchInput => ({
@@ -118,10 +125,16 @@ const base = (c: Ctx, over: Partial<DispatchInput> = {}): DispatchInput => ({
   expected: { ownerUid: '111', ownImUid: '222', targetUid: '333', conversationId: THREAD },
   live: liveRefs({ kind: 'friend' }),
   transport: transport({ statusCode: 0, serverMessageId: '7701260499833538097' }),
+  trustedPort: undefined as unknown,
   approvalId: APPROVAL,
   nowMs: c.now, coverageMaxAgeMs: 90_000, maxTextLength: 500, timeoutMs: 1_000,
   ...over,
 });
+
+/** 让 trustedPort 默认跟随 transport，除非用例显式覆盖。 */
+function withTrusted(input: DispatchInput): DispatchInput {
+  return { ...input, trustedPort: input.trustedPort ?? input.transport };
+}
 
 const state = (file: string, intentId: string) => {
   const db = new DatabaseSync(file, { readOnly: true });
@@ -159,7 +172,7 @@ test('responseFromError 结构化提取，异常也可分类', () => {
 
 test('正常回执 → sent，证据为服务端 ID，正文删除、审批已消费', () => withPendingIntent(async (c) => {
   const t = transport({ statusCode: 0, serverMessageId: '7701260499833538097' });
-  const r = await dispatchOnce(c.a, base(c, { transport: t }));
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { transport: t })));
   assert.deepEqual(r, { status: 'sent', intentId: c.intentId, evidence: '7701260499833538097' });
   assert.equal(t.calls, 1);
   const s = state(c.file, c.intentId);
@@ -170,7 +183,7 @@ test('正常回执 → sent，证据为服务端 ID，正文删除、审批已�
 }));
 
 test('SDK -3 → unknown，绝不判 failed', () => withPendingIntent(async (c) => {
-  const r = await dispatchOnce(c.a, base(c, { transport: transport({ statusCode: -3 }) }));
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { transport: transport({ statusCode: -3 }) })));
   assert.deepEqual(r, { status: 'unknown', intentId: c.intentId, reasonCode: 'ambiguous_result' });
   assert.equal(state(c.file, c.intentId).status, 'unknown');
 }));
@@ -178,37 +191,37 @@ test('SDK -3 → unknown，绝不判 failed', () => withPendingIntent(async (c) 
 test('SendMessageError.response 8610 → failed/risk_controlled', () => withPendingIntent(async (c) => {
   const err = transport(() => Promise.reject(Object.assign(new Error('send failed'), {
     response: { statusCode: 0, checkCode: 8610 } })));
-  const r = await dispatchOnce(c.a, base(c, { transport: err }));
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { transport: err })));
   assert.deepEqual(r, { status: 'failed', intentId: c.intentId, reasonCode: 'risk_controlled' });
 }));
 
 test('异常 response 为 -3 → unknown', () => withPendingIntent(async (c) => {
   const t = transport(() => Promise.reject(Object.assign(new Error('x'), { response: { statusCode: -3 } })));
-  const r = await dispatchOnce(c.a, base(c, { transport: t }));
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { transport: t })));
   assert.deepEqual(r, { status: 'unknown', intentId: c.intentId, reasonCode: 'ambiguous_result' });
 }));
 
 test('异常携带成功 response 仍判 unknown', () => withPendingIntent(async (c) => {
   const t = transport(() => Promise.reject(Object.assign(new Error('odd'), {
     response: { statusCode: 0, serverMessageId: '7701260499833538097' } })));
-  const r = await dispatchOnce(c.a, base(c, { transport: t }));
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { transport: t })));
   assert.equal(r.status, 'unknown');
 }));
 
 test('超时 → unknown/timeout', () => withPendingIntent(async (c) => {
   const hang = transport(() => new Promise<SendResponseLike>(() => undefined));
-  const r = await dispatchOnce(c.a, base(c, { transport: hang, timeoutMs: 50 }));
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { transport: hang, timeoutMs: 50 })));
   assert.deepEqual(r, { status: 'unknown', intentId: c.intentId, reasonCode: 'timeout' });
 }));
 
 test('传输无结构化异常 → unknown/transport_error', () => withPendingIntent(async (c) => {
-  const r = await dispatchOnce(c.a, base(c, { transport: transport(() => Promise.reject(new Error('boom'))) }));
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { transport: transport(() => Promise.reject(new Error('boom'))) })));
   assert.deepEqual(r, { status: 'unknown', intentId: c.intentId, reasonCode: 'transport_error' });
 }));
 
 test('审批未在 v6 登记 → rejected，零副作用', () => withPendingIntent(async (c) => {
   const t = transport({ statusCode: 0, serverMessageId: '1' });
-  const r = await dispatchOnce(c.a, base(c, { transport: t }));
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { transport: t })));
   assert.deepEqual(r, { status: 'rejected', reasonCode: 'approval_missing' });
   assert.equal(t.calls, 0);
   assert.equal(state(c.file, c.intentId).status, 'pending');
@@ -216,10 +229,10 @@ test('审批未在 v6 登记 → rejected，零副作用', () => withPendingInte
 
 test('审批只能消费一次：第二次调用被拒且零调用', () => withPendingIntent(async (c) => {
   const t1 = transport({ statusCode: 0, serverMessageId: '7701260499833538097' });
-  const first = await dispatchOnce(c.a, base(c, { transport: t1 }));
+  const first = await dispatchOnce(c.a, withTrusted(base(c, { transport: t1 })));
   assert.equal(first.status, 'sent');
   const t2 = transport({ statusCode: 0, serverMessageId: '7701260499833538098' });
-  const second = await dispatchOnce(c.a, base(c, { transport: t2 }));
+  const second = await dispatchOnce(c.a, withTrusted(base(c, { transport: t2 })));
   assert.equal(second.status, 'rejected');
   assert.equal(t2.calls, 0);
   assert.equal(state(c.file, c.intentId).approvalConsumed, true);
@@ -227,14 +240,14 @@ test('审批只能消费一次：第二次调用被拒且零调用', () => withP
 
 test('审批 approvalId 不符 → rejected approval_binding_mismatch', () => withPendingIntent(async (c) => {
   const t = transport({ statusCode: 0, serverMessageId: '1' });
-  const r = await dispatchOnce(c.a, base(c, { approvalId: 'appr-other999', transport: t }));
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { approvalId: 'appr-other999', transport: t })));
   assert.deepEqual(r, { status: 'rejected', reasonCode: 'approval_binding_mismatch' });
   assert.equal(t.calls, 0);
 }));
 
 test('审批过期 → rejected approval_expired', () => withPendingIntent(async (c) => {
   const t = transport({ statusCode: 0, serverMessageId: '1' });
-  const r = await dispatchOnce(c.a, base(c, { nowMs: c.now + 400_000, transport: t }));
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { nowMs: c.now + 400_000, transport: t })));
   assert.deepEqual(r, { status: 'rejected', reasonCode: 'approval_expired' });
   assert.equal(t.calls, 0);
 }));
@@ -252,7 +265,7 @@ test('会话必须来自活实例：伪造/漂移一律拒绝', () => withPendin
     ['foreign_conversation', liveRefs({ kind: 'friend', threadId: '0:1:222:444' })],
   ];
   for (const [code, live] of cases) {
-    const r = await dispatchOnce(c.a, base(c, { live, transport: t }));
+    const r = await dispatchOnce(c.a, withTrusted(base(c, { live, transport: t })));
     assert.deepEqual(r, { status: 'rejected', reasonCode: code });
   }
   assert.equal(t.calls, 0);
@@ -261,7 +274,7 @@ test('会话必须来自活实例：伪造/漂移一律拒绝', () => withPendin
 
 test('陌生人联系人同样可发送', () => withPendingIntent(async (c) => {
   const t = transport({ statusCode: 0, serverMessageId: '7701260499833538097' });
-  const r = await dispatchOnce(c.a, base(c, { live: liveRefs({ kind: 'stranger' }), transport: t }));
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { live: liveRefs({ kind: 'stranger' }), transport: t })));
   assert.equal(r.status, 'sent');
 }));
 
@@ -272,7 +285,7 @@ test('正文等长篡改 → rejected content_digest_mismatch，传输层零调�
   try { db.prepare('UPDATE send_text SET body=? WHERE intent_id=?').run(tampered, c.intentId); }
   finally { db.close(); }
   const t = transport({ statusCode: 0, serverMessageId: '1' });
-  const r = await dispatchOnce(c.a, base(c, { transport: t }));
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { transport: t })));
   assert.deepEqual(r, { status: 'rejected', reasonCode: 'content_digest_mismatch' });
   assert.equal(t.calls, 0);
   assert.equal(state(c.file, c.intentId).status, 'pending');
@@ -280,7 +293,7 @@ test('正文等长篡改 → rejected content_digest_mismatch，传输层零调�
 
 test('Proof 换代 → rejected proof_changed，传输层零调用', () => withPendingIntent(async (c) => {
   const t = transport({ statusCode: 0, serverMessageId: '1' });
-  const r = await dispatchOnce(c.a, base(c, { nowMs: c.now + 5_000, coverageMaxAgeMs: 1, transport: t }));
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { nowMs: c.now + 5_000, coverageMaxAgeMs: 1, transport: t })));
   assert.deepEqual(r, { status: 'rejected', reasonCode: 'proof_changed' });
   assert.equal(t.calls, 0);
 }));
@@ -295,7 +308,7 @@ test('proofStillValid 三态', () => withPendingIntent((c) => {
 
 test('v5 库无审批表 → approval_missing（fail closed）', () => withPendingIntent(async (c) => {
   const t = transport({ statusCode: 0, serverMessageId: '1' });
-  const r = await dispatchOnce(c.a, base(c, { transport: t }));
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { transport: t })));
   assert.deepEqual(r, { status: 'rejected', reasonCode: 'approval_missing' });
   assert.equal(t.calls, 0);
 }, { version: 5 }));
@@ -303,8 +316,40 @@ test('v5 库无审批表 → approval_missing（fail closed）', () => withPendi
 test('未到 not_before → rejected not_due', () => withPendingIntent(async (c) => {
   const b = c.a.sendDispatchBinding(c.intentId);
   assert.ok(b && b.notBeforeMs !== null);
-  const r = await dispatchOnce(c.a, base(c, { nowMs: b.notBeforeMs - 1 }));
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { nowMs: b.notBeforeMs - 1 })));
   assert.deepEqual(r, { status: 'rejected', reasonCode: 'not_due' });
+}));
+
+test('未登记的出口一律拒绝：外部构造 { sendText } 拿不到发送能力', () => withPendingIntent(async (c) => {
+  // 结构与 SendTransport 完全相同，但没有 Port 令牌
+  const forged = { conversationId: THREAD, recipientUid: '333',
+    calls: 0, async sendText() { forged.calls++; return { statusCode: 0, serverMessageId: '1' }; } };
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { transport: forged, trustedPort: forged })));
+  assert.deepEqual(r, { status: 'rejected', reasonCode: 'untrusted_transport' });
+  assert.equal(forged.calls, 0, '伪造出口绝不能收到消息');
+  assert.equal(state(c.file, c.intentId).status, 'pending');
+}));
+
+test('出口绑定的会话/收件人与意图不符 → untrusted_transport', () => withPendingIntent(async (c) => {
+  const wrongThread = issueTrustedSendPort({ conversationId: '0:1:222:444', recipientUid: '333',
+    calls: 0, async sendText() { wrongThread.calls++; return { statusCode: 0, serverMessageId: '1' }; } });
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { transport: wrongThread, trustedPort: wrongThread })));
+  assert.deepEqual(r, { status: 'rejected', reasonCode: 'untrusted_transport' });
+  assert.equal(wrongThread.calls, 0);
+
+  const wrongRecipient = issueTrustedSendPort({ conversationId: THREAD, recipientUid: '444',
+    calls: 0, async sendText() { wrongRecipient.calls++; return { statusCode: 0, serverMessageId: '1' }; } });
+  const r2 = await dispatchOnce(c.a, withTrusted(base(c, { transport: wrongRecipient, trustedPort: wrongRecipient })));
+  assert.deepEqual(r2, { status: 'rejected', reasonCode: 'untrusted_transport' });
+  assert.equal(wrongRecipient.calls, 0);
+}));
+
+test('出口被撤销后不可再用', () => withPendingIntent(async (c) => {
+  const t = transport({ statusCode: 0, serverMessageId: '1' });
+  revokeTrustedSendPort(t);
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { transport: t, trustedPort: t })));
+  assert.deepEqual(r, { status: 'rejected', reasonCode: 'untrusted_transport' });
+  assert.equal(t.calls, 0);
 }));
 
 test('dispatch.ts 无运行时 SDK 依赖、无 sendMsg', () => {

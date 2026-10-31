@@ -12,6 +12,7 @@
 import { createHash } from 'node:crypto';
 import type { EveArchive } from '../archive/store.ts';
 import { prepareSdkTextDraft, type TextDraftReject } from '../platform/outbound-request.ts';
+import { assertTrustedSendPort } from '../platform/outbound-transport.ts';
 import {
   deriveSendSession, sessionStillLive,
   type LiveAccountRef, type LiveClientRef, type LiveContactRef, type SessionExpectation,
@@ -25,9 +26,16 @@ export interface SendResponseLike {
   readonly checkCode?: number;
 }
 
-/** 由适配器绑定到「已验证联系人」的发送通道。测试注入 fake。 */
+/**
+ * 发送通道。**只有**由 DouyinReadOnlyPort 内部绑定真实 SDK 联系人、
+ * 并经过 issueTrustedSendPort 登记的出口才会被 dispatchOnce 接受；
+ * 外部构造的任意 { sendText } 对象一律拒绝。
+ * 测试可用 issueTrustedSendPort 显式登记 fake（测试即「内部」）。
+ */
 export interface SendTransport {
   sendText(message: string): Promise<SendResponseLike>;
+  readonly conversationId?: string;
+  readonly recipientUid?: string;
 }
 
 export interface DispatchLiveRefs {
@@ -64,7 +72,8 @@ export type DispatchReject =
   | 'approval_expired'
   | 'approval_binding_mismatch'
   | 'session_changed'
-  | 'receipt_unusable';
+  | 'receipt_unusable'
+  | 'untrusted_transport';
 
 export type DispatchResult =
   | { readonly status: 'sent'; readonly intentId: string; readonly evidence: string }
@@ -77,6 +86,8 @@ export interface DispatchInput {
   readonly expected: SessionExpectation;
   readonly live: DispatchLiveRefs;
   readonly transport: SendTransport;
+  /** 只有持有 Port 令牌的出口才能通过；见 outbound-transport.ts。 */
+  readonly trustedPort?: unknown;
   readonly approvalId: string;
   readonly nowMs: number;
   readonly coverageMaxAgeMs: number;
@@ -154,6 +165,12 @@ export async function dispatchOnce(archive: EveArchive, input: DispatchInput): P
       !/^[A-Za-z0-9_-]{8,64}$/.test(input.approvalId) ||
       !input.live || !input.transport || typeof input.transport.sendText !== 'function')
     return rejected('invalid_input');
+  // 发送能力必须来自 Port 内部绑定的出口，不能由调用方随意构造
+  if (!assertTrustedSendPort(input.trustedPort)) return rejected('untrusted_transport');
+  const port = input.trustedPort;
+  if (port.conversationId !== input.expected.conversationId ||
+      port.recipientUid !== input.expected.targetUid)
+    return rejected('untrusted_transport');
 
   // 1. 账本为准
   const b = archive.sendDispatchBinding(input.intentId);
