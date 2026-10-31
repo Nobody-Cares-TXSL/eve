@@ -149,6 +149,37 @@ export class EveArchive {
    throw new ArchiveError('send_requires_v4');
  }
 
+ /**
+  * T6-2 offline composition only. Read authoritative send reservations.
+  * 'unknown' consumes quota, because it might have reached the platform.
+  * 'pending'/'dispatching' also consume quota conservatively; failed means
+  * proven not sent. This is reservation time, not the SDK receipt time.
+  */
+ sendPolicySnapshot(conversationId:string,now:number):{
+  priorIntents:readonly {conversationId:string;sourceEventId:string}[];
+  recentSends:readonly number[];
+ }{
+  this.requireV4();
+  if(!this.validThread(conversationId)||!Number.isSafeInteger(now))
+   throw new ArchiveError('send_snapshot_rejected');
+  const entries=this.db.prepare(
+   'SELECT source_event_id,status,created_at_ms FROM send_intents WHERE conversation_id=?'
+  ).all(conversationId) as {source_event_id:string;status:string;created_at_ms:number}[];
+  if(entries.some(x=>x.created_at_ms>now))throw new ArchiveError('send_clock_rollback');
+  return {
+   priorIntents:entries.map(x=>({conversationId,sourceEventId:x.source_event_id})),
+   recentSends:entries.filter(x=>x.status!=='failed'&&now-x.created_at_ms<86_400_000)
+    .map(x=>x.created_at_ms),
+  };
+ }
+ /** Explicit identity match to authenticated account + IM UID; never infer from thread text. */
+ matchSendIdentity(input:{ownerUid:string;targetUid:string;ownImUid?:string}):boolean{
+  this.requireV4();
+  return input.ownerUid===this.identity.ownerUid&&
+   input.targetUid===this.identity.targetUid&&
+   (input.ownImUid===undefined||this.identity.ownUids.includes(input.ownImUid));
+ }
+
  /** 终态码封闭集合：不接受任意字符串，避免审计里出现不可解释的状态。 */
  /** 明确「未发送」的失败原因 —— 只有这些才能进 failed。 */
  static readonly SEND_FAILURE_CODES=['rejected_before_dispatch','identity_changed','content_rejected','budget_blocked'] as const;
@@ -169,6 +200,8 @@ export class EveArchive {
   intentId:string;conversationId:string;sourceEventId:string;text:string;
   textDigest:string;decisionDigest:string;eventIds:readonly string[];
   now:number;retentionMs:number;failAtEvent?:number;
+  expectedProofEpoch?:string;proofMaxAgeMs?:number;
+  ratePolicy?:{minIntervalMs:number;maxPerHour:number;maxPerDay:number};
  }):{created:boolean;intentId:string;existingStatus?:string;conflict?:'duplicate_intent'|'duplicate_event'}{
   this.requireV4();
   if(!input.intentId||!input.conversationId||!input.sourceEventId||
@@ -178,6 +211,13 @@ export class EveArchive {
    throw new ArchiveError('rejected');
   this.db.exec('BEGIN IMMEDIATE');
   try{
+   // The offline composition gate may provide a proof epoch. Recheck while
+   // holding the same write transaction that creates the intent to close the
+   // evaluate→persist proof-rotation race.
+   if(input.expectedProofEpoch!==undefined&&
+      (!input.proofMaxAgeMs||
+       this.coverageEpoch(input.conversationId,input.proofMaxAgeMs)!==input.expectedProofEpoch))
+    throw new ArchiveError('send_coverage_changed');
    const prior=this.db.prepare('SELECT intent_id,status FROM send_intents WHERE intent_id=? OR (conversation_id=? AND source_event_id=?)')
     .get(input.intentId,input.conversationId,input.sourceEventId) as {intent_id:string;status:string}|undefined;
    if(prior){this.db.exec('COMMIT');return {created:false,intentId:prior.intent_id,existingStatus:prior.status,conflict:'duplicate_intent'};}
@@ -185,6 +225,24 @@ export class EveArchive {
     const taken=this.db.prepare('SELECT intent_id FROM send_intent_events WHERE conversation_id=? AND server_message_id=?')
      .get(input.conversationId,id) as {intent_id:string}|undefined;
     if(taken){this.db.exec('COMMIT');return {created:false,intentId:taken.intent_id,conflict:'duplicate_event'};}
+   }
+   if(input.ratePolicy){
+    const p=input.ratePolicy;
+    if(!Number.isSafeInteger(p.minIntervalMs)||p.minIntervalMs<0||
+       !Number.isSafeInteger(p.maxPerHour)||p.maxPerHour<1||
+       !Number.isSafeInteger(p.maxPerDay)||p.maxPerDay<1)
+     throw new ArchiveError('invalid_send_rate_policy');
+    // Recheck while BEGIN IMMEDIATE is held; a second worker cannot slip
+    // through based on a stale read of the previous policy snapshot.
+    const records=this.db.prepare(
+     "SELECT created_at_ms FROM send_intents WHERE conversation_id=? AND status IN ('pending','dispatching','sent','unknown')"
+    ).all(input.conversationId) as {created_at_ms:number}[];
+    if(records.some(x=>x.created_at_ms>input.now))throw new ArchiveError('send_clock_rollback');
+    if(records.some(x=>input.now-x.created_at_ms<p.minIntervalMs))
+     throw new ArchiveError('send_min_interval');
+    if(records.filter(x=>input.now-x.created_at_ms<3_600_000).length>=p.maxPerHour||
+       records.filter(x=>input.now-x.created_at_ms<86_400_000).length>=p.maxPerDay)
+     throw new ArchiveError('send_rate_limited');
    }
    this.db.prepare('INSERT INTO send_intents(intent_id,conversation_id,source_event_id,text_digest,decision_digest,status,attempt,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,0,?,?)')
     .run(input.intentId,input.conversationId,input.sourceEventId,input.textDigest,input.decisionDigest,'pending',input.now,input.now);
@@ -341,7 +399,7 @@ export class EveArchive {
   private requireV2():void{
     this.check();
     const version=(this.db.prepare('PRAGMA user_version').get() as {user_version:number}).user_version;
-    if(version!==2&&version!==3)throw new ArchiveError('reconcile_requires_v2');
+    if(version<2||version>4)throw new ArchiveError('reconcile_requires_v2');
   }
   private validThread(thread:string):boolean {
     const p=thread.split(':'), own=new Set(this.identity.ownUids);

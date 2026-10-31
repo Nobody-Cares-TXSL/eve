@@ -179,3 +179,21 @@ test('拒绝结果不携带正文，也不产生意图', () => {
   assert.equal(serialized.includes('这段正文'), false, '拒绝结果不得包含正文');
   assert.equal('intent' in r, false, '拒绝时不得返回意图');
 });
+
+
+test('T6-2: authenticated own IM UID is accepted, forged or target-overlapping UID is rejected',()=>{
+ const thread='0:1:222:333';
+ assert.equal(evaluateSendIntent(candidate({
+  conversationId:thread,
+  identity:{ownerUid:OWNER,ownImUid:'222',targetUid:TARGET},
+ })).ok,true);
+ rejects(candidate({conversationId:thread}),'identity_invalid');
+ rejects(candidate({
+  conversationId:'0:1:999:333',
+  identity:{ownerUid:OWNER,ownImUid:'222',targetUid:TARGET},
+ }),'identity_invalid');
+ rejects(candidate({
+  conversationId:thread,
+  identity:{ownerUid:OWNER,ownImUid:TARGET,targetUid:TARGET},
+ }),'identity_invalid');
+});

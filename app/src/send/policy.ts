@@ -36,7 +36,7 @@ export interface SendCandidate {
   readonly decision: AiDecision;
   readonly conversationId: string;
   readonly sourceEventId: string;
-  readonly identity: { readonly ownerUid: string; readonly targetUid: string };
+  readonly identity: { readonly ownerUid: string; readonly targetUid: string; readonly ownImUid?: string };
   readonly coverage: { readonly usable: boolean; readonly state: string | null };
   readonly runtime: { readonly phase: string; readonly paused: boolean };
   readonly policy: SendPolicy;
@@ -85,12 +85,16 @@ function policyValid(p: SendPolicy): boolean {
 
 /** 会话必须是 owner 与 target 组成的私信线程，不接受其他形式。 */
 function identityValid(c: SendCandidate): boolean {
-  const { ownerUid, targetUid } = c.identity;
+  const { ownerUid, targetUid, ownImUid } = c.identity;
   if (!/^\d+$/.test(ownerUid) || !/^\d+$/.test(targetUid) || ownerUid === targetUid) return false;
+  if (ownImUid !== undefined && (!/^\d+$/.test(ownImUid) || ownImUid === targetUid)) return false;
   const parts = c.conversationId.split(':');
   if (parts.length !== 4 || parts[0] !== '0' || parts[1] !== '1') return false;
   const [, , a, b] = parts as [string, string, string, string];
-  return (a === ownerUid && b === targetUid) || (a === targetUid && b === ownerUid);
+  // The trusted IM UID is authenticated from system.online. Do not infer it
+  // from the thread itself, nor permit arbitrary other account UIDs.
+  const own = new Set([ownerUid,...(ownImUid === undefined ? [] : [ownImUid])]);
+  return (own.has(a) && b === targetUid) || (own.has(b) && a === targetUid);
 }
 
 function inSilence(p: SendPolicy, now: number): boolean {
