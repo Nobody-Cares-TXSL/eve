@@ -194,3 +194,24 @@ T6-1b 底层直接 `saveSendIntent` 的旧离线测试仍可省略 `expectedProo
 已建立独立契约 `docs/contracts/ai-send-handoff.md`，并完成**离线实现**（`finalizeAiWithSend` + `schema-v5.sql`，19 条测试）。推荐 T5 不新建正文表；由受信 Engine 在**一次 SQLite 写事务**中把已验证回复的 T5 `recorded` 审计与 T6 `pending` 意图、完整事件组和 `send_text` 一起提交。对 `skip/defer` 或 T6 拒绝只记录 T5 审计，不落回复正文。旧 `durableDryRunOne` 仍只返回脱敏审计，不擅自改变已冻结的 T5 公共契约。
 
 本设计要求独立 SQLite v5 显式迁移：绑定 `ai_claim_id`（原始 T5 claim）和 `not_before_ms`（真实兑现 reply.delayMs），不修改已有 v4 Schema；发送正文默认短期保留 15 分钟、最长 60 分钟，且必须在最早发送时刻后仍未到期。未来分发需有真实 Runner/单实例锁、Proof、L1 人工确认和真实 SDK Gate；本合同**不提供**真实发送权限。
+
+## 12. T6-3b：SDK 文本请求构造与参数验证（2026-10-31）
+
+**状态：仅离线构造 / 禁止实际调用。** 新增 `app/src/platform/outbound-request.ts` 的 `prepareSdkTextDraft(input)`，它是一个纯函数：不导入任何 SDK 运行时值，不调用 `Client`、`Account`、`Friend`、`Stranger`，不查询联系人、数据库、网络，不使用时钟。唯一 SDK 引用是 `import type {SendableMessage} from 'douyin-im'`，编译期间验证纯字符串是当前已安装的 `douyin-im@1.1.0` 接受的发送参数形状。**它不能、也不允许进行真实发送或决定发出时机。**
+
+### 已确认的 SDK 接口事实
+
+本机 `douyin-im@1.1.0` 的 `ChatContact.sendMsg(message:SendableMessage):Promise<SendMessageResponse>` 允许将**纯 string**作为文本消息发送参数；`Friend` 与 `Stranger` 继承该接口，但 `Group` 也可能提供发送接口，**绝不可因具有同名方法就允许群聊**。SDK 的联系人有 `uid`、`threadId`、`account`、`conversationType`，`blocked` 属性可为 `undefined`。`SendMessageResponse` 提供 `statusCode`、`statusMsg`、可选 `serverMessageId`、可选 `clientMessageId` 和 `checkCode`；是否服务器确认成功、能否当作 `sent` 的证据与各类 `SendMessageError` 语义需等真实 SDK 适配和受控联调后确定，**本轮不实现成功判定**。上游源码/声明见 `app/node_modules/douyin-im/lib/sdk/contacts/chat-contact.d.ts`、`.../services/im/types.d.ts`；SDK 说明：https://github.com/zhinjs/douyin-im 。
+
+### 纯函数输入与判定
+
+- `intent` 快照：`intentId` 必须等于 `SHA256(conversationId + '\\0' + sourceEventId)`，并带合法 `aiClaimId`、`textDigest`、`pending`、`attempt=0`、`notBeforeMs`、`expiresAtMs`、正文；不接受旧版无来源/无延迟快照。**只有源数据结构检查，不代表函数本身查询过 SQLite v5 或已验证真实 T5 claim。**
+- `expected` 白名单：`ownerUid`、`ownImUid`、`targetUid` 全为数字字符串，目标与自有 UID 不同；`session` 必须恰好一个账号，`verified=true` 且 `online=true`，`uid/imUid` 与白名单一致。
+- `contact` 只接受 `friend/stranger`；拒绝 `group`、群聊会话 `conversationType=2`、目标 UID 不符、联系人归属账号不符、`threadId` 不完全一致；`blocked=true` 或 `blocked=undefined` 均拒绝（SDK 未返回拉黑状态不能视作未拉黑）。不根据昵称、备注、联系方式或历史会话猜 UID。
+- 回复正文只接受非空纯字符串；UTF-16 code unit 上限由 `maxTextLength<=500` 限制，拒绝控制字符、SHA256 摘要不符，不允许转成富文本、链接卡片、群 @ 或任意 JSON。
+- `nowMs` 从外部注入，必须在 `[notBeforeMs,expiresAtMs)`；到期和未到执行时间都拒绝。返回要么 `{ok:false,code:<固定枚举>}`，要么 `{ok:true,draft}`；成功 draft 仅包含精确的账号/意图关联元数据与纯文本，**含敏感正文，严禁日志、CLI 输出和持久化副本**。没有自动网络副作用。
+- `session/contact` **仍只是快照对象而不是安全能力**。真实发送阶段必须从已经认证且仍在活跃的 SDK `Account` / `Friend|Stranger` 实例重新读取并核对（包括 `contact.account === activeAccount`），在取得独占锁/当前 Proof/有效 L1 审批后重新构造请求；不能让调用者自行伪造 `verified` 或 `contact.blocked` 即获得发送权限。
+
+### T6-3b 范围边界
+
+本阶段不建立 `PlatformPort.send()`，不接 Runner，不读取真实正文库，不调用 SDK 发送、不处理服务端回执、不迁移正式 v2。真实 SDK 成功/失败/超时和 `unknown` 三态分类、发送前原子 `dispatching` 认领、L1 凭证及重启锁、平台 Unicode 长度与风险设置属于 T6-3c 或更后的独立 Gate。绝不把 `prepareSdkTextDraft().ok=true` 当作 `可以发送` 的权限证明。

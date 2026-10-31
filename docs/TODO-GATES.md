@@ -923,3 +923,17 @@ T5 的 AI 决策模块进入**功能冻结**：接口不再随意改动（清单
 - SQLite 明文存储正文；WAL 与备份的保留/加密策略未定。
 
 **判定：T6-3a 离线正文交接 Gate 通过；真实发送 Gate 仍未开始。**
+
+### T6-3b · SDK 参数构造阶段（2026-10-31）
+
+- 经 Remote Desktop Commander 核实重写推送后的本地基线为 HEAD `49cdd76`，仓库最初干净。本机安装 SDK `douyin-im@1.1.0`；核对 `ChatContact.sendMsg(SendableMessage)` 与 `SendMessageResponse` 的实际 d.ts + SDK 源码；该 API 接受纯字符串，具有账号绑定、会话地址准备与明确的 SDK 发送结果检查。当前阶段**不调用该方法**。
+- `app/src/platform/outbound-request.ts` 为纯离线准备器，SDK 仅 type-only 编译期依赖；不会返回可执行的 SDK 对象或联网能力。它只对调用方提供的快照做格式和一致性检查，不能代替真实 Runner/SDK 对象身份和 L1 审批。
+- `app/test/platform/outbound-request.test.ts` 通过 9 项正反测试：Friend/Stranger、group/UID/会话阻断、多账号、登录/在线状态、blocked 不明、pending 0 attempt、真实的确定性 intentId/事件绑定、notBefore/expiry 和 digest/字数。
+- T6-3b 即便离线全绿，也不意味着能真实发送。正式 SQLite 保持 v2；未发起真实 Claude、SDK 私信调用，未覆盖回执成功语义，也未进行数据库迁移/Push。
+
+### T6-3b 完整离线验收（2026-10-31）
+
+- 设备 2360108124 上 `pnpm typecheck` 通过（0 错）；`pnpm test` **281/281 pass, fail=0**（前次 272 + 本次 9）；`git diff --check` 通过。
+- 正式 SQLite 只读结果：`PRAGMA user_version=2`、`quick_check=ok`、`messages=132`；Runner `phase=stopped,alive=false`；扫描 `app/src` 无真实 `sendMsg(` 调用。没有真实 Claude 请求、没有真实 SDK 发送、没有正式库迁移或新增 Git commit/push。
+- T6-3b 的公开出口仅为纯参数构造器，不获得 SDK 运行时实例：本地类型与安装的 douyin-im@1.1.0 的 SendableMessage 接口兼容，但 `session.verified`、`contact.blocked` 仍是传入快照、可以被调用者伪造。**此结果不授予发送权限**，T6-3c 必须从活跃 SDK 对象重新核实 `contact.account===activeAccount`、真实 Proof/v5 claim、L1 人工批准及真实回执的状态语义，必须对真实发信另行明确授权。
+- 当前 HEAD 仍是历史重写后的 `49cdd76`，工作区只有本轮 `outbound-request.ts`、其测试及文档的未提交修改。

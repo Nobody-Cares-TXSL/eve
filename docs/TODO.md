@@ -81,7 +81,7 @@
 - [x] T6-2a：SendPolicy / SQLite v4 pending 组合层、可信 IM UID、Proof Epoch 与事务内额度复核（离线）；243/243 通过。
 - [x] T6-2b：事件归属/完整批次验证、T5 recorded 来源 Mock Gate、超时/异常进入 unknown（离线）；253/253 通过。
 - [x] T6-3a：正文安全交接离线实现通过——SQLite v5（`ai_claim_id`/`not_before_ms` + 半绑定触发器）、`finalizeAiWithSend` 单事务完成 recorded+pending+正文、终态删正文；19 条测试。真实发送仍被阻断。
-- [ ] T6-3b：真实 SDK 请求构造与参数验证（不实际发送），只在完成 T6-3a 后开始。
+- [x] T6-3b：已安装 douyin-im@1.1.0 的公开 SendableMessage 类型下，离线纯文本请求构造与快照参数验证（account/IM UID、目标、私信线程、blocked、v5 来源字段、notBefore/TTL、digest）；9 项专项测试。**只验证格式，不对真实 SDK 发信，也不能把输入快照当作发送授权。**
 - [ ] T6-3c：L1 人工批准一次、单次 SDK 联调（必须另行明确授权），不自动开放 L0。
 - [ ] T6-2：pending 落盘成功后、**真正调用 SDK 前**必须持久化 dispatching；重启遗留 dispatching 保守进入 unknown，绝不盲目重发。
 - [ ] T6-3：调用 douyin-im Friend/ChatContact.sendMsg，按符合契约的服务端成功回执判 sent；不得宣称对端已显示或已读。
@@ -114,6 +114,6 @@
 
 ## 当前下一步
 
-**当前基线：T0～T4 已完成，T5 真实 Claude dry-run Gate 已通过；T6-1 / T6-1b / T6-2a / T6-2b 的离线 Gate 已通过。** T6-3a 只完成 Contract/AC 设计（`docs/contracts/ai-send-handoff.md`），下一步是依次实现、用临时 SQLite v5 验证原子交接及模型结果来源、审批和正文 TTL；之后才进入 T6-3b / T6-3c 的单次受控真实发送。T5 长期费用/异常恢复与正式库迁移仍为强制未完成 Gate。现在不允许真实发送、不允许自动迁移正式 v2。下次开始编程前按四问、Contract、AC、Gate 和 Understanding Gate 逐步落实。
+**当前基线：T0～T4 已完成，T5 真实 Claude dry-run Gate 已通过；T6-1/1b/2a/2b、T6-3a 的离线 Gate 已通过。T6-3b SDK 纯请求构造器已实现（最终全量测试数见 docs/TODO-GATES.md），真实发送仍然阻断。** 下一步是 T6-3c 的**先审计、再人工授权**：受信 Runner/活跃 SDK Account 与 Contact 实例绑定、v5 真正读取和复核、L1 手动批准单次消息、SDK server 回执语义、平台字数口径、正式数据库备份迁移；任何真实发信都必须单独明确授权，不因模拟测试通过自动开启。T5 长期费用/超时限流退避仍未完成，必须保留 Gate。
 
 **当前最重要的边界**：SDK 已验证的是可行性，不是 Eve 整体完成；不修改上游账号凭证，不在未经准备的情况下触发真实自动发送。

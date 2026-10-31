@@ -226,3 +226,13 @@
 - [x] AC-T6.3a.6 两个连接争用相同 claim/event、预算、Proof 和 pause ABA 均 fail-closed；失败不自动再次调用 Backend，不发送任何真实私信。
 - [x] AC-T6.3a.7 提供 v4→v5 显式迁移、幂等和回滚/重启测试；v2/v3/v4 历史兼容。正式库仍 v2，未经备份和独立授权不得迁移。
 - [x] AC-T6.3a.8 `pnpm typecheck`、全量单测、git diff --check 通过，并确保测试运行没有真实 Claude 调用、没有 `sendMsg`，T6-3a 成功也不等于真实发送 Gate 通过。
+
+### AC-T6.3b · SDK 文本请求构造与验证（2026-10-31）
+
+- [x] 与本机 `douyin-im@1.1.0` 的 `SendableMessage` 类型兼容：只构造纯 string，不传富文本/群聊/卡片，无 SDK 运行时 import、无 `sendMsg` 或网络执行路径。
+- [x] 会话 UID、账号 UID/IM UID、单账号已验证在线、联系人类型/归属 UID、线程号完全相等；`group`、多账号、离线、Blocked/未知状态 fail-closed。
+- [x] `intentId` 依照 `conversationId+sourceEventId` 重新计算，必须具备来源 claim、`pending`、0 次尝试、有效 not-before/expiry，过期或未到时刻不能构造。
+- [x] 仅原样字符串；空白/控制字符/超过 500 UTF-16 code units/正文摘要不符均拒绝，错误结果不含正文。精确验证延迟与过期边界。
+- [x] 9 个专项测试覆盖合法 Friend/Stranger、身份/群/时钟/内容/来源拒绝及源码没有 SDK 运行时发送依赖。
+- [ ] 与真实活跃 SDK 实例绑定和从 SQLite v5 读取可信请求的生产路径尚未实现；Builder 的 snapshot 属性并非授权。
+- [ ] 平台真实长度计数、`SendMessageResponse` 的成功证据、`SendMessageError` 分类及 L1 审批/一次真实发信均未验收。正式 v2 不迁移。
