@@ -90,7 +90,8 @@
 - [x] T6-3c-real-B1 交接通道：`durableDecisionWithSend()` 打通真实 T5→T6（模型产生正文 → 单事务落 pending 意图），9 条测试。**不发送**。
 - [x] T6 L0 自动回复链路（离线）：`runL0Once()` 串起 AI 决策 → 交接 → 程序 Gate → 受控派发；正常路径无人工确认（D-019）；14 条端到端测试。
 - [x] 可信出口 P0 修复（含复检修正）：删除**全部**全局签发/登记函数，签发能力封装进 Port 私有持有的注册表实例；`verify` 只认可本注册表签出的出口；`DispatchInput` 只保留单一 `trustedPort`。8 条回归测试。
-- [ ] T6 Runner 接线：单实例锁 + 暂停栅栏 + 延迟调度 + 出口生命周期 + 默认关闭的启用开关，把 `runL0Once()` 接入真实运行。
+- [x] T6-L0 Runtime 接线：配置门控（默认关闭）、两阶段调度（决策一次 + 按 notBeforeMs 派发）、暂停/断线撤销、崩溃恢复、同进程 Port 生命周期。10 条 Runner 端到端测试（Fake SDK）。
+- [ ] T6 真实 L0 启用：正式配置仍 `autoReply.enabled=false`，需操作者单独启用一次。
 - [ ] T6 真实发送授权：接通后仍需操作者明确启用一次。
 - [ ] 多会话准入（后续独立扩展）：单目标白名单 → 多会话准入 + 分会话限流；不在首次发送范围内。
 - [ ] T6-2：pending 落盘成功后、**真正调用 SDK 前**必须持久化 dispatching；重启遗留 dispatching 保守进入 unknown，绝不盲目重发。

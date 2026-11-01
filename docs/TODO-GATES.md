@@ -1431,3 +1431,46 @@ Runner 的 AI 槽仍是 test-only，CLI 对 `--experimental-ai-dry-run` 直接�
 单进程 TypeScript 无法防御「业务模块直接 import douyin-im 拿到 Account 自行 sendMsg」。本机制防的是误用与越权接线；真正的隔离依赖「`platform/` 之外禁止 import SDK」+ doctor D10。不得声称等价于进程级沙箱。
 
 **判定：P0-1 真正封闭（在可实现的范围内）；Runner 接线未开始。**
+
+### T6-L0 Runtime 接线（2026-11-02）
+
+基线 `e20482b`。授权范围：代码、配置契约、测试、文档；临时 SQLite + Fake SDK。不启用正式账号 L0、不调用真实 `sendMsg`、不改正式库。
+
+#### 实现
+
+| 项 | 落地 |
+|---|---|
+| 配置门控 | `config.autoReply`，**缺失即关闭**；`enabled:true` 时字段非法拒绝启动 |
+| 两阶段调度 | `decideOnce`（生成一次 pending）/ `dispatchPendingOnce`（按 `notBeforeMs` 派发同一条） |
+| 生命周期 | 暂停/断线清空待派发标记；每轮重新取出口与实例快照 |
+| 崩溃恢复 | 建库后 `recoverInterruptedSends()`：`dispatching → unknown`，绝不重发 |
+| 平台端口 | `PlatformPort` 增加可选 `createTrustedSendPort` / `liveRefs`，仅真实 Port 实现 |
+
+#### Definition of Done 对照
+
+| 要求 | 证据 |
+|---|---|
+| 配置关闭：AI 与发送均为零 | 测试断言 `aiCalls===0`、`sent.length===0`、零意图 |
+| 配置开启（Fake）：自主 reply / skip | reply 一次派发；skip 零发送零意图 |
+| 延迟回复：到期派发同一意图 | `notBefore` 前零发送；到期后发送且 `aiCalls` 不变 |
+| 暂停、断线、身份漂移：拒绝发送 | 暂停/断线均零发送 |
+| 重启恢复：unknown 不重试、pending 不重复生成 | 遗留 `dispatching` → `unknown`，零发送 |
+| 单实例锁 | CLI 层 `flock --no-fork`（Runner 不自持锁，结构确认） |
+| 同进程 Port 生命周期 | 旧出口失效、新注册表可签发 |
+| typecheck + 全量测试 | 0 错；**382/382**，连续 3 轮全绿 |
+| 正式库不变 | `user_version=6`、`quick_check=ok`、`send_intents=0` |
+
+#### 过程中修复
+
+1. **恢复调用位置错误**：最初放在 `set('starting')` 之后，那时 `this.archive` 尚为 undefined，恢复从未执行。移到建库之后、`set('running')` 之前。
+2. **低版本库阻塞**：恢复调用在 v3 库上抛错并被 catch 成 `paused_env`，导致 T5 的 12 条 Runner 测试全挂。改为识别 schema 版本错误并容忍。
+3. **fs-untrusted 两处固定延迟**：并行负载下偶发失败，改为轮询等待。
+
+#### 仍未关闭的 Gate
+
+- **真实平台 L0**：正式配置 `autoReply.enabled` 仍为 false，真实发送 0 次，需操作者单独启用。
+- **长期稳定性**：限流退避、费用观测、7×24 运行未验收（T9）。
+- **多会话准入**：仍单会话。
+- **`defer` 语义**：当前 `defer` 只记录「不生成意图」，并不真正安排稍后重新判断——不伪装成已实现，属后续调度阶段。
+
+**判定：L0 Runtime 离线闭环通过；真实发送仍未授权。**

@@ -652,3 +652,45 @@ dispatchOnce({ trustedPort: port, outlets: mine });  // 自建验证器证明自
 ### 22.4 诚实边界（不变）
 
 单进程 TypeScript 无法防御「业务模块直接 import douyin-im、拿到 Account 后自行 `sendMsg`」。本机制防的是**误用与越权接线**。真正的隔离依赖「`platform/` 之外禁止 import SDK」+ doctor D10；测试中新增静态扫描：`src/platform/` 之外出现 `sendMsg(` 即失败。
+
+## 23. T6-L0 Runtime 接线（2026-11-02）
+
+### 23.1 配置门控（默认关闭）
+
+`config.autoReply`：
+
+```json
+{ "autoReply": { "enabled": false } }
+```
+
+- **缺失即视为关闭**，不是错误，也不是默认开启。
+- `enabled: true` 时必须给出完整合法参数；任何字段非法 → 拒绝启动（绝不静默降级）。
+- 关闭时 Runner **既不触发 AI 决策，也不创建发送意图或发送出口**——不是「在 AI 分支查一次开关」。
+
+### 23.2 两阶段调度
+
+| 阶段 | 做什么 | 不做什么 |
+|---|---|---|
+| 决策（`decideOnce`） | AI 生成**一次** pending 意图（正文由模型产生） | 不发送 |
+| 派发（`dispatchPendingOnce`） | 按 `not_before_ms` 到期后派发**同一条**意图 | **不重新调用 AI** |
+
+延迟回复不重新生成内容；到期前 Runner 只轮询同一条 pending。
+
+### 23.3 生命周期与撤销
+
+- **暂停 / 停止 / 断线**：立即清空待派发标记，撤销发送能力；意图留在账本，不自动派发。
+- **重连**：重新验证身份、Coverage 与会话绑定后才可能再派发。
+- **AI 生成 ≠ 必须发送**：`decideOnce` 在 await 之后重新检查 `stillAuthorized()`；若运行态已失效，返回 `runtime_lost_after_decision`，意图不派发。
+
+### 23.4 崩溃恢复
+
+在**建库之后、开始处理新事件之前**（即单实例锁内）调用 `recoverInterruptedSends()`：
+
+- `dispatching` → `unknown`，绝不自动重试；
+- 遗留 `pending` 只在重新通过全部 Gate 后才可能派发；
+- 低版本库（v3~v5）无发送账本，恢复调用被容忍（不阻塞）。
+
+### 23.5 已知限制
+
+- Runner 本身不持有 flock；单实例互斥在 CLI 组合根（`flock --no-fork`）。
+- `maxDecisions` 上限用于防止测试/异常场景无限调用模型。

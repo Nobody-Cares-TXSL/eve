@@ -375,3 +375,17 @@
 - [x] AC-Secure3.5 `src/platform/` 之外出现 `sendMsg(` 由静态扫描测试拦截。
 - [x] AC-Secure3.6 多 Port 实例共享同一信任根；只有首个安装者在 `stop()` 时 `revokeAll()`。
 - [ ] AC-Secure3.7 诚实边界：不等价于进程/OS 级隔离。
+
+### AC-T6.L0Runtime · Runner 接线（**离线已实现**，2026-11-02）
+
+- [x] AC-L0RT.1 `config.autoReply` 缺失或 `enabled:false` 时，Runner 的 AI 决策次数与发送调用次数**均为零**，且不产生意图。
+- [x] AC-L0RT.2 `enabled:true` 时字段非法（越界/未知字段/起止相同）拒绝启动，不静默降级。
+- [x] AC-L0RT.3 两阶段：`decideOnce` 只生成一次 pending；`dispatchPendingOnce` 到期派发**同一意图**，不重新调用 AI。
+- [x] AC-L0RT.4 AI 生成后运行态失效（暂停/停止/断线）→ `runtime_lost_after_decision`，意图不派发。
+- [x] AC-L0RT.5 暂停与断线立即清空待派发标记；恢复后不重发旧意图。
+- [x] AC-L0RT.6 建库后调用 `recoverInterruptedSends()`：遗留 `dispatching` → `unknown`，绝不重发；低版本库容忍该调用。
+- [x] AC-L0RT.7 Runner 每轮重新取出口与实例快照，旧引用不复用；同进程 Port 停止后旧出口失效、新注册表仍可签发。
+- [x] AC-L0RT.8 单实例互斥在 CLI 组合根（`flock --no-fork`），Runner 不自持锁。
+- [x] AC-L0RT.9 `runner.ts` 与 `auto-reply.ts` 不 import `douyin-im`、不直接调用 `sendMsg`。
+- [ ] AC-L0RT.10 真实平台 L0 未启用：`autoReply.enabled` 在正式配置中仍为 false，真实发送 0 次。
+- [ ] AC-L0RT.11 长期运行下的限流退避、费用观测与 7×24 稳定性未验收（T9）。
