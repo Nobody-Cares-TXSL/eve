@@ -29,6 +29,8 @@ export interface DryRunOptions {
   readonly signal?: AbortSignal;
   readonly maxBatchEvents?:number;
   readonly policy?:AiCallPolicy;
+  /** 注入时钟（毫秒）。省略则各调用点取系统时钟；测试用它保证确定性。 */
+  readonly nowMs?:number;
 }
 
 /** T5-1: produces audit metadata only; never claims an event or sends anything. */
@@ -44,7 +46,7 @@ export async function dryRunOne(archive: EveArchive, backend: AiBackend, opts: D
       (opts.timeoutMs ?? 10_000) < 1 || (opts.timeoutMs ?? 10_000) > 30_000)
     throw new Error('invalid_backend_timeout');
   let proofEpoch:string|null;
-  try{proofEpoch=archive.coverageEpoch(opts.conversationId,opts.maxAgeMs);}
+  try{proofEpoch=archive.coverageEpoch(opts.conversationId,opts.maxAgeMs,opts.nowMs);}
   catch{return blocked('coverage_unusable');}
   if(!proofEpoch)return blocked('coverage_unusable');
 
@@ -93,7 +95,7 @@ async function evaluateCandidate(archive:EveArchive,backend:AiBackend,opts:DryRu
   // Detect both expiry and ABA: a NEW verified epoch is not permission to
   // reuse a result computed against the OLD epoch's context.
   try{
-    if(archive.coverageEpoch(opts.conversationId,opts.maxAgeMs)!==proofEpoch)
+    if(archive.coverageEpoch(opts.conversationId,opts.maxAgeMs,opts.nowMs)!==proofEpoch)
       return blocked('coverage_lost_after_inference');
   }catch{return blocked('coverage_lost_after_inference');}
   if (failure) return blocked(failure);
@@ -130,6 +132,7 @@ export async function durableDryRunOne(archive:EveArchive,backend:AiBackend,opts
  try{
   reservation=archive.claimAiDryRun({
    conversationId:opts.conversationId,maxAgeMs:opts.maxAgeMs,
+   ...(opts.nowMs===undefined?{}:{nowMs:opts.nowMs}),
    backendId:backend.id,backendKind:backend.kind,
    ...(opts.maxBatchEvents===undefined?{}:{maxBatchEvents:opts.maxBatchEvents}),
    ...(opts.policy===undefined?{}:{policy:opts.policy}),
@@ -147,6 +150,7 @@ export async function durableDryRunOne(archive:EveArchive,backend:AiBackend,opts
  try{
   const final=archive.finishAiDryRun({
    claimId:reservation.claimId,maxAgeMs:opts.maxAgeMs,
+   ...(opts.nowMs===undefined?{}:{nowMs:opts.nowMs}),
    outcome:audit.status==='dry_run'
     ?{status:'recorded',action:audit.action,decisionDigest:audit.decisionDigest,replyLength:audit.replyLength}
     :{status:'blocked',reasonCode:audit.reasonCode},

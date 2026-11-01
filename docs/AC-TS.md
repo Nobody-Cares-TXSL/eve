@@ -289,3 +289,12 @@
 - [x] AC-B1prep.5 演练脚本不输出真实 UID（只报告身份是否存在）。
 - [ ] AC-B1prep.6 **正式库 v2→v6 迁移**：需操作者授权后执行，未开始。
 - [ ] AC-B1prep.7 **首次真实发送**：指定接收方与内容、单次 `sendMsg`——需单独授权，未开始。
+
+### AC-T5.ClockInjection · 时间源可注入（2026-11-01）
+
+- [x] AC-T5.ClockInjection.1 `coverageStatus` / `coverageEpoch` / `readDryRunCandidate` / `claimAiDryRun` / `finishAiDryRun` / `durableDryRunOne` 接受可选时间参数，缺省取系统时钟。
+- [x] AC-T5.ClockInjection.2 同一次调用内，**证明有效期与频率预算使用同一个时间基准**，不再各自取 `Date.now()`。
+- [x] AC-T5.ClockInjection.3 非安全整数的时间注入被拒绝（`invalid_now`），不得静默降级为系统时钟。
+- [x] AC-T5.ClockInjection.4 **未放宽任何安全阈值**：`minIntervalMs` 默认 0、Coverage TTL、预算上限与全部 fail-closed 分支保持不变。
+- [x] AC-T5.ClockInjection.5 边界回归覆盖：未来时间戳、恰好到达最小间隔、Coverage 过期（后端零调用）。
+- [ ] AC-T5.ClockInjection.6 原始偶发失败的根因未定位（隔离 150 轮 + 全量 8 轮均未复现）；本项只消除该类时序敏感，不声称已证明根因。

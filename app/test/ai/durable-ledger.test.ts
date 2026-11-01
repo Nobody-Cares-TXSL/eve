@@ -256,17 +256,50 @@ test('T5-4 failure cooldown prevents next eligible, persists through reopening',
  }finally{reopened.close();}
  assert.equal(calls,1);
 },2));
-test('T5-4 min interval and future timestamps fail closed',()=>fixture(async(a,_,path)=>{
+/**
+ * 时间一律注入：该用例同时受「频率冷却」与「Coverage 有效期」两套时钟影响，
+ * 用系统时钟会让并行负载下的失败无法归因（曾出现约 1/10 的偶发失败）。
+ * 注入 nowMs 后，两个判定的时间基准完全固定，结果由构造保证。
+ */
+test('T5-4 future timestamp is rejected as cooldown (injected clock)',()=>fixture(async(a,_,path)=>{
  const b=fake(async()=>result());
- assert.equal((await durableDryRunOne(a,b,{...opts,policy:{minIntervalMs:10000}})).status,'dry_run');
+ const now=Date.now();
+ const first=await durableDryRunOne(a,b,{...opts,nowMs:now,policy:{minIntervalMs:10000}});
+ assert.equal(first.status,'dry_run');
  const db=new DatabaseSync(path);
  try{
-  db.prepare('UPDATE ai_decision_attempts SET claimed_at_ms=?').run(Date.now()+60000);
+  db.prepare('UPDATE ai_decision_attempts SET claimed_at_ms=?').run(now+60000);
  }finally{db.close();}
- const next=await durableDryRunOne(a,b,{...opts,policy:{minIntervalMs:10000}});
+ const next=await durableDryRunOne(a,b,{...opts,nowMs:now+1000,policy:{minIntervalMs:10000}});
  assert.equal(next.status,'blocked');
  if(next.status==='blocked')assert.equal(next.reasonCode,'ai_cooldown');
 },2));
+
+test('T5-4 min interval boundary: exactly at interval is allowed, just under is cooldown',()=>fixture(async(a,_,path)=>{
+ const b=fake(async()=>result());
+ const now=Date.now();
+ assert.equal((await durableDryRunOne(a,b,{...opts,nowMs:now,policy:{minIntervalMs:10000}})).status,'dry_run');
+ const db=new DatabaseSync(path);
+ try{
+  db.prepare('UPDATE ai_decision_attempts SET claimed_at_ms=?').run(now-9000);
+ }finally{db.close();}
+ // 差 9s < 10s：仍在冷却
+ const under=await durableDryRunOne(a,b,{...opts,nowMs:now,policy:{minIntervalMs:10000}});
+ assert.equal(under.status,'blocked');
+ if(under.status==='blocked')assert.equal(under.reasonCode,'ai_cooldown');
+ // 恰好 10s：判定用 `<`，等于间隔应当放行
+ const exact=await durableDryRunOne(a,b,{...opts,nowMs:now+1000,policy:{minIntervalMs:10000}});
+ assert.equal(exact.status,'dry_run','恰好到达最小间隔必须允许');
+},3));
+
+test('T5-4 expired coverage is rejected before any AI call',()=>fixture(async(a)=>{
+ const b=fake(async()=>{throw new Error('backend_must_not_be_called');});
+ const now=Date.now();
+ // 注入一个远超 maxAgeMs 的 now：证明必须过期
+ const r=await durableDryRunOne(a,b,{...opts,nowMs:now+opts.maxAgeMs+1000});
+ assert.equal(r.status,'blocked');
+ if(r.status==='blocked')assert.equal(r.reasonCode,'coverage_unusable');
+},1));
 test('T5-4 invalid budget cannot reserve an event',()=>fixture(async(a)=>{
  const b=fake(async()=>result());
  const x=await durableDryRunOne(a,b,{...opts,policy:{maxPerHour:0}});

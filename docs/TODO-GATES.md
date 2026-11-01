@@ -1199,3 +1199,43 @@ SDK `-3` → unknown 且不可再认领；未确认非零码 → unknown；`Send
 全量并行运行时，`T5-4 min interval and future timestamps fail closed` 偶发失败（约 1/10 次），单独运行 5 次全过。该用例属 T5-4，本轮未修改其代码。失败时全量耗时明显升高（单用例 4.6s、整轮多例 9–15s），指向负载下的时序敏感，而非逻辑缺陷。**未修复，不声称稳定**；后续应给该用例加更宽的预算或改用注入时钟。
 
 **判定：B1 前置（迁移演练 + 真实出口零发送验收）通过；正式库迁移与首次真实发送仍未授权。**
+
+### T5-4 偶发失败：时间源注入改造（2026-11-01）
+
+#### 1. 先尝试定位（未成功复现）
+
+| 手段 | 结果 |
+|---|---|
+| 隔离场景 6 路并行 × 25 轮（150 轮） | 0 次失败 |
+| 全量套件加临时诊断（记录首/次调用结果、耗时、Coverage 剩余有效期）连跑 8 轮 | 0 次失败，诊断未触发 |
+
+**如实结论：未能复现，因此没有拿到「是首次调用没得到 `dry_run`，还是第二次没得到 `ai_cooldown`」的直接证据。** 不宣称根因已证实。
+
+#### 2. 按「时间可控」改造（不依赖复现）
+
+该用例同时受两套时钟影响：**频率冷却**（`claimed_at_ms` vs 当前时间）与 **Coverage 有效期**（`last_verified_at_ms` vs 当前时间，90s）。并行负载下二者都可能漂移，导致失败无法归因。
+
+改造为**统一时间源**：
+
+- `coverageStatus(id, maxAgeMs, now = Date.now())`
+- `coverageEpoch(id, maxAgeMs, now = Date.now())`
+- `readDryRunCandidate(..., now = Date.now())`
+- `claimAiDryRun({..., nowMs?})` —— 证明有效期与预算判定共用同一个 `now`
+- `finishAiDryRun({..., nowMs?})`
+- `durableDryRunOne(opts.nowMs?)` —— 向下贯穿
+
+**没有放宽任何安全语义**：`minIntervalMs` 默认仍为 0、Coverage TTL 未改、所有阈值与 fail-closed 分支原样保留；新增参数缺省时仍取系统时钟，生产行为不变。新增 `invalid_now` 拒绝非安全整数的注入值。
+
+#### 3. 边界回归（新增 3 条）
+
+| 用例 | 断言 |
+|---|---|
+| 未来时间戳 | `ai_cooldown` |
+| 最小间隔边界 | 差 9s（<10s）→ `ai_cooldown`；恰好 10s → **允许**（判定用 `<`） |
+| Coverage 过期 | 注入 `now > maxAgeMs` → `coverage_unusable`，且**后端零调用**（fake 直接抛错验证） |
+
+#### 4. 验证
+
+- `pnpm typecheck` 0 错；`pnpm test` **331/331**，**连续 6 轮全绿**（改造前该用例约 1/10 失败）。
+
+**判定：该用例已由构造保证确定性；不声称已找到原始失败的根因，只声明该类负载敏感的时序失败被消除。正式库迁移仍待单独授权。**

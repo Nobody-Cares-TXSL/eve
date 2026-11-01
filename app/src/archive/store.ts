@@ -990,8 +990,8 @@ export class EveArchive {
   * T5 proof revision. Prevents ABA: pause/reconnect may invalidate proof and
   * finish a NEW verified epoch while an AI backend is still evaluating.
   */
- coverageEpoch(id:string,maxAgeMs:number):string|null{
-  if(!this.coverageStatus(id,maxAgeMs).usable)return null;
+ coverageEpoch(id:string,maxAgeMs:number,now:number=Date.now()):string|null{
+  if(!this.coverageStatus(id,maxAgeMs,now).usable)return null;
   const row=this.db.prepare(
    "SELECT epoch_id FROM reconcile_epochs WHERE conversation_id=? AND state='verified' ORDER BY rowid DESC LIMIT 1"
   ).get(id) as {epoch_id:string}|undefined;
@@ -1001,11 +1001,11 @@ export class EveArchive {
   * T5 preview only. Does NOT claim/consume an eligible event.
   * Performs the T4 usable gate before exposing text even to our own AI engine.
   */
- readDryRunCandidate(id:string,maxAgeMs:number,maxTurns=5,excludeAttempted=false,maxBatchEvents=1):DryRunCandidate|null{
+ readDryRunCandidate(id:string,maxAgeMs:number,maxTurns=5,excludeAttempted=false,maxBatchEvents=1,now:number=Date.now()):DryRunCandidate|null{
   this.requireV2();
   if(!this.validThread(id))throw new ArchiveError('rejected');
   if(!Number.isSafeInteger(maxTurns)||maxTurns<1||maxTurns>6)throw new ArchiveError('invalid_context_limit');
-  if(!this.coverageStatus(id,maxAgeMs).usable)throw new ArchiveError('coverage_unusable');
+  if(!this.coverageStatus(id,maxAgeMs,now).usable)throw new ArchiveError('coverage_unusable');
   if(excludeAttempted)this.requireV3();
   if(!Number.isSafeInteger(maxBatchEvents)||maxBatchEvents<1||maxBatchEvents>3)throw new ArchiveError('invalid_batch_limit');
   const query=
@@ -1092,16 +1092,19 @@ export class EveArchive {
   return {eventId:row.event_id,eventIds,turns};
  }
  /** Claim is a permanent, single-attempt dry-run reservation: crashes never auto-retry an AI call. */
- claimAiDryRun(input:{conversationId:string;maxAgeMs:number;backendId:string;backendKind:'model-api'|'agent-runtime';maxBatchEvents?:number;policy?:AiCallPolicy}):
+ claimAiDryRun(input:{conversationId:string;maxAgeMs:number;backendId:string;backendKind:'model-api'|'agent-runtime';maxBatchEvents?:number;policy?:AiCallPolicy;nowMs?:number}):
    {claimId:string;proofEpoch:string;candidate:DryRunCandidate}|null{
   this.requireV3();
   if(!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(input.backendId)||!['model-api','agent-runtime'].includes(input.backendKind))
    throw new ArchiveError('invalid_backend');
   this.db.exec('BEGIN IMMEDIATE');
   try{
-   const proofEpoch=this.coverageEpoch(input.conversationId,input.maxAgeMs);
+   // 时间来源统一：调用方注入 nowMs 时，证明有效期与预算判定都用它。
+   const now=input.nowMs??Date.now();
+   if(!Number.isSafeInteger(now))throw new ArchiveError('invalid_now');
+   const proofEpoch=this.coverageEpoch(input.conversationId,input.maxAgeMs,now);
    if(!proofEpoch)throw new ArchiveError('coverage_unusable');
-   const candidate=this.readDryRunCandidate(input.conversationId,input.maxAgeMs,5,true,input.maxBatchEvents??1);
+   const candidate=this.readDryRunCandidate(input.conversationId,input.maxAgeMs,5,true,input.maxBatchEvents??1,now);
    if(!candidate){this.db.exec('COMMIT');return null;}
    const p=input.policy??{};
    const maxHour=p.maxPerHour??6,maxDay=p.maxPerDay??30;
@@ -1110,7 +1113,6 @@ export class EveArchive {
       maxHour<1||maxHour>100||maxDay<1||maxDay>500||
       minInterval<0||minInterval>3600000||failCooldown<0||failCooldown>86400000)
     throw new ArchiveError('invalid_ai_policy');
-   const now=Date.now();
    const usage=this.db.prepare(
     "SELECT COUNT(*) AS all_calls,"+
     "SUM(CASE WHEN claimed_at_ms>? THEN 1 ELSE 0 END) AS recent_hour "+
@@ -1147,7 +1149,7 @@ export class EveArchive {
   }catch(e){this.db.exec('ROLLBACK');throw e;}
  }
  /** Finalization is atomic and compares the same proof epoch inside the write transaction. */
- finishAiDryRun(input:{claimId:string;maxAgeMs:number;outcome:
+ finishAiDryRun(input:{claimId:string;maxAgeMs:number;nowMs?:number;outcome:
   |{status:'recorded';action:'reply'|'skip'|'defer';decisionDigest:string;replyLength:number}
   |{status:'blocked';reasonCode:string}}):{status:'recorded'|'blocked';reasonCode:string|null}{
   this.requireV3();
@@ -1158,7 +1160,9 @@ export class EveArchive {
     "SELECT conversation_id,proof_epoch_id,state FROM ai_decision_attempts WHERE claim_id=?"
    ).get(input.claimId) as {conversation_id:string;proof_epoch_id:string;state:string}|undefined;
    if(!row||row.state!=='claimed')throw new ArchiveError('claim_not_active');
-   const sameProof=this.coverageEpoch(row.conversation_id,input.maxAgeMs)===row.proof_epoch_id;
+   const now=input.nowMs??Date.now();
+   if(!Number.isSafeInteger(now))throw new ArchiveError('invalid_now');
+   const sameProof=this.coverageEpoch(row.conversation_id,input.maxAgeMs,now)===row.proof_epoch_id;
    const outcome=input.outcome;
    const reason=!sameProof?'coverage_lost_after_inference':
     outcome.status==='blocked'?outcome.reasonCode:null;
@@ -1199,18 +1203,20 @@ export class EveArchive {
   for(const row of rows)states[row.state]=row.n;
   return {claimed:states['claimed']!,recorded:states['recorded']!,blocked:states['blocked']!,interrupted:states['interrupted']!};
  }
- coverageStatus(id:string,maxAgeMs:number):{
+ coverageStatus(id:string,maxAgeMs:number,now:number=Date.now()):{
   state:string|null;verified:boolean;fresh:boolean;usable:boolean;ageMs:number|null;
  }{
   this.requireV2();
   if(!this.validThread(id))throw new ArchiveError('rejected');
   if(!Number.isSafeInteger(maxAgeMs)||maxAgeMs<1)throw new ArchiveError('invalid_max_age');
+  if(!Number.isSafeInteger(now))throw new ArchiveError('invalid_now');
   const row=this.db.prepare('SELECT sync_state,last_verified_at_ms FROM conversations WHERE conversation_id=?')
    .get(id) as {sync_state:string;last_verified_at_ms:number|null}|undefined;
   const state=row?.sync_state??null;
   const verified=state==='verified';
   const at=row?.last_verified_at_ms??null;
-  const ageMs=verified&&at!==null?Date.now()-at:null;
+  // now 可注入：让「有效期」判定可被确定性测试，同时默认仍取系统时钟。
+  const ageMs=verified&&at!==null?now-at:null;
   // 时间戳缺失或倒退一律视为不可用（保守，不假设「刚验证过」）
   const fresh=ageMs!==null&&ageMs>=0&&ageMs<=maxAgeMs;
   return {state,verified,fresh,usable:verified&&fresh,ageMs};
