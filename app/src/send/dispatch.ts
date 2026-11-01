@@ -88,7 +88,15 @@ export interface DispatchInput {
   readonly transport: SendTransport;
   /** 只有持有 Port 令牌的出口才能通过；见 outbound-transport.ts。 */
   readonly trustedPort?: unknown;
-  readonly approvalId: string;
+  /**
+   * 发送模式：
+   *   'l0_auto'   —— 正常自动回复（D-019）。不要求审批记录，完全由程序 Gate 决定。
+   *   'l1_review' —— 可选人工旁观的测试模式：必须有**真实登记**的审批记录。
+   * 任何模式都不允许代码自动调用 createSendApproval 伪造审批。
+   */
+  readonly mode: 'l0_auto' | 'l1_review';
+  /** 仅 l1_review 模式需要；L0 传 undefined。 */
+  readonly approvalId?: string | undefined;
   readonly nowMs: number;
   readonly coverageMaxAgeMs: number;
   readonly maxTextLength: number;
@@ -162,8 +170,10 @@ export async function dispatchOnce(archive: EveArchive, input: DispatchInput): P
       input.coverageMaxAgeMs < 1 || !Number.isSafeInteger(input.maxTextLength) ||
       input.maxTextLength < 1 || input.maxTextLength > 500 ||
       !Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1 || input.timeoutMs > 30_000 ||
-      !/^[A-Za-z0-9_-]{8,64}$/.test(input.approvalId) ||
+      (input.mode !== 'l0_auto' && input.mode !== 'l1_review') ||
       !input.live || !input.transport || typeof input.transport.sendText !== 'function')
+    return rejected('invalid_input');
+  if (input.mode === 'l1_review' && !/^[A-Za-z0-9_-]{8,64}$/.test(input.approvalId ?? ''))
     return rejected('invalid_input');
   // 发送能力必须来自 Port 内部绑定的出口，不能由调用方随意构造
   if (!assertTrustedSendPort(input.trustedPort)) return rejected('untrusted_transport');
@@ -195,16 +205,21 @@ export async function dispatchOnce(archive: EveArchive, input: DispatchInput): P
   if (b.conversationId !== input.expected.conversationId) return rejected('foreign_conversation');
 
   // 3. L1 审批必须来自 v6 账本，且绑定意图/收件人/正文摘要
-  let approval;
-  try { approval = archive.sendApprovalState(input.intentId); }
-  catch { return rejected('approval_missing'); }
-  if (!approval) return rejected('approval_missing');
-  if (approval.approvalId !== input.approvalId) return rejected('approval_binding_mismatch');
-  if (approval.textDigest !== b.textDigest || approval.recipientUid !== input.expected.targetUid)
-    return rejected('approval_binding_mismatch');
-  if (approval.consumed) return rejected('approval_consumed');
-  if (input.nowMs < approval.approvedAtMs || input.nowMs >= approval.expiresAtMs)
-    return rejected('approval_expired');
+  // 审批仅在 l1_review 模式下是必要条件；L0 不要求审批记录。
+  // 若账本里恰好存在审批记录（例如之前跑过 L1），L0 仍然不消费它，
+  // 以免把「有人批准过」误当成发送前提。
+  if (input.mode === 'l1_review') {
+    let approval;
+    try { approval = archive.sendApprovalState(input.intentId); }
+    catch { return rejected('approval_missing'); }
+    if (!approval) return rejected('approval_missing');
+    if (approval.approvalId !== input.approvalId) return rejected('approval_binding_mismatch');
+    if (approval.textDigest !== b.textDigest || approval.recipientUid !== input.expected.targetUid)
+      return rejected('approval_binding_mismatch');
+    if (approval.consumed) return rejected('approval_consumed');
+    if (input.nowMs < approval.approvedAtMs || input.nowMs >= approval.expiresAtMs)
+      return rejected('approval_expired');
+  }
 
   // 4. T6-3b 构造器复核
   const draft = prepareSdkTextDraft({
@@ -224,19 +239,22 @@ export async function dispatchOnce(archive: EveArchive, input: DispatchInput): P
     maxTextLength: input.maxTextLength,
   });
   if (!draft.ok) return rejected(draft.code);
-  if (draft.draft.recipientUid !== approval.recipientUid) return rejected('approval_binding_mismatch');
+  if (draft.draft.recipientUid !== input.expected.targetUid) return rejected('contact_unverified');
 
   // 5. 原子认领
   if (!archive.claimSendIntent(input.intentId, input.nowMs)) return rejected('already_claimed');
 
-  // 6. 审批消费：条件更新保证只能成功一次
-  const consumed = archive.consumeSendApproval({
-    approvalId: input.approvalId, intentId: input.intentId,
-    recipientUid: approval.recipientUid, textDigest: b.textDigest, nowMs: input.nowMs,
-  });
-  if (!consumed) {
-    archive.settleSendIntent(input.intentId, { status: 'failed', reasonCode: 'rejected_before_dispatch' }, input.nowMs);
-    return { status: 'failed', intentId: input.intentId, reasonCode: 'rejected_before_dispatch' };
+  // 6. l1_review 才消费审批（条件更新保证只能成功一次）；L0 无审批可消费
+  if (input.mode === 'l1_review') {
+    const state = archive.sendApprovalState(input.intentId);
+    const consumed = archive.consumeSendApproval({
+      approvalId: input.approvalId!, intentId: input.intentId,
+      recipientUid: input.expected.targetUid, textDigest: b.textDigest, nowMs: input.nowMs,
+    });
+    if (!consumed || !state) {
+      archive.settleSendIntent(input.intentId, { status: 'failed', reasonCode: 'rejected_before_dispatch' }, input.nowMs);
+      return { status: 'failed', intentId: input.intentId, reasonCode: 'rejected_before_dispatch' };
+    }
   }
 
   // 7. 发送前最后一次复核：绑定、正文、事件、Proof、实例存活

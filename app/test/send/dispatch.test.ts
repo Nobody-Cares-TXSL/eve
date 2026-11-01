@@ -126,6 +126,7 @@ const base = (c: Ctx, over: Partial<DispatchInput> = {}): DispatchInput => ({
   live: liveRefs({ kind: 'friend' }),
   transport: transport({ statusCode: 0, serverMessageId: '7701260499833538097' }),
   trustedPort: undefined as unknown,
+  mode: 'l1_review' as const,
   approvalId: APPROVAL,
   nowMs: c.now, coverageMaxAgeMs: 90_000, maxTextLength: 500, timeoutMs: 1_000,
   ...over,
@@ -351,6 +352,73 @@ test('出口被撤销后不可再用', () => withPendingIntent(async (c) => {
   assert.deepEqual(r, { status: 'rejected', reasonCode: 'untrusted_transport' });
   assert.equal(t.calls, 0);
 }));
+
+test('L0 自动模式：无审批记录也能发送（D-019）', () => withPendingIntent(async (c) => {
+  // 本用例的 fixture 默认会登记审批；这里先确认 L0 根本不看它
+  const t = transport({ statusCode: 0, serverMessageId: '7701260499833538097' });
+  const r = await dispatchOnce(c.a, withTrusted(base(c, {
+    mode: 'l0_auto', approvalId: undefined, transport: t,
+  })));
+  assert.deepEqual(r, { status: 'sent', intentId: c.intentId, evidence: '7701260499833538097' });
+  assert.equal(t.calls, 1);
+  const s = state(c.file, c.intentId);
+  assert.equal(s.status, 'sent');
+  assert.equal(s.approvalConsumed, false, 'L0 不得消费审批记录');
+}));
+
+test('L0 无审批时仍受全部程序 Gate 约束：Proof 过期即拒发', () => withPendingIntent(async (c) => {
+  const t = transport({ statusCode: 0, serverMessageId: '1' });
+  const r = await dispatchOnce(c.a, withTrusted(base(c, {
+    mode: 'l0_auto', approvalId: undefined, nowMs: c.now + 5_000, coverageMaxAgeMs: 1, transport: t,
+  })));
+  assert.deepEqual(r, { status: 'rejected', reasonCode: 'proof_changed' });
+  assert.equal(t.calls, 0);
+}));
+
+test('L0 无审批时仍受身份约束：会话漂移即拒发', () => withPendingIntent(async (c) => {
+  const t = transport({ statusCode: 0, serverMessageId: '1' });
+  const r = await dispatchOnce(c.a, withTrusted(base(c, {
+    mode: 'l0_auto', approvalId: undefined, live: liveRefs({ kind: 'none' }), transport: t,
+  })));
+  assert.deepEqual(r, { status: 'rejected', reasonCode: 'contact_unverified' });
+  assert.equal(t.calls, 0);
+}));
+
+test('L0 无审批时仍受内容约束：正文被篡改即拒发', () => withPendingIntent(async (c) => {
+  const tampered = '这是一条只供离线测试的答复';
+  assert.equal(tampered.length, TEXT.length);
+  const db = new DatabaseSync(c.file);
+  try { db.prepare('UPDATE send_text SET body=? WHERE intent_id=?').run(tampered, c.intentId); }
+  finally { db.close(); }
+  const t = transport({ statusCode: 0, serverMessageId: '1' });
+  const r = await dispatchOnce(c.a, withTrusted(base(c, {
+    mode: 'l0_auto', approvalId: undefined, transport: t,
+  })));
+  assert.deepEqual(r, { status: 'rejected', reasonCode: 'content_digest_mismatch' });
+  assert.equal(t.calls, 0);
+}));
+
+test('L0 幂等：同一意图第二次派发被拒', () => withPendingIntent(async (c) => {
+  const t1 = transport({ statusCode: 0, serverMessageId: '7701260499833538097' });
+  const first = await dispatchOnce(c.a, withTrusted(base(c, {
+    mode: 'l0_auto', approvalId: undefined, transport: t1,
+  })));
+  assert.equal(first.status, 'sent');
+  const t2 = transport({ statusCode: 0, serverMessageId: '7701260499833538098' });
+  const second = await dispatchOnce(c.a, withTrusted(base(c, {
+    mode: 'l0_auto', approvalId: undefined, transport: t2,
+  })));
+  assert.equal(second.status, 'rejected');
+  assert.equal(t2.calls, 0);
+}));
+
+test('L1 模式仍要求真实审批记录（保留为可选测试模式）', () => withPendingIntent(async (c) => {
+  const t = transport({ statusCode: 0, serverMessageId: '1' });
+  const r = await dispatchOnce(c.a, withTrusted(base(c, { mode: 'l1_review', approvalId: 'appr-wrong001', transport: t })));
+  // 该 fixture 未登记审批 → 先命中 approval_missing（而不是绑定不符）
+  assert.deepEqual(r, { status: 'rejected', reasonCode: 'approval_missing' });
+  assert.equal(t.calls, 0);
+}, { approve: false }));
 
 test('dispatch.ts 无运行时 SDK 依赖、无 sendMsg', () => {
   const source = readFileSync(new URL('../../src/send/dispatch.ts', import.meta.url), 'utf8');
