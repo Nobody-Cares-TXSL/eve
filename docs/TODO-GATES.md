@@ -1403,3 +1403,31 @@ Runner 的 AI 槽仍是 test-only，CLI 对 `--experimental-ai-dry-run` 直接�
 `pnpm typecheck` 0 错；`pnpm test` **366/366**（360 + 6）。正式库 v6 未改动；真实 `sendMsg` 调用 0 次。
 
 **判定：两个 P0 已封；Runner 接线未开始。**
+
+### P0-1 复检修正：删除全局签发入口（2026-11-02）
+
+操作者复核 `2fc2fe6` 后指出 **P0-1 并未真正封住**：`claimPortIdentity(token: object)` 仍公开导出且**无条件接受任意对象**。普通模块只需 `claimPortIdentity({})` + `registerSendPortIssuer()` 就能自签出口。
+
+**上一版结论「签发能力已收紧」是错误的**，现更正。
+
+#### 修正
+
+- 删除全部全局签发/登记函数：`claimPortIdentity`、`registerSendPortIssuer`、`issueTrustedSendPort`、`assertTrustedSendPort`。
+- 签发能力封装进 `createOutletRegistry()` 返回的**注册表实例**；注册表本身即能力凭证，`verify` 只认可本注册表签出的对象。
+- `dispatchOnce` 必须同时收到出口与其注册表；verify 失败 → `untrusted_transport`，传输层零调用。
+- 导出面收敛为三个符号，源码扫描固定。
+
+#### 新增测试（2 条关键复检）
+
+- 源码中不存在任何全局签发/身份登记入口；导出集恰为 `TrustedSendPort`/`OutletRegistry`/`createOutletRegistry`。
+- 攻击者用自己注册表签出的出口，**不能被受害者注册表认可**。
+
+#### 验证
+
+`pnpm typecheck` 0 错；`pnpm test` **368/368**。正式库 v6 未改动；真实 `sendMsg` 调用 0 次。
+
+#### 诚实边界（写入契约 §21.3）
+
+单进程 TypeScript 无法防御「业务模块直接 import douyin-im 拿到 Account 自行 sendMsg」。本机制防的是误用与越权接线；真正的隔离依赖「`platform/` 之外禁止 import SDK」+ doctor D10。不得声称等价于进程级沙箱。
+
+**判定：P0-1 真正封闭（在可实现的范围内）；Runner 接线未开始。**

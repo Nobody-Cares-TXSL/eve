@@ -35,6 +35,8 @@ export interface L0LoopInput {
   readonly live: { client: LiveClientRef; account: LiveAccountRef; contact: LiveContactRef };
   readonly expected: SendHandoffOptions['identity'] & { conversationId: string };
   readonly transport: TrustedSendPort;
+  /** 来自真实 SDK Port 的注册表；测试用 fake 注册表。 */
+  readonly outlets: import('../platform/outbound-transport.ts').OutletRegistry;
   readonly handoff: Omit<SendHandoffOptions, 'conversationId' | 'identity'>;
   readonly dispatch: {
     nowMs: number;
@@ -83,6 +85,7 @@ export async function runL0Once(input: L0LoopInput): Promise<L0Outcome> {
     },
     live,
     trustedPort: transport,
+    outlets: input.outlets,
     mode: 'l0_auto',
     nowMs: input.dispatch.nowMs,
     coverageMaxAgeMs: input.dispatch.coverageMaxAgeMs,

@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Client } from 'douyin-im';
 import { DouyinReadOnlyPort } from '../../src/platform/douyin.ts';
-import { claimPortIdentity, registerSendPortIssuer, assertTrustedSendPort, type TrustedSendPort } from '../../src/platform/outbound-transport.ts';
+import { createOutletRegistry, type OutletRegistry, type TrustedSendPort } from '../../src/platform/outbound-transport.ts';
 
 const THREAD = '0:1:222:333';
 
@@ -96,7 +96,7 @@ test('上线后为目标会话创建可信出口，且能通过令牌校验', as
     assert.ok(outlet, '活跃会话应能创建出口');
     assert.equal(outlet.conversationId, THREAD);
     assert.equal(outlet.recipientUid, '333');
-    assert.equal(assertTrustedSendPort(outlet), true, '必须带 Port 令牌');
+    assert.equal(port.outletRegistry.verify(outlet), true, '必须由本 Port 注册表认可');
   });
 });
 
@@ -147,9 +147,9 @@ test('stop() 撤销全部出口，令牌失效', async () => {
     await port.start();
     const outlet = port.createTrustedSendPort(THREAD);
     assert.ok(outlet);
-    assert.equal(assertTrustedSendPort(outlet), true);
+    assert.equal(port.outletRegistry.verify(outlet), true);
     await port.stop();
-    assert.equal(assertTrustedSendPort(outlet), false, 'stop 后令牌必须失效');
+    assert.equal(port.outletRegistry.verify(outlet), false, 'stop 后必须失效');
     await assert.rejects(() => outlet.sendText('关停后不应发出'), /send_session_changed/);
   });
 });
@@ -162,32 +162,31 @@ test('出口只允许一个目标：无法为其他 UID 创建', async () => {
   });
 });
 
-test('P0-1：普通模块无法签发可信出口（无 Port 身份即被拒）', () => {
-  const fakeIdentity = {};
-  // 未通过 claimPortIdentity 登记的对象不能注册签发器
-  assert.throws(() => registerSendPortIssuer({}, fakeIdentity), /send_port_issuer_not_authorized/);
-  // 即便传入自己构造的对象，只要没登记过身份就不行
-  assert.throws(() => registerSendPortIssuer({}, {}), /send_port_issuer_not_authorized/);
+test('P0-1：注册表只能认可自己签出的出口，外来对象一律拒绝', () => {
+  const a = createOutletRegistry();
+  const b = createOutletRegistry();
+  const outletA = a.issue('0:1:222:333', '333', async () => ({ statusCode: 0 }));
+  // 另一个注册表不认可 A 签出的出口
+  assert.equal(b.verify(outletA), false, '跨注册表不得互认');
+  // 手写同形对象也不被认可
+  assert.equal(a.verify({ conversationId: '0:1:222:333', recipientUid: '333', sendText: async () => ({}) }), false);
+  assert.equal(a.verify(null), false);
+  assert.equal(a.verify({}), false);
 });
 
-test('P0-1：签发器撤销后，已签出的出口全部失效', () => {
-  const identity = {};
-  claimPortIdentity(identity);
-  const issuer = registerSendPortIssuer({}, identity);
-  const port = issuer.issue('0:1:222:333', '333', async () => ({ statusCode: 0 }));
-  assert.equal(assertTrustedSendPort(port), true);
-  issuer.revokeAll();
-  assert.equal(assertTrustedSendPort(port), false, 'revokeAll 后必须失效');
-  // 撤销后签发器也不能再签发
-  assert.throws(() => issuer.issue('0:1:222:333', '333', async () => ({ statusCode: 0 })),
-    /send_port_issuer_revoked/);
+test('P0-1：注册表 revokeAll 后出口失效且不可再签发', () => {
+  const registry = createOutletRegistry();
+  const port = registry.issue('0:1:222:333', '333', async () => ({ statusCode: 0 }));
+  assert.equal(registry.verify(port), true);
+  registry.revokeAll();
+  assert.equal(registry.verify(port), false, 'revokeAll 后必须失效');
+  assert.throws(() => registry.issue('0:1:222:333', '333', async () => ({ statusCode: 0 })),
+    /outlet_registry_revoked/);
 });
 
 test('P0-1：签出的出口被冻结，无法改写会话或收件人', () => {
-  const identity = {};
-  claimPortIdentity(identity);
-  const issuer = registerSendPortIssuer({}, identity);
-  const port = issuer.issue('0:1:222:333', '333', async () => ({ statusCode: 0 }));
+  const registry = createOutletRegistry();
+  const port = registry.issue('0:1:222:333', '333', async () => ({ statusCode: 0 }));
   assert.throws(() => { (port as { conversationId: string }).conversationId = '0:1:222:999'; }, TypeError);
   assert.equal(port.conversationId, '0:1:222:333');
 });
@@ -197,8 +196,31 @@ test('P0-1：Port 通过签发器签出的出口可通过校验，且 stop 后�
     await port.start();
     const outlet = port.createTrustedSendPort(THREAD);
     assert.ok(outlet);
-    assert.equal(assertTrustedSendPort(outlet), true);
+    assert.equal(port.outletRegistry.verify(outlet), true);
     await port.stop();
-    assert.equal(assertTrustedSendPort(outlet), false);
+    assert.equal(port.outletRegistry.verify(outlet), false);
   });
+});
+
+test('P0-1 复检：不存在任何全局签发/身份登记入口', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../../src/platform/outbound-transport.ts', import.meta.url), 'utf8');
+  // 任何形式的全局签发能力都不允许
+  assert.doesNotMatch(src, /export function issueTrustedSendPort/);
+  assert.doesNotMatch(src, /export function claimPortIdentity/);
+  assert.doesNotMatch(src, /export function registerSendPortIssuer/);
+  assert.doesNotMatch(src, /export function assertTrustedSendPort/);
+  // 只导出工厂函数与类型
+  const exports = [...src.matchAll(/export (?:function|class|interface) (\w+)/g)].map(m => m[1]);
+  assert.deepEqual(exports.sort(), ['OutletRegistry', 'TrustedSendPort', 'createOutletRegistry'].sort());
+});
+
+test('P0-1 复检：业务模块无法让别人的注册表认可自己构造的出口', () => {
+  const victim = createOutletRegistry();
+  const attacker = createOutletRegistry();
+  const attackerOutlet = attacker.issue('0:1:222:333', '333', async () => ({ statusCode: 0 }));
+  assert.equal(victim.verify(attackerOutlet), false, '攻击者的出口不能被受害者注册表认可');
+  // 攻击者自己的注册表当然认可它——但这不构成权限，因为 dispatch 只接受
+  // 由**真实 Port 持有**的注册表实例（Port 实例私有，外部拿不到）
+  assert.equal(attacker.verify(attackerOutlet), true);
 });

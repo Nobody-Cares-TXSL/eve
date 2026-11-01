@@ -14,7 +14,7 @@ import { EveArchive } from '../../src/archive/store.ts';
 import { MockPlatformPort } from '../../src/platform/mock.ts';
 import { reconcileOnce } from '../../src/runtime/reconcile.ts';
 import type { InboundMessage } from '../../src/platform/types.ts';
-import { claimPortIdentity, registerSendPortIssuer, assertTrustedSendPort, type TrustedSendPort } from '../../src/platform/outbound-transport.ts';
+import { createOutletRegistry, type OutletRegistry, type TrustedSendPort } from '../../src/platform/outbound-transport.ts';
 import {
   classifySendResponse, dispatchOnce, proofStillValid, responseFromError,
   type DispatchInput, type SendResponseLike, type SendTransport,
@@ -109,35 +109,50 @@ async function withPendingIntent(
   }
 }
 
-/** 测试扮演 Port：持身份令牌注册签发器，用它签出可信出口。 */
-const testPortIdentity = {};
-claimPortIdentity(testPortIdentity);
-const testIssuer = registerSendPortIssuer({}, testPortIdentity);
+/** 每个出口自带注册表，避免用例之间互相撤销影响。 */
+interface CountedPort { readonly port: TrustedSendPort; readonly counter: { calls: number }; readonly registry: OutletRegistry }
 /**
  * 出口对象被冻结，不能挂属性，也不能用 Proxy 包装
  * （包装后就不再是 WeakSet 里登记的那个对象，守卫会正确地拒绝）。
  * 因此把计数器放在外部对象上，与出口一起返回。
  */
-interface CountedPort { readonly port: TrustedSendPort; readonly counter: { calls: number } }
 const transport = (r: SendResponseLike | (() => Promise<SendResponseLike>)): CountedPort => {
   const counter = { calls: 0 };
-  const port = testIssuer.issue(THREAD, '333', async () => {
+  const registry = createOutletRegistry();
+  const port = registry.issue(THREAD, '333', async () => {
     counter.calls++;
     return typeof r === 'function' ? r() : r;
   });
-  return { port, counter };
+  outletRegistryMap.set(port as unknown as object, registry);
+  return { port, counter, registry };
 };
 
-const base = (c: Ctx, over: Partial<DispatchInput> = {}): DispatchInput => ({
+const base = (c: Ctx, over: Partial<DispatchInput> = {}): DispatchInput => {
+  // 默认出口及其注册表必须配对；若用例覆盖了 trustedPort 但没给 outlets，
+  // 用该出口自己的注册表，否则 dispatch 会（正确地）拒绝。
+  const fallback = transport({ statusCode: 0, serverMessageId: '7701260499833538097' });
+  const tp = (over.trustedPort as TrustedSendPort | undefined) ?? fallback.port;
+  // 出口自己的注册表优先；外部伪造对象没有登记，落到一个空注册表（verify 必拒）
+  const reg = (over.outlets as OutletRegistry | undefined) ??
+    registryOf(tp) ?? createOutletRegistry();
+  return {
   intentId: c.intentId,
   expected: { ownerUid: '111', ownImUid: '222', targetUid: '333', conversationId: THREAD },
   live: liveRefs({ kind: 'friend' }),
-  trustedPort: transport({ statusCode: 0, serverMessageId: '7701260499833538097' }).port,
+  trustedPort: tp,
+  outlets: reg,
   mode: 'l1_review' as const,
   approvalId: APPROVAL,
   nowMs: c.now, coverageMaxAgeMs: 90_000, maxTextLength: 500, timeoutMs: 1_000,
   ...over,
-});
+  };
+};
+
+/** 出口 → 其注册表，便于 base() 自动配对（避免「验证 A 发送 B」的测试污染）。 */
+const outletRegistryMap = new WeakMap<object, OutletRegistry>();
+function registryOf(port: TrustedSendPort | undefined): OutletRegistry | undefined {
+  return port ? outletRegistryMap.get(port as unknown as object) : undefined;
+}
 
 
 
@@ -337,26 +352,28 @@ test('未登记的出口一律拒绝：外部构造 { sendText } 拿不到发送
 
 test('出口绑定的会话/收件人与意图不符 → untrusted_transport', () => withPendingIntent(async (c) => {
   let wrongThreadCalls = 0;
-  const wrongThread = testIssuer.issue('0:1:222:444', '333', async () => {
+  const wrongThreadRegistry = createOutletRegistry();
+  const wrongThread = wrongThreadRegistry.issue('0:1:222:444', '333', async () => {
     wrongThreadCalls++; return { statusCode: 0, serverMessageId: '1' };
   });
-  const r = await dispatchOnce(c.a, base(c, { trustedPort: wrongThread }));
+  const r = await dispatchOnce(c.a, base(c, { trustedPort: wrongThread, outlets: wrongThreadRegistry }));
   assert.deepEqual(r, { status: 'rejected', reasonCode: 'untrusted_transport' });
   assert.equal(wrongThreadCalls, 0);
 
   let wrongRecipientCalls = 0;
-  const wrongRecipient = testIssuer.issue(THREAD, '444', async () => {
+  const wrongRecipientRegistry = createOutletRegistry();
+  const wrongRecipient = wrongRecipientRegistry.issue(THREAD, '444', async () => {
     wrongRecipientCalls++; return { statusCode: 0, serverMessageId: '1' };
   });
-  const r2 = await dispatchOnce(c.a, base(c, { trustedPort: wrongRecipient }));
+  const r2 = await dispatchOnce(c.a, base(c, { trustedPort: wrongRecipient, outlets: wrongRecipientRegistry }));
   assert.deepEqual(r2, { status: 'rejected', reasonCode: 'untrusted_transport' });
   assert.equal(wrongRecipientCalls, 0);
 }));
 
 test('出口被撤销后不可再用', () => withPendingIntent(async (c) => {
   const t = transport({ statusCode: 0, serverMessageId: '1' });
-  testIssuer.revoke(t.port);
-  const r = await dispatchOnce(c.a, base(c, { trustedPort: t.port }));
+  t.registry.revoke(t.port);
+  const r = await dispatchOnce(c.a, base(c, { trustedPort: t.port, outlets: t.registry }));
   assert.deepEqual(r, { status: 'rejected', reasonCode: 'untrusted_transport' });
   assert.equal(t.counter.calls, 0);
 }));
@@ -442,7 +459,7 @@ test('P0-2：DispatchInput 不再有独立 transport 字段（结构上无法分
   const src = readFileSync(new URL('../../src/send/dispatch.ts', import.meta.url), 'utf8');
   // 只允许单一出口参数 trustedPort；出现 transport 字段即为回退
   assert.doesNotMatch(src, /readonly transport: SendTransport/);
-  assert.match(src, /readonly trustedPort: unknown/);
+  assert.match(src, /readonly trustedPort: TrustedSendPort/);
   // 发送调用必须走 trustedPort（经 assert 之后赋值的 port）
   assert.match(src, /port\.sendText\(/);
   assert.doesNotMatch(src, /input\.transport\.sendText/);

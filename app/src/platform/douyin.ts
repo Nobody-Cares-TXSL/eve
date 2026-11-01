@@ -10,9 +10,7 @@ import { createClient, configureLogger, type Client, type Account, type MessageE
 import { LocalQrFile } from './qr.ts';
 import { normalizeInboundMessage } from './normalize.ts';
 import { projectHistoryPage } from './history.ts';
-import {
-  claimPortIdentity, registerSendPortIssuer, type TrustedSendPort,
-} from './outbound-transport.ts';
+import { createOutletRegistry, type TrustedSendPort } from './outbound-transport.ts';
 import type { HistoryPage, PlatformPort, PlatformSink, PlatformStatus } from './types.ts';
 
 type Contact = Friend | Stranger;
@@ -68,12 +66,13 @@ export class DouyinReadOnlyPort implements PlatformPort {
   private blocked = false;
   private started = false;
   private readonly contacts = new Map<string, Contact>();
-  /** 本 Port 的签发器；stop() 时 revokeAll。 */
-  private readonly portIdentity: object = {};
-  private readonly sendIssuer = (() => {
-    claimPortIdentity(this.portIdentity);
-    return registerSendPortIssuer(this, this.portIdentity);
-  })();
+  /**
+   * 出口注册表：本 Port 私有持有，是签发能力的唯一凭证。
+   * `stop()` 时 revokeAll，旧出口与签发能力同时失效。
+   */
+  private readonly outlets = createOutletRegistry();
+  /** 供受控发送链路取用；外部无法凭空构造一个能通过校验的注册表。 */
+  get outletRegistry() { return this.outlets; }
   private readonly recentIds = new Set<string>();
   private readonly recentQueue: string[] = [];
 
@@ -243,7 +242,7 @@ export class DouyinReadOnlyPort implements PlatformPort {
     this.verified = false;
     this.started = false;
     // 出口必须先失效，避免关停过程中仍有发送路径
-    this.sendIssuer.revokeAll();
+    this.outlets.revokeAll();
     this.contacts.clear();
     this.recentIds.clear();
     this.recentQueue.length = 0;
@@ -280,7 +279,7 @@ export class DouyinReadOnlyPort implements PlatformPort {
         .find((c): c is Contact => !!c && c.threadId === conversationId);
     if (!contact || contact.uid !== this.targetUid) return null;
 
-    return this.sendIssuer.issue(conversationId, this.targetUid, async (message: string) => {
+    return this.outlets.issue(conversationId, this.targetUid, async (message: string) => {
       // 发送前最后一道：会话必须仍然有效，否则拒绝
       if (!this.started || !this.verified || this.active !== account || !account.online) {
         throw new Error('send_session_changed');

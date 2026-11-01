@@ -12,7 +12,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { EveArchive } from '../../src/archive/store.ts';
 import { MockPlatformPort } from '../../src/platform/mock.ts';
 import { reconcileOnce } from '../../src/runtime/reconcile.ts';
-import { claimPortIdentity, registerSendPortIssuer, assertTrustedSendPort, type TrustedSendPort } from '../../src/platform/outbound-transport.ts';
+import { createOutletRegistry, type OutletRegistry, type TrustedSendPort } from '../../src/platform/outbound-transport.ts';
 import { runL0Once, sessionEligible, type L0LoopInput } from '../../src/send/l0-loop.ts';
 import type { AiBackend } from '../../src/ai/contracts.ts';
 import type { InboundMessage } from '../../src/platform/types.ts';
@@ -50,12 +50,10 @@ function fakeSdk(opts: { online?: boolean; blocked?: boolean; kind?: 'friend' | 
   return { client: { accounts: [account] }, account, contact };
 }
 
-/** 测试扮演 Port：注册签发器，用它签出绑定 fake contact 的可信出口。 */
-const testIdentity = {};
-claimPortIdentity(testIdentity);
-const testIssuer = registerSendPortIssuer({}, testIdentity);
+/** 测试扮演 Port：自建注册表并签出绑定 fake contact 的出口。 */
+const testRegistry: OutletRegistry = createOutletRegistry();
 function fakeOutlet(contact: { sent: string[]; sendMsg: (t: string) => Promise<SendResponseLike> }) {
-  return testIssuer.issue(THREAD, '333', async (message: string) => contact.sendMsg(message));
+  return testRegistry.issue(THREAD, '333', async (message: string) => contact.sendMsg(message));
 }
 
 const fakeBackend = (fn: AiBackend['evaluate']): AiBackend =>
@@ -88,6 +86,7 @@ async function fixture(
       live: sdk,
       expected: { ownerUid: '111', ownImUid: '222', targetUid: '333', conversationId: THREAD },
       transport: fakeOutlet(sdk.contact),
+      outlets: testRegistry,
       handoff: {
         maxAgeMs: 90_000, timeoutMs: 1000, nowMs: now,
         runtime: opts.runtime ?? { phase: 'running', paused: false },
@@ -166,7 +165,7 @@ test('L0：被拉黑立即阻断', () => fixture(async ({ base, sdk }) => {
 }));
 
 test('L0：unknown 结果不自动重试', () => fixture(async ({ base, file, sdk }) => {
-  const ambiguous = testIssuer.issue(THREAD, '333', async () => ({ statusCode: -3 } as SendResponseLike));
+  const ambiguous = testRegistry.issue(THREAD, '333', async () => ({ statusCode: -3 } as SendResponseLike));
   const out = await runL0Once({ ...base, transport: ambiguous, backend: fakeBackend(async () => reply()) });
   assert.equal(out.kind, 'unknown');
   if (out.kind === 'unknown') assert.equal(out.reasonCode, 'ambiguous_result');
@@ -206,7 +205,7 @@ test('L0：出口必须经 Port 登记；伪造出口零发送', () => fixture(a
 }));
 
 test('L0：出口被撤销后零发送', () => fixture(async ({ base, sdk }) => {
-  testIssuer.revoke(base.transport);
+  testRegistry.revoke(base.transport);
   const out = await runL0Once({ ...base, backend: fakeBackend(async () => reply()) });
   assert.equal(out.kind, 'send_blocked');
   assert.equal(sdk.contact.sent.length, 0);

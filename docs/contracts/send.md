@@ -580,3 +580,43 @@ AI 不能跳过白名单、静默期与限流；程序不提供可被 AI 输出�
 ### 20.3 仍未做
 
 Runner 接线（单实例锁、暂停栅栏、延迟调度、出口生命周期、默认关闭的启用开关）尚未开始。
+
+## 21. P0-1 复检修正：删除全局签发入口（2026-11-02）
+
+### 21.1 上一版为何仍未封住
+
+§20.1 保留了 `export function claimPortIdentity(token: object)`——它**无条件接受任意对象**。普通模块只需：
+
+```ts
+claimPortIdentity({})            // 自己造一个"身份"
+registerSendPortIssuer({}, that) // 拿到签发器
+```
+
+就能为自己签发可信出口。所谓「身份登记」只证明「某个对象调用过登记函数」，**不证明它来自真实 SDK Port**。上一版「签发能力已收紧」的结论是错误的。
+
+### 21.2 修正后的模型
+
+**不再导出任何全局签发/登记函数。** 签发能力封装进 `createOutletRegistry()` 返回的**注册表实例**：
+
+```ts
+export interface OutletRegistry {
+  issue(conversationId, recipientUid, send): TrustedSendPort;
+  verify(candidate): candidate is TrustedSendPort;
+  revoke(port): void;
+  revokeAll(): void;
+}
+export function createOutletRegistry(): OutletRegistry;
+```
+
+- 注册表**本身就是能力凭证**：谁持有它，谁就能签出被它认可的出口。
+- `verify` 只认可**本注册表**签出的对象；别的注册表签出的、或手写的同形对象，一律 false。
+- `DouyinReadOnlyPort` 在实例内私有持有注册表，通过只读 getter `outletRegistry` 暴露给受控链路。
+- `stop()` 调用 `revokeAll()`，旧出口与签发能力同时失效。
+
+导出面收敛为三个符号：`TrustedSendPort`（类型）、`OutletRegistry`（类型）、`createOutletRegistry`（工厂）。测试以源码扫描固定该导出集。
+
+### 21.3 仍然存在的诚实边界
+
+单进程 TypeScript **无法**防御「业务模块直接 import douyin-im、拿到 Account、自行 `sendMsg`」。本机制防的是**误用与越权接线**（例如随手传入一个自制 transport）。真正的隔离依赖架构约束：`platform/` 之外禁止 import SDK，doctor D10 扫描 `sendMsg` 只能出现在 `platform/douyin.ts`。
+
+不得声称本机制等价于进程级沙箱或 OS 级隔离。

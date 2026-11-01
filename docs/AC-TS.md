@@ -356,3 +356,12 @@
 - [x] AC-Secure.4 `DispatchInput` 只有单一 `trustedPort`；发送调用只走该对象，源码扫描禁止 `transport` 字段回潮。
 - [x] AC-Secure.5 回归测试证明「验证 A、发送 B」在结构上不可能（B 无参数位，调用次数恒 0）。
 - [ ] AC-Secure.6 Runner 接线与默认关闭的启用开关，未开始。
+
+### AC-T6.SecureOutlet.2 · 删除全局签发入口（2026-11-02）
+
+- [x] AC-Secure2.1 `claimPortIdentity` / `registerSendPortIssuer` / `issueTrustedSendPort` / `assertTrustedSendPort` 全部删除，不再导出。
+- [x] AC-Secure2.2 导出面恰为 `TrustedSendPort`、`OutletRegistry`、`createOutletRegistry`；源码扫描固定。
+- [x] AC-Secure2.3 `registry.verify` 只认可本注册表签出的对象；跨注册表与手写同形对象均 false。
+- [x] AC-Secure2.4 `dispatchOnce` 必须同时收到出口与其注册表；缺失或 verify 失败 → `untrusted_transport`，传输层零调用。
+- [x] AC-Secure2.5 `revokeAll()` 后出口失效、注册表不可再签发；Port `stop()` 触发。
+- [ ] AC-Secure2.6 诚实边界：本机制不等价于进程/OS 级隔离，仅防误用与越权接线；架构隔离依赖 `platform/` 之外禁 import SDK（doctor D10）。
