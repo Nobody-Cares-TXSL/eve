@@ -14,7 +14,7 @@ import { EveArchive } from '../../src/archive/store.ts';
 import { MockPlatformPort } from '../../src/platform/mock.ts';
 import { reconcileOnce } from '../../src/runtime/reconcile.ts';
 import type { InboundMessage } from '../../src/platform/types.ts';
-import { createOutletRegistry, type OutletRegistry, type TrustedSendPort } from '../../src/platform/outbound-transport.ts';
+import { installOutletRegistry, __resetInstalledRegistryForTest, type TrustedSendPort } from '../../src/platform/outbound-transport.ts';
 import {
   classifySendResponse, dispatchOnce, proofStillValid, responseFromError,
   type DispatchInput, type SendResponseLike, type SendTransport,
@@ -109,8 +109,13 @@ async function withPendingIntent(
   }
 }
 
-/** 每个出口自带注册表，避免用例之间互相撤销影响。 */
-interface CountedPort { readonly port: TrustedSendPort; readonly counter: { calls: number }; readonly registry: OutletRegistry }
+/**
+ * 信任根是进程级唯一槽位：本测试文件在顶部安装一次注册表，
+ * 之后所有出口都从它签出——与真实 Port 的行为一致。
+ */
+__resetInstalledRegistryForTest();
+const testRegistry = installOutletRegistry();
+interface CountedPort { readonly port: TrustedSendPort; readonly counter: { calls: number } }
 /**
  * 出口对象被冻结，不能挂属性，也不能用 Proxy 包装
  * （包装后就不再是 WeakSet 里登记的那个对象，守卫会正确地拒绝）。
@@ -118,29 +123,21 @@ interface CountedPort { readonly port: TrustedSendPort; readonly counter: { call
  */
 const transport = (r: SendResponseLike | (() => Promise<SendResponseLike>)): CountedPort => {
   const counter = { calls: 0 };
-  const registry = createOutletRegistry();
-  const port = registry.issue(THREAD, '333', async () => {
+  const port = testRegistry.issue(THREAD, '333', async () => {
     counter.calls++;
     return typeof r === 'function' ? r() : r;
   });
-  outletRegistryMap.set(port as unknown as object, registry);
-  return { port, counter, registry };
+  return { port, counter };
 };
 
 const base = (c: Ctx, over: Partial<DispatchInput> = {}): DispatchInput => {
-  // 默认出口及其注册表必须配对；若用例覆盖了 trustedPort 但没给 outlets，
-  // 用该出口自己的注册表，否则 dispatch 会（正确地）拒绝。
   const fallback = transport({ statusCode: 0, serverMessageId: '7701260499833538097' });
   const tp = (over.trustedPort as TrustedSendPort | undefined) ?? fallback.port;
-  // 出口自己的注册表优先；外部伪造对象没有登记，落到一个空注册表（verify 必拒）
-  const reg = (over.outlets as OutletRegistry | undefined) ??
-    registryOf(tp) ?? createOutletRegistry();
   return {
   intentId: c.intentId,
   expected: { ownerUid: '111', ownImUid: '222', targetUid: '333', conversationId: THREAD },
   live: liveRefs({ kind: 'friend' }),
   trustedPort: tp,
-  outlets: reg,
   mode: 'l1_review' as const,
   approvalId: APPROVAL,
   nowMs: c.now, coverageMaxAgeMs: 90_000, maxTextLength: 500, timeoutMs: 1_000,
@@ -148,11 +145,7 @@ const base = (c: Ctx, over: Partial<DispatchInput> = {}): DispatchInput => {
   };
 };
 
-/** 出口 → 其注册表，便于 base() 自动配对（避免「验证 A 发送 B」的测试污染）。 */
-const outletRegistryMap = new WeakMap<object, OutletRegistry>();
-function registryOf(port: TrustedSendPort | undefined): OutletRegistry | undefined {
-  return port ? outletRegistryMap.get(port as unknown as object) : undefined;
-}
+
 
 
 
@@ -352,28 +345,26 @@ test('未登记的出口一律拒绝：外部构造 { sendText } 拿不到发送
 
 test('出口绑定的会话/收件人与意图不符 → untrusted_transport', () => withPendingIntent(async (c) => {
   let wrongThreadCalls = 0;
-  const wrongThreadRegistry = createOutletRegistry();
-  const wrongThread = wrongThreadRegistry.issue('0:1:222:444', '333', async () => {
+  const wrongThread = testRegistry.issue('0:1:222:444', '333', async () => {
     wrongThreadCalls++; return { statusCode: 0, serverMessageId: '1' };
   });
-  const r = await dispatchOnce(c.a, base(c, { trustedPort: wrongThread, outlets: wrongThreadRegistry }));
+  const r = await dispatchOnce(c.a, base(c, { trustedPort: wrongThread }));
   assert.deepEqual(r, { status: 'rejected', reasonCode: 'untrusted_transport' });
   assert.equal(wrongThreadCalls, 0);
 
   let wrongRecipientCalls = 0;
-  const wrongRecipientRegistry = createOutletRegistry();
-  const wrongRecipient = wrongRecipientRegistry.issue(THREAD, '444', async () => {
+  const wrongRecipient = testRegistry.issue(THREAD, '444', async () => {
     wrongRecipientCalls++; return { statusCode: 0, serverMessageId: '1' };
   });
-  const r2 = await dispatchOnce(c.a, base(c, { trustedPort: wrongRecipient, outlets: wrongRecipientRegistry }));
+  const r2 = await dispatchOnce(c.a, base(c, { trustedPort: wrongRecipient }));
   assert.deepEqual(r2, { status: 'rejected', reasonCode: 'untrusted_transport' });
   assert.equal(wrongRecipientCalls, 0);
 }));
 
 test('出口被撤销后不可再用', () => withPendingIntent(async (c) => {
   const t = transport({ statusCode: 0, serverMessageId: '1' });
-  t.registry.revoke(t.port);
-  const r = await dispatchOnce(c.a, base(c, { trustedPort: t.port, outlets: t.registry }));
+  testRegistry.revoke(t.port);
+  const r = await dispatchOnce(c.a, base(c, { trustedPort: t.port }));
   assert.deepEqual(r, { status: 'rejected', reasonCode: 'untrusted_transport' });
   assert.equal(t.counter.calls, 0);
 }));
@@ -464,3 +455,22 @@ test('P0-2：DispatchInput 不再有独立 transport 字段（结构上无法分
   assert.match(src, /port\.sendText\(/);
   assert.doesNotMatch(src, /input\.transport\.sendText/);
 });
+
+test('P0-1 复检：调用方自建注册表 + 自签出口 + 伪造参数 → 真实出口零调用', () => withPendingIntent(async (c) => {
+  // 攻击者没有安装权（槽位已被真实信任根占用），只能自建一个注册表
+  const { installOutletRegistry, verifyAgainstInstalled } = await import('../../src/platform/outbound-transport.ts');
+  assert.throws(() => installOutletRegistry(), /outlet_registry_already_installed/,
+    '槽位不可被替换');
+  // 攻击者用自己造的「证件」——一个同形出口
+  let forgedCalls = 0;
+  const forged = {
+    conversationId: THREAD, recipientUid: '333',
+    async sendText() { forgedCalls++; return { statusCode: 0, serverMessageId: '1' }; },
+  };
+  assert.equal(verifyAgainstInstalled(forged), false, '伪造出口不被信任根认可');
+  // 即便伪造完整参数提交给 dispatch，也必须在调用真实出口前被拒
+  const r = await dispatchOnce(c.a, base(c, { trustedPort: forged as never }));
+  assert.deepEqual(r, { status: 'rejected', reasonCode: 'untrusted_transport' });
+  assert.equal(forgedCalls, 0, '伪造出口零调用');
+  assert.equal(state(c.file, c.intentId).status, 'pending', '意图状态不得改变');
+}));

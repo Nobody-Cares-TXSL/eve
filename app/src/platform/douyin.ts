@@ -10,7 +10,9 @@ import { createClient, configureLogger, type Client, type Account, type MessageE
 import { LocalQrFile } from './qr.ts';
 import { normalizeInboundMessage } from './normalize.ts';
 import { projectHistoryPage } from './history.ts';
-import { createOutletRegistry, type TrustedSendPort } from './outbound-transport.ts';
+import {
+  acquireOutletRegistry, viewOf, type SendOutletView, type TrustedSendPort,
+} from './outbound-transport.ts';
 import type { HistoryPage, PlatformPort, PlatformSink, PlatformStatus } from './types.ts';
 
 type Contact = Friend | Stranger;
@@ -67,12 +69,14 @@ export class DouyinReadOnlyPort implements PlatformPort {
   private started = false;
   private readonly contacts = new Map<string, Contact>();
   /**
-   * 出口注册表：本 Port 私有持有，是签发能力的唯一凭证。
+   * 出口注册表：由本 Port 在构造时**安装**到进程级唯一槽位。
+   * 对外只暴露只读视图（仅 verify），不泄露 issue()。
    * `stop()` 时 revokeAll，旧出口与签发能力同时失效。
    */
-  private readonly outlets = createOutletRegistry();
-  /** 供受控发送链路取用；外部无法凭空构造一个能通过校验的注册表。 */
-  get outletRegistry() { return this.outlets; }
+  private readonly acquired = acquireOutletRegistry();
+  private readonly outlets = this.acquired.registry;
+  /** 只读视图：可校验，不可签发。 */
+  get outletView(): SendOutletView { return viewOf(this.outlets); }
   private readonly recentIds = new Set<string>();
   private readonly recentQueue: string[] = [];
 
@@ -242,7 +246,8 @@ export class DouyinReadOnlyPort implements PlatformPort {
     this.verified = false;
     this.started = false;
     // 出口必须先失效，避免关停过程中仍有发送路径
-    this.outlets.revokeAll();
+    // 只有首个安装者（真实拥有信任根）才撤销；复用者不撤销别人的出口
+    if (this.acquired.owner) this.outlets.revokeAll();
     this.contacts.clear();
     this.recentIds.clear();
     this.recentQueue.length = 0;

@@ -620,3 +620,35 @@ export function createOutletRegistry(): OutletRegistry;
 单进程 TypeScript **无法**防御「业务模块直接 import douyin-im、拿到 Account、自行 `sendMsg`」。本机制防的是**误用与越权接线**（例如随手传入一个自制 transport）。真正的隔离依赖架构约束：`platform/` 之外禁止 import SDK，doctor D10 扫描 `sendMsg` 只能出现在 `platform/douyin.ts`。
 
 不得声称本机制等价于进程级沙箱或 OS 级隔离。
+
+## 22. 信任根修正：进程级唯一槽位（2026-11-02）
+
+### 22.1 上一版为何仍未封住
+
+§21 把签发收进注册表实例，但 `createOutletRegistry()` **仍是公开工厂**，且 Port 通过 `get outletRegistry()` 暴露了**带 `issue()` 的完整注册表**。
+
+于是调用方可以：
+
+```ts
+const mine = createOutletRegistry();   // 自建证件
+const port = mine.issue(...);          // 自签
+dispatchOnce({ trustedPort: port, outlets: mine });  // 自建验证器证明自建证件
+```
+
+这等价于「自己做了一张证件，再拿自己做的验证器证明它有效」。`dispatchOnce` 把调用方提供的注册表当作真实 SDK 授权证明——**信任根缺失**。
+
+### 22.2 修正：进程级唯一槽位
+
+- `installOutletRegistry()` **只能成功一次**，已安装则抛 `outlet_registry_already_installed`（fail-closed，绝不静默替换）。
+- `acquireOutletRegistry()` 供 Port 使用：已安装则复用，未安装则安装。信任根是**进程**级的，不是实例级的（多 Port 实例共享同一根）。
+- **`dispatchOnce` 不再接受调用方传入的注册表**：`DispatchInput` 删除 `outlets` 字段，改为内部调用 `verifyAgainstInstalled(trustedPort)`，只认进程级槽位里的那一个注册表。
+- Port 对外只暴露 `outletView`（**只有 `verify`，没有 `issue`**），签发能力不可通过公共 getter 取得。
+- 只有**首个安装者**（`acquireOutletRegistry().owner === true`）在 `stop()` 时执行 `revokeAll()`；复用者不撤销别人的出口。
+
+### 22.3 攻击场景回归
+
+测试固定：槽位已被真实信任根占用时，攻击者 `installOutletRegistry()` 抛错；其伪造的同形出口 `verifyAgainstInstalled` 为 false；即便伪造完整参数提交 `dispatchOnce`，也在调用真实出口前被拒，意图状态不变。
+
+### 22.4 诚实边界（不变）
+
+单进程 TypeScript 无法防御「业务模块直接 import douyin-im、拿到 Account 后自行 `sendMsg`」。本机制防的是**误用与越权接线**。真正的隔离依赖「`platform/` 之外禁止 import SDK」+ doctor D10；测试中新增静态扫描：`src/platform/` 之外出现 `sendMsg(` 即失败。

@@ -12,7 +12,7 @@
 import { createHash } from 'node:crypto';
 import type { EveArchive } from '../archive/store.ts';
 import { prepareSdkTextDraft, type TextDraftReject } from '../platform/outbound-request.ts';
-import type { OutletRegistry, TrustedSendPort } from '../platform/outbound-transport.ts';
+import { verifyAgainstInstalled, type TrustedSendPort } from '../platform/outbound-transport.ts';
 import {
   deriveSendSession, sessionStillLive,
   type LiveAccountRef, type LiveClientRef, type LiveContactRef, type SessionExpectation,
@@ -90,11 +90,6 @@ export interface DispatchInput {
    * 不能出现「验证 A、发送 B」的分离。
    */
   readonly trustedPort: TrustedSendPort;
-  /**
-   * 校验凭证：必须来自持有真实 SDK 的 Port。调用方无法凭空构造一个
-   * 能认可任意出口的注册表——`verify` 只认本注册表签出的对象。
-   */
-  readonly outlets: OutletRegistry;
   /**
    * 发送模式：
    *   'l0_auto'   —— 正常自动回复（D-019）。不要求审批记录，完全由程序 Gate 决定。
@@ -182,9 +177,9 @@ export async function dispatchOnce(archive: EveArchive, input: DispatchInput): P
     return rejected('invalid_input');
   if (input.mode === 'l1_review' && !/^[A-Za-z0-9_-]{8,64}$/.test(input.approvalId ?? ''))
     return rejected('invalid_input');
-  // 发送能力必须来自 Port 注册表签出的出口；校验对象即发送对象
-  if (!input.outlets || typeof input.outlets.verify !== 'function' ||
-      !input.outlets.verify(input.trustedPort)) return rejected('untrusted_transport');
+  // 发送能力只能来自**进程级已安装的**注册表（真实 Port 安装的唯一实例）。
+  // 调用方无法传入自己的注册表——参数里没有这个位置。
+  if (!verifyAgainstInstalled(input.trustedPort)) return rejected('untrusted_transport');
   const port = input.trustedPort;
   if (port.conversationId !== input.expected.conversationId ||
       port.recipientUid !== input.expected.targetUid)

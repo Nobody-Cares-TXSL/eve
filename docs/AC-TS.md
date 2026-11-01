@@ -365,3 +365,13 @@
 - [x] AC-Secure2.4 `dispatchOnce` 必须同时收到出口与其注册表；缺失或 verify 失败 → `untrusted_transport`，传输层零调用。
 - [x] AC-Secure2.5 `revokeAll()` 后出口失效、注册表不可再签发；Port `stop()` 触发。
 - [ ] AC-Secure2.6 诚实边界：本机制不等价于进程/OS 级隔离，仅防误用与越权接线；架构隔离依赖 `platform/` 之外禁 import SDK（doctor D10）。
+
+### AC-T6.SecureOutlet.3 · 进程级信任根（2026-11-02）
+
+- [x] AC-Secure3.1 `installOutletRegistry()` 只能成功一次；重复安装抛错，绝不静默替换信任根。
+- [x] AC-Secure3.2 `DispatchInput` 不含 `outlets`；派发只查进程级槽位（`verifyAgainstInstalled`）。
+- [x] AC-Secure3.3 Port 对外只暴露只读 `outletView`（仅 verify），签发能力不可通过公共 getter 取得。
+- [x] AC-Secure3.4 攻击者自建注册表 + 自签出口 + 伪造完整参数 → 在真实出口被调用前拒绝，零调用、意图状态不变。
+- [x] AC-Secure3.5 `src/platform/` 之外出现 `sendMsg(` 由静态扫描测试拦截。
+- [x] AC-Secure3.6 多 Port 实例共享同一信任根；只有首个安装者在 `stop()` 时 `revokeAll()`。
+- [ ] AC-Secure3.7 诚实边界：不等价于进程/OS 级隔离。

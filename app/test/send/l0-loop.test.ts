@@ -12,7 +12,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { EveArchive } from '../../src/archive/store.ts';
 import { MockPlatformPort } from '../../src/platform/mock.ts';
 import { reconcileOnce } from '../../src/runtime/reconcile.ts';
-import { createOutletRegistry, type OutletRegistry, type TrustedSendPort } from '../../src/platform/outbound-transport.ts';
+import { installOutletRegistry, __resetInstalledRegistryForTest, type TrustedSendPort } from '../../src/platform/outbound-transport.ts';
 import { runL0Once, sessionEligible, type L0LoopInput } from '../../src/send/l0-loop.ts';
 import type { AiBackend } from '../../src/ai/contracts.ts';
 import type { InboundMessage } from '../../src/platform/types.ts';
@@ -50,8 +50,9 @@ function fakeSdk(opts: { online?: boolean; blocked?: boolean; kind?: 'friend' | 
   return { client: { accounts: [account] }, account, contact };
 }
 
-/** 测试扮演 Port：自建注册表并签出绑定 fake contact 的出口。 */
-const testRegistry: OutletRegistry = createOutletRegistry();
+/** 信任根为进程级槽位：本文件安装一次，出口都从它签出。 */
+__resetInstalledRegistryForTest();
+const testRegistry = installOutletRegistry();
 function fakeOutlet(contact: { sent: string[]; sendMsg: (t: string) => Promise<SendResponseLike> }) {
   return testRegistry.issue(THREAD, '333', async (message: string) => contact.sendMsg(message));
 }
@@ -86,7 +87,6 @@ async function fixture(
       live: sdk,
       expected: { ownerUid: '111', ownImUid: '222', targetUid: '333', conversationId: THREAD },
       transport: fakeOutlet(sdk.contact),
-      outlets: testRegistry,
       handoff: {
         maxAgeMs: 90_000, timeoutMs: 1000, nowMs: now,
         runtime: opts.runtime ?? { phase: 'running', paused: false },
