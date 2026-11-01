@@ -85,7 +85,8 @@
 - [x] T6-3c（离线部分）：受控发送执行与回执三态分类、L1 审批判定、claim 后复核——`src/send/dispatch.ts`，13 条测试。
 - [x] T6-3c-real-A（离线）：真实 SDK 实例绑定、v6 审批持久化（只能消费一次）、`sent` 证据收紧为数字形式 `serverMessageId`——`outbound-session.ts` + `schema-v6.sql`，30 条测试。真实发送 0 次。
 - [x] T6-3c-real-B0（离线）：本机交互式 L1 审批（展示接收方与完整正文、精确 `CONFIRM`）+ 可信出口令牌（仅 Port 内部登记可发）+ 摘要重算校验——`approval-cli.ts`、`outbound-transport.ts`，10 条测试。真实发送 0 次。
-- [ ] T6-3c-real-B1：正式库备份 + v6 迁移、真实 SDK 出口绑定、指定接收方与内容的**单次** `sendMsg`——需操作者单独授权，不自动开放 L0。
+- [x] T6-3c-real-B1 前置（离线）：迁移演练（副本上 v2→v6 全链通过）+ 真实 SDK 出口 `createTrustedSendPort`（唯一 sendMsg 点，8 条零发送测试）+ doctor D10 语义演进。
+- [ ] T6-3c-real-B1：正式库 v2→v6 迁移、指定接收方与内容的**单次** `sendMsg`——需操作者单独授权，不自动开放 L0。
 - [ ] T6-2：pending 落盘成功后、**真正调用 SDK 前**必须持久化 dispatching；重启遗留 dispatching 保守进入 unknown，绝不盲目重发。
 - [ ] T6-3：调用 douyin-im Friend/ChatContact.sendMsg，按符合契约的服务端成功回执判 sent；不得宣称对端已显示或已读。
 - [ ] T6-4：在程序侧强制执行唯一白名单、频率/静默、消息长度、暂停、身份复核，AI 无权改写；发送前重新验一次。

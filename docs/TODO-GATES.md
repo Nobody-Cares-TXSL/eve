@@ -1153,3 +1153,49 @@ SDK `-3` → unknown 且不可再认领；未确认非零码 → unknown；`Send
 | 非 TTY 拒绝 | ✅ 管道实测 |
 
 **B1 仍未授权。** 前置条件不变：正式库备份（已就绪）→ v2→v6 迁移 → 操作者指定接收方与内容 → 单次 `sendMsg`。
+
+### T6-3c-real-B1 前置：迁移演练与真实出口（2026-11-01）
+
+#### 1. 正式库备份二次核对（操作者执行）
+
+新备份 `eve-prod-v2-20261101T122238481405Z.sqlite`：SHA-256 与清单、与 10-31 旧备份**三方一致**（`59c450cd…`），说明期间正式库无变化。本机独立复算确认。
+
+#### 2. 迁移演练（备份副本，未碰正式库）
+
+`scripts/t6-migration-rehearsal.ts` 在副本上执行 v2→v6：
+
+| 检查 | 结果 |
+|---|---|
+| 逐级迁移（v2→v3→v4→v5→v6） | 每步消息数恒为 132 |
+| 版本 / meta 对齐 | `user_version=6`、`schema_version=6` |
+| 记录保留 | messages 132、batches 26、conversations 1、epochs 11 |
+| 完整性 | `quick_check=ok` |
+| 新表齐全 | `send_intents`/`send_intent_events`/`send_text`/`send_approvals`/`ai_*` 全部存在 |
+| 重复迁移 | 幂等，版本与数据不变 |
+| 失败回滚（v5 注入 v6 失败） | 仍 v5、无 `send_approvals`、数据完整、`quick_check=ok` |
+| 源备份 | SHA-256 未变 |
+| 总判定 | **pass** |
+
+**过程中修复**：演练脚本初版把 `owner_uid`/`target_uid` 打进报告。该脚本会进公开仓库，违反「日志不得输出 UID」约束，已改为只报告「身份是否存在」。
+
+#### 3. 真实 SDK 发送出口（零发送测试）
+
+`DouyinReadOnlyPort.createTrustedSendPort()` 成为全项目**唯一** `sendMsg` 调用点：
+
+- 未上线 / 非白名单会话 / 联系人未绑定 → 返回 `null`
+- 出口经令牌登记；每次发送前重新核验会话，失效即抛 `send_session_changed`
+- `stop()` 撤销全部出口，令牌立即失效
+- 8 条测试全部使用 FakeClient，**不触网、不发真实消息**
+
+`doctor` D10 语义同步演进：从「零 `sendMsg`」改为「只能出现在 `platform/douyin.ts`」，实测输出 `sendMsg 仅出现在唯一受控出口（platform/douyin.ts）`。
+
+#### 4. 验证
+
+- `pnpm typecheck` 0 错；`pnpm test` **329/329**（321 + 8）。
+- 正式库仍 v2、未迁移；本轮真实 `sendMsg` 调用 **0** 次；模型请求 0 次。
+
+#### 5. 一个尚未定位的偶发失败（如实记录）
+
+全量并行运行时，`T5-4 min interval and future timestamps fail closed` 偶发失败（约 1/10 次），单独运行 5 次全过。该用例属 T5-4，本轮未修改其代码。失败时全量耗时明显升高（单用例 4.6s、整轮多例 9–15s），指向负载下的时序敏感，而非逻辑缺陷。**未修复，不声称稳定**；后续应给该用例加更宽的预算或改用注入时钟。
+
+**判定：B1 前置（迁移演练 + 真实出口零发送验收）通过；正式库迁移与首次真实发送仍未授权。**

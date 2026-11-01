@@ -354,3 +354,35 @@ send_approvals(approval_id PK, intent_id UNIQUE, recipient_uid,
 - 正式库完成**经批准的备份 + v6 迁移**；
 - 操作者明确指定接收方、精确消息内容，并授权**最多一次** `sendMsg()`；
 - 遇 `unknown` 不重试、不补发，不自动开启 L0。
+
+## 15. T6-3c-real-B1 前置：真实 SDK 出口与迁移演练（离线）
+
+### 15.1 唯一受控发送出口
+
+`DouyinReadOnlyPort.createTrustedSendPort(conversationId)` 是全项目**唯一**出现 `sendMsg` 的地方：
+
+- 只在 `started && verified && active` 时创建；未上线返回 `null`。
+- 只接受属于唯一白名单目标的会话；其他线程一律 `null`。
+- 联系人必须已绑定且 `uid === targetUid`。
+- 出口携带 `conversationId` 与 `recipientUid`，经 `issueTrustedSendPort()` 登记。
+- **每次 `sendText` 前重新核验**：会话失效/账号下线/换号即抛 `send_session_changed`，不调用 `sendMsg`。
+- `stop()` 撤销全部出口，令牌立即失效。
+
+### 15.2 doctor D10 语义演进
+
+D10 从「源码零 `sendMsg`」改为「`sendMsg` 只能出现在白名单文件」：
+
+- 出现在 `platform/douyin.ts` 之外 → **fail**，并列出违规文件；
+- 完全没有 → ok（只读阶段）；
+- 仅出现在唯一出口 → ok，并说明位置。
+
+### 15.3 迁移演练
+
+`scripts/t6-migration-rehearsal.ts <备份>` 在**副本**上执行 v2→v6：
+
+- 逐级迁移，每步校验消息数不变；
+- 迁移后校验版本/meta 对齐、消息/批次/会话数保留、`quick_check=ok`、新表齐全；
+- 重复迁移幂等；
+- 在停在 v5 的副本上注入 v6 失败，验证回滚（仍 v5、无 `send_approvals`、数据完整）；
+- 校验源备份 SHA-256 未变；
+- **报告不输出 owner/target UID**，只报告身份是否存在。

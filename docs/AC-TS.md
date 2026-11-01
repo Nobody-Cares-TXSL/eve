@@ -279,3 +279,13 @@
 - [x] AC-realB0.6 出口撤销后立即不可用。
 - [x] AC-realB0.7 TTY 端到端已由操作者在真实终端完成（2026-11-01）：`isTTY:true`、屏幕完整显示接收方 `333` 与完整正文、输入 `CONFIRM` → `approved` 且 `approvalRegistered:true`、第二次尝试 `unavailable`、`verdict:pass`。非 TTY（管道）实测 `rejected_non_tty`；`--self-test` 覆盖「先错后对」路径。
 - [ ] AC-realB0.8 **B1**：真实 SDK 出口绑定、正式库备份迁移、单次 `sendMsg` 验收——需单独授权，未开始。
+
+### AC-T6.3c-real-B1-prep · 真实出口与迁移演练（**离线已实现**，2026-11-01）
+
+- [x] AC-B1prep.1 `DouyinReadOnlyPort.createTrustedSendPort()` 为唯一 `sendMsg` 调用点；未上线/非白名单/联系人未绑定均返回 `null`。
+- [x] AC-B1prep.2 出口经令牌登记；每次发送前重新核验会话，失效即抛错且不调用 `sendMsg`；`stop()` 撤销全部出口。
+- [x] AC-B1prep.3 doctor D10 演进为「发送调用只能出现在白名单文件」，出现在别处即 fail 并列出文件。
+- [x] AC-B1prep.4 迁移演练在备份副本上完成 v2→v6：记录保留、版本/meta 对齐、幂等、失败回滚、源备份未被修改。
+- [x] AC-B1prep.5 演练脚本不输出真实 UID（只报告身份是否存在）。
+- [ ] AC-B1prep.6 **正式库 v2→v6 迁移**：需操作者授权后执行，未开始。
+- [ ] AC-B1prep.7 **首次真实发送**：指定接收方与内容、单次 `sendMsg`——需单独授权，未开始。
