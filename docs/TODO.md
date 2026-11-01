@@ -86,7 +86,8 @@
 - [x] T6-3c-real-A（离线）：真实 SDK 实例绑定、v6 审批持久化（只能消费一次）、`sent` 证据收紧为数字形式 `serverMessageId`——`outbound-session.ts` + `schema-v6.sql`，30 条测试。真实发送 0 次。
 - [x] T6-3c-real-B0（离线）：本机交互式 L1 审批（展示接收方与完整正文、精确 `CONFIRM`）+ 可信出口令牌（仅 Port 内部登记可发）+ 摘要重算校验——`approval-cli.ts`、`outbound-transport.ts`，10 条测试。真实发送 0 次。
 - [x] T6-3c-real-B1 前置（离线）：迁移演练（副本上 v2→v6 全链通过）+ 真实 SDK 出口 `createTrustedSendPort`（唯一 sendMsg 点，8 条零发送测试）+ doctor D10 语义演进。
-- [ ] T6-3c-real-B1：正式库 v2→v6 迁移、指定接收方与内容的**单次** `sendMsg`——需操作者单独授权，不自动开放 L0。
+- [x] T6-3c-real-B1 迁移部分：正式库已从 v2 **逐级**升级至 v6（四次独立事务），备份/完整性/外键/计数全部核验通过。
+- [ ] T6-3c-real-B1 发送部分：指定接收方与内容的**单次** `sendMsg`——需操作者单独授权，不自动开放 L0。
 - [ ] T6-2：pending 落盘成功后、**真正调用 SDK 前**必须持久化 dispatching；重启遗留 dispatching 保守进入 unknown，绝不盲目重发。
 - [ ] T6-3：调用 douyin-im Friend/ChatContact.sendMsg，按符合契约的服务端成功回执判 sent；不得宣称对端已显示或已读。
 - [ ] T6-4：在程序侧强制执行唯一白名单、频率/静默、消息长度、暂停、身份复核，AI 无权改写；发送前重新验一次。
@@ -118,6 +119,6 @@
 
 ## 当前下一步
 
-**当前基线：T0～T4 已完成，T5 真实 Claude dry-run Gate 已通过；T6-1/1b/2a/2b、T6-3a、T6-3b、T6-3c、real-A、real-B0（均为离线）的 Gate 已通过，321/321。真实发送仍然完全阻断（`sendMsg` 零调用）。** 下一步只剩 `T6-3c-real-B1`：正式库备份 + v6 迁移、真实 SDK 出口绑定、操作者指定接收方与内容的**单次** `sendMsg`——**必须单独明确授权**。T5 长期费用/超时限流退避、平台字数口径仍未完成，必须保留 Gate。
+**当前基线：T0～T4 已完成，T5 真实 Claude dry-run Gate 已通过；T6 的离线 Gate（1/1b/2a/2b/3a/3b/3c/real-A/real-B0/B1 前置）全部通过，331/331；正式库已迁移至 v6。真实发送仍然完全阻断（`sendMsg` 零调用）。** 下一步只剩 `T6-3c-real-B1`：正式库备份 + v6 迁移、真实 SDK 出口绑定、操作者指定接收方与内容的**单次** `sendMsg`——**必须单独明确授权**。T5 长期费用/超时限流退避、平台字数口径仍未完成，必须保留 Gate。
 
 **当前最重要的边界**：SDK 已验证的是可行性，不是 Eve 整体完成；不修改上游账号凭证，不在未经准备的情况下触发真实自动发送。

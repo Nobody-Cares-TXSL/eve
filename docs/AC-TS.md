@@ -298,3 +298,13 @@
 - [x] AC-T5.ClockInjection.4 **未放宽任何安全阈值**：`minIntervalMs` 默认 0、Coverage TTL、预算上限与全部 fail-closed 分支保持不变。
 - [x] AC-T5.ClockInjection.5 边界回归覆盖：未来时间戳、恰好到达最小间隔、Coverage 过期（后端零调用）。
 - [ ] AC-T5.ClockInjection.6 原始偶发失败的根因未定位（隔离 150 轮 + 全量 8 轮均未复现）；本项只消除该类时序敏感，不声称已证明根因。
+
+### AC-T6.MigrateProd · 正式库逐级迁移（2026-11-01 已执行）
+
+- [x] AC-Migrate.1 迁移前确认无 Runner、无进程占用数据库。
+- [x] AC-Migrate.2 生成一致性备份（`VACUUM INTO`），校验可打开、版本 v2、计数一致、SHA-256 与清单相符。
+- [x] AC-Migrate.3 逐级执行 v3/v4/v5/v6，每步校验 `user_version` 与 `schema_version` 同步、消息数不变、`quick_check=ok`。
+- [x] AC-Migrate.4 最终核验：`quick_check=ok`、`foreign_key_check` 零违规、messages 132 / batches 26 / conversations 1 / epochs 11 全部保留。
+- [x] AC-Migrate.5 失败即停：不继续、不降级，报告停点并给出还原指引（脚本固化该行为）。
+- [x] AC-Migrate.6 收尾确认：Runner 未运行、`send_intents=0`、`send_approvals=0`、无真实发送、Git 工作区无意外改动。
+- [ ] AC-Migrate.7 **首次真实发送**：仍需单独授权，指定接收方、完整正文、最多一次。

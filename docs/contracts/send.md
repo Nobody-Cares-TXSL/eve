@@ -386,3 +386,32 @@ D10 从「源码零 `sendMsg`」改为「`sendMsg` 只能出现在白名单文�
 - 在停在 v5 的副本上注入 v6 失败，验证回滚（仍 v5、无 `send_approvals`、数据完整）；
 - 校验源备份 SHA-256 未变；
 - **报告不输出 owner/target UID**，只报告身份是否存在。
+
+## 16. 正式库 v2→v6 迁移（受控执行）
+
+### 16.1 迁移不是单一事务
+
+`upgradeToV6()` 只接受 v5。正式库从 v2 出发，实际执行链是**四次独立的显式升级**：
+
+```
+v2 --upgradeToV3()--> v3 --upgradeToV4()--> v4 --upgradeToV5()--> v5 --upgradeToV6()--> v6
+```
+
+每一步各自 `BEGIN IMMEDIATE` / `COMMIT`。因此**任一步失败时数据库会合法地停在中间版本**，不会整体回滚到 v2。此时不得调用任何「降级函数」，只能按恢复流程用迁移前备份还原。
+
+### 16.2 迁移 Gate（脚本固化）
+
+`scripts/t6-migrate-prod.ts --confirm --backup-dir <dir>`：
+
+1. **确认无人占用**：`lsof` 检查数据库与 `-wal`/`-shm`；`pgrep` 确认没有 `cli.ts run`。
+2. **一致性备份**：`VACUUM INTO` 生成快照（含 WAL 已提交内容），校验可打开、版本、消息/批次计数、SHA-256，并写 JSON 清单。
+3. **逐级迁移**：每步后校验 `user_version`、`archive_meta.schema_version`、消息数、`quick_check`。
+4. **最终核验**：`quick_check`、`foreign_key_check`（零违规）、消息/批次/会话/Epoch 计数与迁移前一致。
+5. **失败即停**：不继续下一步、不尝试降级；报告停在哪个版本并给出还原指引。
+6. **收尾**：确认 Runner 仍未运行、未启用任何真实发送。
+
+脚本不导入任何发送模块，也不启动 Runner。
+
+### 16.3 迁移成功 ≠ 授权发送
+
+数据库到 v6 只代表具备存储结构。**首次 `sendMsg()` 仍需独立授权**，且必须指定接收方、完整正文与「最多一次」范围。
