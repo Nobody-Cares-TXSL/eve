@@ -1,9 +1,18 @@
-/** T1: douyin-im 的只读接入边界。只能在本模块导入 SDK；绝不调用 sendMsg。 */
+/**
+ * douyin-im 接入边界。只能在本模块导入 SDK。
+ *
+ * T1–T6-3c-real-B0 期间本模块严格只读。T6-3c-real-B1 起新增**唯一**受控发送出口
+ * `createTrustedSendPort()`：它只在活跃已验证会话下创建、经令牌登记、stop() 时撤销。
+ * 除该出口外，本模块不得出现任何其他发送调用。
+ */
 import { createClient, configureLogger, type Client, type Account, type MessageEvent,
   type Friend, type Stranger, PrivateMessageEvent, StrangerMessageEvent } from 'douyin-im';
 import { LocalQrFile } from './qr.ts';
 import { normalizeInboundMessage } from './normalize.ts';
 import { projectHistoryPage } from './history.ts';
+import {
+  issueTrustedSendPort, revokeTrustedSendPort, type TrustedSendPort,
+} from './outbound-transport.ts';
 import type { HistoryPage, PlatformPort, PlatformSink, PlatformStatus } from './types.ts';
 
 type Contact = Friend | Stranger;
@@ -59,6 +68,8 @@ export class DouyinReadOnlyPort implements PlatformPort {
   private blocked = false;
   private started = false;
   private readonly contacts = new Map<string, Contact>();
+  /** 由本 Port 发出的可信出口，stop() 时全部撤销。 */
+  private readonly sendPorts = new Set<object>();
   private readonly recentIds = new Set<string>();
   private readonly recentQueue: string[] = [];
 
@@ -227,6 +238,9 @@ export class DouyinReadOnlyPort implements PlatformPort {
   async stop(): Promise<void> {
     this.verified = false;
     this.started = false;
+    // 出口必须先失效，避免关停过程中仍有发送路径
+    for (const p of this.sendPorts) revokeTrustedSendPort(p);
+    this.sendPorts.clear();
     this.contacts.clear();
     this.recentIds.clear();
     this.recentQueue.length = 0;
@@ -239,6 +253,44 @@ export class DouyinReadOnlyPort implements PlatformPort {
       this.active = undefined;
       await this.qr.remove();
     }
+  }
+
+  /**
+   * T6-3c-real-B1 前置：由**当前活跃会话**创建唯一可信发送出口。
+   *
+   * 这是全项目唯一允许出现 `sendMsg` 的地方。它：
+   *   - 只在 started && verified && 单账号在线时创建；
+   *   - 只接受属于唯一白名单目标的会话；
+   *   - 每次 sendText 前重新核验会话仍有效（下线/换号即抛错，不发送）；
+   *   - 经 issueTrustedSendPort 登记，外部构造的同形对象拿不到令牌；
+   *   - stop() 时全部撤销。
+   *
+   * 返回 null 表示当前不可用（未上线、会话不符、联系人未绑定）。
+   */
+  createTrustedSendPort(conversationId: string): TrustedSendPort | null {
+    if (!this.started || !this.verified || !this.active) return null;
+    const account = this.active;
+    const ownUids = this.identities(account);
+    if (!belongsToTarget(conversationId, ownUids, this.targetUid)) return null;
+    const contact = this.contacts.get(conversationId) ??
+      [account.pickFriend(this.targetUid), account.pickStranger(this.targetUid)]
+        .find((c): c is Contact => !!c && c.threadId === conversationId);
+    if (!contact || contact.uid !== this.targetUid) return null;
+
+    const port: TrustedSendPort = {
+      conversationId,
+      recipientUid: this.targetUid,
+      sendText: async (message: string) => {
+        // 发送前最后一道：会话必须仍然有效，否则拒绝
+        if (!this.started || !this.verified || this.active !== account || !account.online) {
+          throw new Error('send_session_changed');
+        }
+        // 唯一真实发送调用点。上层（dispatchOnce）已完成账本、审批、Proof 与实例复核。
+        return contact.sendMsg(message);
+      },
+    };
+    this.sendPorts.add(port);
+    return issueTrustedSendPort(port);
   }
 
   async readHistory(conversationId: string, cursor?: string | null): Promise<HistoryPage> {

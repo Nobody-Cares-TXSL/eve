@@ -17,7 +17,8 @@
     "t5:demo": "node scripts/t5-demo.ts",
     "t5:claude": "node scripts/t5-demo.ts --claude",
     "t5:check": "node scripts/t5-claude-check.ts",
-    "t6:approval-tty": "node scripts/t6-approval-tty.ts"
+    "t6:approval-tty": "node scripts/t6-approval-tty.ts",
+    "t6:rehearsal": "node scripts/t6-migration-rehearsal.ts"
   },
   "dependencies": {
     "douyin-im": "1.1.0"

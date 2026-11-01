@@ -5,18 +5,26 @@ import {loadConfig} from './config.ts';
 import {readState,paths,isAlive} from './state.ts';
 type Level='ok'|'warn'|'fail';
 export interface Check {id:string;level:Level;detail:string;fix?:string;}
-/** 源文件里是否出现发送调用：只读阶段的硬边界，doctor 必须能独立验证。
+/**
+ * 发送调用的白名单位置：T6-3c-real-B1 起，全项目唯一允许出现 `sendMsg` 的文件。
+ * 其余任何文件出现发送调用都视为边界破坏。
+ */
+const SEND_CALL_ALLOWED = ['douyin.ts'];
+
+/** 收集出现发送调用的文件（相对 srcDir 的路径）。
  *  跳过本文件自身——检查器的检测模式本身就在源码里，自指会误报。 */
-async function hasSendCall(dir:string):Promise<boolean>{
+async function findSendCalls(dir:string, root=dir):Promise<string[]>{
+  const found:string[]=[];
   for(const name of await readdir(dir)){
     if(name==='doctor.ts') continue;
     const full=join(dir,name);
     const st=await stat(full);
-    if(st.isDirectory()){ if(await hasSendCall(full)) return true; continue; }
+    if(st.isDirectory()){ found.push(...await findSendCalls(full, root)); continue; }
     if(!name.endsWith('.ts')) continue;
-    if(/\bsendMsg\s*\(/.test(await readFile(full,'utf8'))) return true;
+    if(/\bsendMsg\s*\(/.test(await readFile(full,'utf8')))
+      found.push(full.slice(root.length).replace(/^[/\\]/,''));
   }
-  return false;
+  return found;
 }
 export async function doctor(configFile:string,stateDir:string,dataDir:string,srcDir:string):Promise<{checks:Check[];summary:{ok:number;warn:number;fail:number}}> {
   const c:Check[]=[];
@@ -48,10 +56,13 @@ export async function doctor(configFile:string,stateDir:string,dataDir:string,sr
     const mode=st.mode&0o777;
     add('D9',mode===0o700?'ok':'warn',mode===0o700?'凭据目录权限 0700':'凭据目录权限非 0700，需 t1:harden');
   } catch {add('D9','warn','尚无本机登录凭据（需先完成扫码登录）');}
-  // D10：只读边界必须由代码本身证明，而不是写在文档里
+  // D10：发送能力必须收敛到唯一出口，不能散落在任意模块
   try {
-    const sending=await hasSendCall(srcDir);
-    add('D10',sending?'fail':'ok',sending?'源码中存在 sendMsg 调用，违反只读阶段':'源码无 sendMsg 调用');
+    const calls=await findSendCalls(srcDir);
+    const stray=calls.filter(f=>!SEND_CALL_ALLOWED.some(a=>f.endsWith(a)));
+    if(stray.length>0) add('D10','fail','发送调用出现在白名单之外：'+stray.join(', '));
+    else if(calls.length===0) add('D10','ok','源码无 sendMsg 调用');
+    else add('D10','ok','sendMsg 仅出现在唯一受控出口（'+calls.join(', ')+'）');
   } catch {add('D10','warn','无法扫描源码中的发送调用');}
   // D11 无法自动化：平台使用风险只能由人确认
   add('D11','warn','平台使用风险需人工确认（无法自动判定）');
