@@ -1272,3 +1272,32 @@ SDK `-3` → unknown 且不可再认领；未确认非零码 → unknown；`Send
 - **迁移成功不等于授权发送**：首次 `sendMsg()` 仍需单独授权，并指定接收方、完整正文与最多一次。
 
 **判定：迁移 Gate 通过；真实发送仍未授权。**
+
+### T6 真实 T5→T6 交接通道（2026-11-01）
+
+#### 操作者指出的设计冲突
+
+T6 意图要求正文来自真实 T5 决策（`ai_claim_id` + `decision_digest` + `reply_length` 三者必须与某条 `recorded` 一致）。因此**不能**把固定测试文字直接塞进 `send_text` 再伪造 T5 记录——那等于伪造审计链，会让「只发你批准的那一条」的论证失效。
+
+正确做法：让模型产生正文，通道是新增的 `durableDecisionWithSend()`。
+
+#### 实现
+
+- `evaluateBackend()`：从 `evaluateCandidate` 抽出，合法时**返回原始 `AiDecision`**（旧路径只留摘要与长度，正文被丢弃，T6 拿不到）。
+- `durableDecisionWithSend()`：`claimAiDryRun` → `evaluateBackend` → `finalizeAiWithSend`，同一事务完成 T5 recorded + T6 pending + 正文。
+- `durableDryRunOne()` 行为完全不变，既有 T5 测试全部保持通过。
+
+#### 测试（新增 9 条）
+
+合法 reply → `recorded_pending`，`send_text` 中就是模型生成的正文（不是固定串）；意图的 `ai_claim_id` 绑定该 claim、`not_before_ms` 正确；skip → `recorded_no_intent('not_reply')` 且零意图零正文；运行态非 running → 仍 recorded 但零意图；后端异常 → `blocked` 且 claim 记 blocked；非法决策 → `invalid_decision`；推理窗口内 Proof 换代 → `blocked` 且零意图；v4 库 → `storage_unavailable`；同一事件第二次 → `no_pending_event`；源码扫描确认 engine 不导入 SDK/sendMsg/`src/send/`。
+
+#### 验证
+
+- `pnpm typecheck` 0 错；`pnpm test` **340/340**（331 + 9）。
+- 正式库 v6 未改动；真实 `sendMsg` 调用 0 次。
+
+#### 有意未做：Runner 接线
+
+Runner 的 AI 槽仍是 test-only，CLI 对 `--experimental-ai-dry-run` 直接返回 2。在没有授权的启用路径前接线，只会在真实运行中生成 `pending` 意图与**真实聊天正文**（写入 `send_text`）却没有可用派发器，形成无人消费的隐私面。留到首次发送授权时，与 L1 审批、单实例锁、派发器一并完成。
+
+**判定：T5→T6 交接通道离线通过；首次真实发送仍需单独授权。**

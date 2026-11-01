@@ -415,3 +415,41 @@ v2 --upgradeToV3()--> v3 --upgradeToV4()--> v4 --upgradeToV5()--> v5 --upgradeTo
 ### 16.3 迁移成功 ≠ 授权发送
 
 数据库到 v6 只代表具备存储结构。**首次 `sendMsg()` 仍需独立授权**，且必须指定接收方、完整正文与「最多一次」范围。
+
+## 17. 真实 T5→T6 交接通道（2026-11-01）
+
+### 17.1 为什么不能直接塞固定测试文字
+
+T6 的发送意图要求 `ai_claim_id` 绑定一条**真实的 T5 recorded 决策**，且 `decision_digest` 与 `reply_length` 必须与该决策一致。若把一段固定测试文字直接写进 `send_text` 并伪造 `ai_decision_attempts` 记录：
+
+- 等于伪造审计链，破坏「意图必须可追溯到真实模型决策」这一前提；
+- 后续任何「只发你批准的那一条」的论证都会失效。
+
+因此**首次发送的正文必须由模型产生**，通道是 `durableDecisionWithSend()`。
+
+### 17.2 通道实现
+
+`src/ai/engine.ts`：
+
+- 抽出 `evaluateBackend()`：调用后端并把结果收敛为「合法 `AiDecision`」或「固定失败码」。与旧 `evaluateCandidate` 的唯一区别是**合法时返回原始决策对象**——T6 需要正文，不能只留摘要。
+- 新增 `durableDecisionWithSend()`：`claimAiDryRun` → `evaluateBackend` → `finalizeAiWithSend`。
+  - 合法 reply → 同一事务内完成 T5 `recorded` + T6 `pending` 意图 + 受限正文；
+  - skip/defer → 只记 `recorded`，不产生意图与正文；
+  - 策略拒绝 → 仍记 `recorded`，返回 `recorded_no_intent` + 拒绝码；
+  - 后端失败/非法决策 → 只记 `blocked` 审计，无意图、无正文；
+  - 推理窗口内 Proof 换代 → `blocked`，不落意图。
+
+`durableDryRunOne()` 行为完全不变（仍只写摘要），既有测试全部保持通过。
+
+### 17.3 仍然不发送
+
+`engine.ts` 不导入 `douyin-im`、不调用 `sendMsg`、不引用 `src/send/`（测试以源码扫描固定）。通道只负责「产生合法的待审批意图」。
+
+### 17.4 Runner 尚未接线（有意为之）
+
+Runner 的 AI 槽仍是 test-only，CLI 对 `--experimental-ai-dry-run` 直接返回 2。在没有授权的启用路径之前把它接到 `durableDecisionWithSend`，只会：
+
+- 在真实运行中生成 `pending` 意图与**真实聊天正文**（写入 `send_text`），却没有可用的派发器；
+- 形成无人消费的隐私面。
+
+因此 Runner 接线留到「首次发送授权」那一步，与 L1 审批、单实例锁、派发器一并完成。

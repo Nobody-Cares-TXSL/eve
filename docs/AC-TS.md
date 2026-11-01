@@ -308,3 +308,14 @@
 - [x] AC-Migrate.5 失败即停：不继续、不降级，报告停点并给出还原指引（脚本固化该行为）。
 - [x] AC-Migrate.6 收尾确认：Runner 未运行、`send_intents=0`、`send_approvals=0`、无真实发送、Git 工作区无意外改动。
 - [ ] AC-Migrate.7 **首次真实发送**：仍需单独授权，指定接收方、完整正文、最多一次。
+
+### AC-T6.Handoff · 真实 T5→T6 交接通道（**离线已实现**，2026-11-01）
+
+- [x] AC-Handoff.1 `evaluateBackend()` 在决策合法时返回**原始 `AiDecision`**，供 T6 取用正文；不合法时返回固定失败码。
+- [x] AC-Handoff.2 `durableDecisionWithSend()` 在同一事务内完成 T5 `recorded` + T6 `pending` 意图 + `send_text` + 事件组。
+- [x] AC-Handoff.3 意图的 `ai_claim_id` 必须绑定产生它的 T5 claim，`decision_digest` 与 `reply_length` 与该决策一致。
+- [x] AC-Handoff.4 skip/defer 与策略拒绝只写 `recorded`，不产生意图与正文；后端失败与非法决策只写 `blocked`。
+- [x] AC-Handoff.5 推理窗口内 Proof 换代 → `blocked`，不落意图。
+- [x] AC-Handoff.6 `durableDryRunOne()` 行为不变，既有 T5 测试全部保持通过。
+- [x] AC-Handoff.7 `engine.ts` 不导入 `douyin-im`、不调用 `sendMsg`、不引用 `src/send/`。
+- [ ] AC-Handoff.8 Runner 接线：需要授权的启用路径 + L1 审批 + 派发器，未开始。
