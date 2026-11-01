@@ -553,3 +553,30 @@ AI 不能跳过白名单、静默期与限流；程序不提供可被 AI 输出�
 `runL0Once()` 已可端到端运行（Fake SDK），但 **Runner 尚未调用它**：需要
 单实例锁、暂停栅栏、`createTrustedSendPort` 生命周期与「何时开始自动回复」的
 一次性启用开关。真实平台发送仍需操作者单独授权。
+
+## 20. 可信出口的两个 P0 修复（2026-11-02）
+
+### 20.1 P0-1：签发能力曾对所有模块开放
+
+**问题**：`issueTrustedSendPort()` 是公开导出。任何仓库内模块都能导入它，为自己构造的对象登记 WeakSet 令牌——令牌因此**不能证明**对象来自 `DouyinReadOnlyPort`。
+
+**修复**：
+
+- 删除公开的 `issueTrustedSendPort()`。
+- 出口类 `FrozenSendPort` **不导出**，构造函数私有；对象创建后 `Object.freeze`，无法改写会话或收件人。
+- 签发只能通过 `registerSendPortIssuer(owner, identity)`；该函数要求 `identity` 是经 `claimPortIdentity()` 登记的 Port 身份对象。普通模块无法凭空取得该对象，因此**签不出可信出口**。
+- 签发器支持 `revoke` / `revokeAll`；Port `stop()` 调用 `revokeAll()`，旧出口与签发能力同时失效。
+
+### 20.2 P0-2：验证的出口与发送的出口可能不同
+
+**问题**：`dispatchOnce` 校验 `input.trustedPort`，却用 `input.transport.sendText()` 发送。二者没有引用一致性检查——可以「验证 A、发送 B」。
+
+**修复**：
+
+- `DispatchInput` **删除** `transport` 字段，只保留单一 `trustedPort`。
+- 校验通过后，所有发送调用只走这个已校验对象：`port.sendText(...)`。
+- 回归测试断言：只传 A 时 B 的调用次数恒为 0；源码扫描禁止 `input.transport.sendText` 与 `readonly transport: SendTransport` 回潮。
+
+### 20.3 仍未做
+
+Runner 接线（单实例锁、暂停栅栏、延迟调度、出口生命周期、默认关闭的启用开关）尚未开始。

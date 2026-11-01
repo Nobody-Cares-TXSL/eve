@@ -1372,3 +1372,34 @@ Runner 的 AI 槽仍是 test-only，CLI 对 `--experimental-ai-dry-run` 直接�
 - **多会话准入**：当前仍单会话；任何好友/陌生人自主回复需单独设计。
 
 **判定：L0 链路离线通过；Runner 接线与真实发送仍未授权。**
+
+### 可信出口两个 P0 修复（2026-11-02）
+
+操作者审查 `fb0ebb7` 后指出两处权限边界漏洞。**修复先于 Runner 接线**——否则「默认关闭」只降低误操作概率，不构成可信链路。
+
+#### P0-1 签发能力对所有模块开放
+
+`issueTrustedSendPort()` 是公开导出，任何模块都能为自己构造的对象登记令牌，令牌因此不能证明来源。
+
+修复：删除该导出；出口类不导出且构造函数私有、实例 `Object.freeze`；签发必须通过 `registerSendPortIssuer(owner, identity)`，其中 `identity` 需经 `claimPortIdentity()` 登记——普通模块拿不到，签不出出口。签发器支持 `revoke`/`revokeAll`，Port `stop()` 时调用。
+
+#### P0-2 验证对象与发送对象可能不同
+
+`dispatchOnce` 校验 `input.trustedPort` 却用 `input.transport.sendText()` 发送，可「验证 A、发送 B」。
+
+修复：`DispatchInput` 删除 `transport`，只保留单一 `trustedPort`；校验后所有发送只走该对象。
+
+#### 测试（新增 6 条）
+
+- 无 Port 身份调用 `registerSendPortIssuer` → `send_port_issuer_not_authorized`
+- `revokeAll()` 后出口失效、签发器不可再签发
+- 出口被冻结，改写 `conversationId` 抛 TypeError
+- Port 签出的出口可校验、`stop()` 后失效
+- 只传 A 时 B 的调用次数恒为 0（结构上无法「验证 A 发送 B」）
+- 源码扫描禁止 `readonly transport: SendTransport` 与 `input.transport.sendText` 回潮
+
+#### 验证
+
+`pnpm typecheck` 0 错；`pnpm test` **366/366**（360 + 6）。正式库 v6 未改动；真实 `sendMsg` 调用 0 次。
+
+**判定：两个 P0 已封；Runner 接线未开始。**

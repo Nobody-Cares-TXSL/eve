@@ -347,3 +347,12 @@
 - [ ] AC-L0.10 Runner 接线（单实例锁、暂停栅栏、出口生命周期、一次性启用开关）未开始。
 - [ ] AC-L0.11 真实平台发送需单独授权，未开始。
 - [ ] AC-L0.12 多会话准入未开始（当前单会话）。
+
+### AC-T6.SecureOutlet · 可信出口 P0 修复（2026-11-02）
+
+- [x] AC-Secure.1 公开的 `issueTrustedSendPort()` 已删除；出口类不导出、构造函数私有、实例冻结。
+- [x] AC-Secure.2 签发必须持有经 `claimPortIdentity()` 登记的 Port 身份；普通模块调用 `registerSendPortIssuer` 被拒（`send_port_issuer_not_authorized`）。
+- [x] AC-Secure.3 `revokeAll()` 后已签出的出口全部失效，且签发器不可再签发。
+- [x] AC-Secure.4 `DispatchInput` 只有单一 `trustedPort`；发送调用只走该对象，源码扫描禁止 `transport` 字段回潮。
+- [x] AC-Secure.5 回归测试证明「验证 A、发送 B」在结构上不可能（B 无参数位，调用次数恒 0）。
+- [ ] AC-Secure.6 Runner 接线与默认关闭的启用开关，未开始。
