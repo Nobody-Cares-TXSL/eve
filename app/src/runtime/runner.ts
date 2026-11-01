@@ -306,8 +306,9 @@ export class Runner {
             this.archive=EveArchive.open(this.archivePath,this.trustedIdentity);
             if(this.reconcileEnabled){
               this.archive.upgradeToV2();
-              if(this.aiDryRun){
+              if(this.aiDryRun||this.l0){
                 // Never silently upgrade a production database. Single-instance lock is required.
+                // L0 与 dry-run 共用同一 T5 claim 账本，因此都必须执行恢复。
                 this.archive.recoverAbandonedAiClaims();
               }
               this.archive.invalidateCurrentCoverage();
@@ -322,7 +323,14 @@ export class Runner {
       // 崩溃恢复必须在建库之后、开始处理新事件之前。
       // dispatching → unknown，绝不自动重试；遗留 pending 只在重新通过 Gate 后派发。
       if(this.reconcileEnabled&&this.archive&&!this.faulted&&!this.stopping){
-        try{this.archive.recoverInterruptedSends(Date.now());}
+        try{
+          this.archive.recoverInterruptedSends(Date.now());
+          // 接管遗留 pending：重启后继续派发未发送的意图，**不重新调用 AI**
+          if(this.l0&&this.confirmedConversationId){
+            const pending=this.archive.listPendingSendIntents(this.confirmedConversationId);
+            if(pending.length>0)this.pendingIntentId=pending[0]!.intentId;
+          }
+        }
         catch(e){
           // 只有 v6 才有 send_intents 表。低版本库（v3~v5）不承载发送账本，
           // 恢复无意义但也无害；只有真正的恢复失败才阻塞。
@@ -438,9 +446,12 @@ export class Runner {
             if(this.pendingIntentId){
               const due=await dispatchPendingOnce(deps,this.pendingIntentId);
               if(due.kind==='not_due'){this.l0NextCheck=Date.now()+Math.min(slot.quietPeriodMs||500,2000);return;}
-              // 已结算（sent/failed/unknown）或不再 pending：清除待派发标记
-              if(due.kind!=='unauthorized')this.pendingIntentId=undefined;
-              if(due.kind==='unauthorized'){this.l0NextCheck=Date.now()+1000;return;}
+              if(due.kind==='unauthorized'){
+                // 运行态失效：保留标记，等恢复后重试（不重新调 AI）
+                this.l0NextCheck=Date.now()+1000;return;
+              }
+              // expired 已在账本终结；sent/failed/unknown/rejected 也已结算或不可重试
+              this.pendingIntentId=undefined;
               this.l0NextCheck=Date.now()+1000;return;
             }
             // 阶段 1：满足静默期与决策次数上限才发起决策

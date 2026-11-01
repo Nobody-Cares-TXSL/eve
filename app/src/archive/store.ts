@@ -10,6 +10,12 @@ import type {SendRejectCode} from '../send/policy.ts';
 /** 当前程序支持的最高 schema 版本；所有「版本区间」判断都应引用它。 */
 export const MAX_SCHEMA_VERSION=6;
 
+export interface PendingSendIntent {
+  readonly intentId:string;
+  readonly notBeforeMs:number|null;
+  readonly expiresAtMs:number|null;
+}
+
 export type HandoffBlockReason='claim_inactive'|'coverage_changed'|'source_invalid'|'storage_unavailable'|'policy_invalid';
 export type HandoffNoIntentReason='not_reply'|'already_finalized'|SendRejectCode;
 export type HandoffResult=
@@ -624,6 +630,36 @@ export class EveArchive {
    claimState:claim?.state??null,claimProofEpoch:claim?.proof_epoch_id??null,
    claimDecisionDigest:claim?.decision_digest??null,claimReplyLength:claim?.reply_length??null,
   };
+ }
+
+ /**
+  * T6-L0：列出遗留的 pending 意图（按创建时间升序）。
+  * 重启后 Runner 用它重新接管未派发的意图——不重新调用 AI。
+  */
+ listPendingSendIntents(conversationId:string):readonly PendingSendIntent[]{
+  this.requireV5();
+  if(!this.validThread(conversationId))throw new ArchiveError('rejected');
+  const rows=this.db.prepare(
+    'SELECT i.intent_id,i.not_before_ms,t.expires_at_ms FROM send_intents i '+
+    "LEFT JOIN send_text t ON t.intent_id=i.intent_id "+
+    "WHERE i.conversation_id=? AND i.status='pending' ORDER BY i.created_at_ms"
+  ).all(conversationId) as {intent_id:string;not_before_ms:number|null;expires_at_ms:number|null}[];
+  return rows.map(r=>({intentId:r.intent_id,notBeforeMs:r.not_before_ms,expiresAtMs:r.expires_at_ms}));
+ }
+
+ /**
+  * 安全终结一条已不可能发送的意图：正文过期或 Proof 换代。
+  * 必须写明确原因码，绝不静默删除、也不绕过证明强行发送。
+  */
+ terminateSendIntent(intentId:string,reasonCode:'content_expired'|'coverage_lost',now:number):boolean{
+  this.requireV5();
+  if(!Number.isSafeInteger(now))throw new ArchiveError('rejected');
+  const r=this.db.prepare(
+   "UPDATE send_intents SET status='failed',reason_code=?,settled_at_ms=?,updated_at_ms=? WHERE intent_id=? AND status='pending'"
+  ).run(reasonCode,now,now,intentId);
+  if(Number(r.changes)!==1)return false;
+  this.db.prepare('DELETE FROM send_text WHERE intent_id=?').run(intentId);
+  return true;
  }
 
  /**

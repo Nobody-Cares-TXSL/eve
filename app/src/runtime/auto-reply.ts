@@ -46,6 +46,7 @@ export type DecisionOutcome =
 
 export type DispatchOutcome =
   | { readonly kind: 'not_due' }
+  | { readonly kind: 'expired'; readonly intentId: string }
   | { readonly kind: 'no_pending' }
   | { readonly kind: 'unauthorized' }
   | { readonly kind: 'sent'; readonly intentId: string; readonly evidence: string }
@@ -93,6 +94,11 @@ export async function dispatchPendingOnce(deps: AutoReplyDeps, intentId: string)
   const binding = deps.archive.sendDispatchBinding(intentId);
   if (!binding) return { kind: 'no_pending' };
   if (binding.status !== 'pending') return { kind: 'no_pending' };
+  // 正文过期：安全终结，不发送、不延长保留
+  if (binding.expiresAtMs !== null && deps.now() >= binding.expiresAtMs) {
+    deps.archive.terminateSendIntent(intentId, 'content_expired', deps.now());
+    return { kind: 'expired', intentId };
+  }
   if (binding.notBeforeMs !== null && deps.now() < binding.notBeforeMs) return { kind: 'not_due' };
 
   // 出口必须在派发时重新获取：断线/暂停后 Runner 会撤销旧出口
@@ -115,6 +121,25 @@ export async function dispatchPendingOnce(deps: AutoReplyDeps, intentId: string)
     case 'sent': return { kind: 'sent', intentId: result.intentId, evidence: result.evidence };
     case 'failed': return { kind: 'failed', intentId: result.intentId, reasonCode: result.reasonCode };
     case 'unknown': return { kind: 'unknown', intentId: result.intentId, reasonCode: result.reasonCode };
-    default: return { kind: 'rejected', reasonCode: result.reasonCode };
+    default: {
+      // rejected 分两类：
+      //  - 证明/身份已失效（proof_changed、contact_unverified、foreign_conversation、
+      //    content_digest_mismatch、session 相关）：意图永远不可能再合法发送，
+      //    必须安全终结，否则会永久遗留一条 pending。
+      //  - 运行态暂时不可用（runtime_not_running 等）：保留 pending 等恢复。
+      const terminal = new Set([
+        'proof_changed', 'contact_unverified', 'foreign_conversation',
+        'content_digest_mismatch', 'approval_missing', 'approval_expired',
+        'approval_consumed', 'approval_binding_mismatch', 'ledger_unavailable',
+        'content_empty', 'content_too_long', 'content_control_chars',
+        'source_unverified', 'intent_not_pending', 'already_claimed',
+        'untrusted_transport', 'invalid_input', 'not_due',
+      ]);
+      if (terminal.has(result.reasonCode)) {
+        deps.archive.terminateSendIntent(intentId, 'coverage_lost', deps.now());
+        return { kind: 'expired', intentId };
+      }
+      return { kind: 'rejected', reasonCode: result.reasonCode };
+    }
   }
 }

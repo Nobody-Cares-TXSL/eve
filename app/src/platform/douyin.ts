@@ -294,6 +294,32 @@ export class DouyinReadOnlyPort implements PlatformPort {
     });
   }
 
+  /**
+   * 取当前认证的实例快照，供 L0 派发前的身份/联系人复核。
+   *
+   * 返回的 `client/account/contact` 都是**真实 SDK 对象引用**：
+   * `dispatchOnce` 会校验 `contact.account === account`、`contact` 由
+   * `pickFriend/pickStranger` 真实返回。构造一个同形对象无法通过校验。
+   *
+   * 未上线、会话不符、联系人未绑定时返回 null（fail-closed）。
+   */
+  liveRefs(conversationId: string): {
+    client: { accounts: readonly unknown[] };
+    account: unknown;
+    contact: unknown;
+  } | null {
+    if (!this.started || !this.verified || !this.active) return null;
+    const account = this.active;
+    const ownUids = this.identities(account);
+    if (!belongsToTarget(conversationId, ownUids, this.targetUid)) return null;
+    if (!account.online) return null;
+    const contact = this.contacts.get(conversationId) ??
+      [account.pickFriend(this.targetUid), account.pickStranger(this.targetUid)]
+        .find((c): c is Contact => !!c && c.threadId === conversationId);
+    if (!contact || contact.uid !== this.targetUid) return null;
+    return { client: this.client, account, contact };
+  }
+
   async readHistory(conversationId: string, cursor?: string | null): Promise<HistoryPage> {
     if (!this.started || !this.verified || !this.active) throw new Error('平台未验证上线');
     const ownUids = this.identities(this.active);

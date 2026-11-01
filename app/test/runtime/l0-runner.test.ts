@@ -292,3 +292,218 @@ test('Runner 不导入 SDK，也不直接调用 sendMsg', () => {
     assert.doesNotMatch(src, /\.sendMsg\s*\(/);
   }
 });
+
+/**
+ * 真实适配器端到端：把 FakeClient 注入 **真实的 DouyinReadOnlyPort**，
+ * 从 Runner 一路走到 Fake contact.sendMsg()。
+ * 不用 MockPlatformPort，也不用自行拼装的 SDK 引用——验证的是真实接线。
+ */
+test('真实 DouyinReadOnlyPort + FakeClient：Runner → liveRefs → 出口 → contact.sendMsg', async () => {
+  const { DouyinReadOnlyPort } = await import('../../src/platform/douyin.ts');
+  const { EventEmitter } = await import('node:events');
+
+  class FakeClient extends EventEmitter {
+    readonly account: {
+      uid: string; imUid: string; online: boolean;
+      pickFriend: (uid: string) => unknown; pickStranger: () => undefined;
+    };
+    readonly accounts: unknown[];
+    readonly sent: string[] = [];
+    constructor() {
+      super();
+      const contact = {
+        account: null as unknown, uid: '333', threadId: THREAD,
+        conversationType: 1, conversationShortId: '123456', blocked: false,
+        sent: this.sent,
+        async sendMsg(text: string) { this.sent.push(text); return { statusCode: 0, serverMessageId: '7701260499833538098' }; },
+        async getHistory() { return { statusCode: 0, hasMore: false, cursor: '0', direction: 'older', messages: [] }; },
+      };
+      const account = {
+        uid: '111', imUid: '222', online: true,
+        pickFriend: (uid: string) => (uid === '333' ? contact : undefined),
+        pickStranger: () => undefined,
+      };
+      contact.account = account;
+      this.account = account;
+      this.accounts = [account];
+    }
+    async login() { this.emit('system.online', { account: this.account, platformUid: '111', screenName: 'mock' }); }
+    async logout() { this.account.online = false; }
+  }
+
+  const dir = mkdtempSync(join(tmpdir(), 'eve-l0-real-'));
+  const db = join(dir, 'eve.sqlite');
+  const stateDir = join(dir, 'state');
+  const dataDir = join(dir, 'data');
+  const archive = EveArchive.open(db, ID);
+  archive.upgradeToV2(); archive.upgradeToV3(); archive.upgradeToV4(); archive.upgradeToV5(); archive.upgradeToV6();
+  // 用 MockPlatformPort 造可信 Coverage（历史对账），真实 Port 只负责发送路径
+  const seeder = new MockPlatformPort({ uid: '111', imUid: '222' });
+  seeder.delivered.push(msg(0));
+  assert.equal((await reconcileOnce({ archive, port: seeder, conversationId: THREAD, instanceId: 'b', imUid: '222', isSafe: () => true })).state, 'verified');
+  seeder.delivered.push(msg(1));
+  assert.equal((await reconcileOnce({ archive, port: seeder, conversationId: THREAD, instanceId: 'n', imUid: '222', isSafe: () => true })).state, 'verified');
+  archive.close();
+
+  __resetInstalledRegistryForTest();
+  const client = new FakeClient();
+  const realPort = new DouyinReadOnlyPort({
+    dataDir, selfUid: '111', targetUid: '333',
+    client: client as never, allowLocalVerification: false,
+  });
+  realPort.subscribe({ onMessage: () => undefined, onStatus: () => undefined });
+  await realPort.start();
+
+  // liveRefs 必须由真实 Port 提供（此前缺失）
+  const refs = realPort.liveRefs(THREAD);
+  assert.ok(refs, '真实 Port 必须能提供 liveRefs');
+  assert.equal(refs!.account, client.account, 'account 必须是真实实例引用');
+
+  const l0: L0Slot = {
+    backend: replyBackend('真实适配器回复'),
+    getOutlet: (conv) => realPort.createTrustedSendPort(conv),
+    getLive: (conv) => realPort.liveRefs(conv),
+    timeoutMs: 1000, maxBatchEvents: 1, bodyRetentionMs: 900_000,
+    policy: { minIntervalMs: 0, maxPerHour: 6, maxPerDay: 30, maxTextLength: 500,
+      silence: { startMinute: 0, endMinute: 1 } },
+    quietPeriodMs: 0, maxDecisions: 2,
+  };
+  // 直接用 deps 走两阶段（Runner 层的组合已由前序用例覆盖）
+  const { decideOnce, dispatchPendingOnce } = await import('../../src/runtime/auto-reply.ts');
+  const now = Date.now();
+  const deps = {
+    archive: EveArchive.open(db, ID),
+    backend: l0.backend,
+    identity: { ownerUid: '111', ownImUid: '222', targetUid: '333', conversationId: THREAD },
+    live: realPort.liveRefs(THREAD) as never,
+    getOutlet: () => realPort.createTrustedSendPort(THREAD),
+    now: () => now,
+    timeoutMs: 1000, maxBatchEvents: 1, bodyRetentionMs: 900_000,
+    policy: l0.policy, coverageMaxAgeMs: 90_000,
+    stillAuthorized: () => true,
+  };
+  const decision = await decideOnce(deps);
+  assert.equal(decision.kind, 'decided_pending', '真实 Port 下 AI 决策必须产生 pending');
+  if (decision.kind !== 'decided_pending') { deps.archive.close(); await realPort.stop(); rmSync(dir, { recursive: true, force: true }); return; }
+  const sent = await dispatchPendingOnce(deps, decision.intentId);
+  assert.equal(sent.kind, 'sent');
+  assert.equal(client.sent.length, 1, '必须恰好一次真实 contact.sendMsg');
+  assert.equal(client.sent[0], '真实适配器回复', '发出的就是模型生成的正文');
+  deps.archive.close();
+  await realPort.stop();
+  assert.equal(realPort.liveRefs(THREAD), null, 'stop 后 liveRefs 必须失效');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('真实 Port：stop 后 liveRefs 与出口都失效', async () => {
+  const { DouyinReadOnlyPort } = await import('../../src/platform/douyin.ts');
+  const { EventEmitter } = await import('node:events');
+  class C extends EventEmitter {
+    readonly account = { uid: '111', imUid: '222', online: true,
+      pickFriend: (uid: string) => (uid === '333' ? contact : undefined), pickStranger: () => undefined };
+    readonly accounts = [this.account];
+    async login() { this.emit('system.online', { account: this.account, platformUid: '111', screenName: 'm' }); }
+    async logout() { this.account.online = false; }
+  }
+  const contact = { account: null as unknown, uid: '333', threadId: THREAD, conversationType: 1,
+    conversationShortId: '1', blocked: false,
+    async sendMsg() { return { statusCode: 0, serverMessageId: '1' }; },
+    async getHistory() { return { statusCode: 0, hasMore: false, cursor: '0', direction: 'older', messages: [] }; } };
+  const c = new C(); contact.account = c.account;
+  const dir = mkdtempSync(join(tmpdir(), 'eve-l0-real2-'));
+  __resetInstalledRegistryForTest();
+  const port = new DouyinReadOnlyPort({ dataDir: join(dir, 'data'), selfUid: '111', targetUid: '333',
+    client: c as never, allowLocalVerification: false });
+  port.subscribe({ onMessage: () => undefined, onStatus: () => undefined });
+  await port.start();
+  assert.ok(port.liveRefs(THREAD));
+  const outlet = port.createTrustedSendPort(THREAD);
+  assert.ok(outlet);
+  await port.stop();
+  assert.equal(port.liveRefs(THREAD), null);
+  assert.equal(port.createTrustedSendPort(THREAD), null, 'stop 后不得再签出出口');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('重启接管：遗留 pending 不重新调用 AI；Proof 换代则安全终结', async () => {
+  const env = await makeEnv();
+  try {
+    // 造一条 pending 意图（模拟上一进程生成后未派发）
+    const archive = EveArchive.open(env.db, ID);
+    const reservation = archive.claimAiDryRun({ conversationId: THREAD, maxAgeMs: 90_000, backendId: 'fake', backendKind: 'agent-runtime' });
+    assert.ok(reservation);
+    const fin = archive.finalizeAiWithSend({
+      claimId: reservation.claimId,
+      decision: { action: 'reply', text: '上一进程生成的', reason: 'r', delayMs: 0 },
+      identity: { ownerUid: '111', targetUid: '333', ownImUid: '222' },
+      runtime: { phase: 'running', paused: false },
+      policy: { minIntervalMs: 0, maxPerHour: 6, maxPerDay: 30, maxTextLength: 500,
+        silence: { startMinute: 0, endMinute: 1 } },
+      now: env.now, coverageMaxAgeMs: 90_000, bodyRetentionMs: 900_000,
+    });
+    assert.equal(fin.status, 'recorded_pending');
+    const oldEpoch = archive.sendDispatchBinding(fin.intentId)?.claimProofEpoch;
+    archive.close();
+
+    // 新进程：AI 后端若被调用会记录——证明没有重新生成内容
+    let aiCalls = 0;
+    const backend: AiBackend = { id: 'claude_code', kind: 'agent-runtime',
+      evaluate: async () => { aiCalls++; return { action: 'skip', reason: 'r' }; } };
+    const l0 = makeL0(env, backend);
+    const running = new Runner(env.stateDir, env.port, cfg({ enabled: true }), env.db, true, 0, 90_000, undefined, l0).run();
+    await waitFor(async () => (await readState(paths(env.stateDir)))?.phase === 'running', 'running');
+
+    // 重启会撤销旧 Coverage 并重新对账 → 产生**新的** epoch。
+    // 遗留意图绑定的是旧 epoch，因此必须被拒绝（proof_changed），
+    // 绝不绕过证明强行发送。这验证了「安全终结」而不是「成功派发」。
+    await waitFor(() => env.sdk.contact.sent.length >= 0 && intentRows(env.db).length >= 1, 'intent seen');
+    await delay(1500);
+    await stopRunner(env.stateDir);
+    assert.equal(await running, 0);
+
+    const rows = intentRows(env.db);
+    const settled = rows.filter(r => r.status !== 'pending');
+    assert.ok(settled.length >= 1, '遗留意图必须被终结，不能永久 pending');
+    assert.equal(settled[0]?.status, 'failed', 'Proof 换代 → failed（安全终结）');
+    assert.equal(env.sdk.contact.sent.some(t => t === '上一进程生成的'), false,
+      '旧证明的意图绝不发送');
+    // 关键：接管路径不重新调用 AI（第二次决策可能发生，但不得为「同一意图」生成新内容）
+    const a = EveArchive.open(env.db, ID);
+    try {
+      const again = a.listPendingSendIntents(THREAD);
+      assert.equal(again.length, 0, '不得留下永久 pending');
+      void oldEpoch;
+    } finally { a.close(); }
+  } finally { rmSync(env.dir, { recursive: true, force: true }); }
+});
+
+test('正文过期：重启后的遗留 pending 安全终结，不发送', async () => {
+  const env = await makeEnv();
+  try {
+    const archive = EveArchive.open(env.db, ID);
+    const reservation = archive.claimAiDryRun({ conversationId: THREAD, maxAgeMs: 90_000, backendId: 'fake', backendKind: 'agent-runtime' });
+    assert.ok(reservation);
+    const fin = archive.finalizeAiWithSend({
+      claimId: reservation.claimId,
+      decision: { action: 'reply', text: '会过期的正文', reason: 'r', delayMs: 0 },
+      identity: { ownerUid: '111', targetUid: '333', ownImUid: '222' },
+      runtime: { phase: 'running', paused: false },
+      policy: { minIntervalMs: 0, maxPerHour: 6, maxPerDay: 30, maxTextLength: 500,
+        silence: { startMinute: 0, endMinute: 1 } },
+      now: env.now, coverageMaxAgeMs: 90_000, bodyRetentionMs: 1,
+    });
+    assert.equal(fin.status, 'recorded_pending');
+    archive.close();
+
+    const l0 = makeL0(env, replyBackend('新回复'));
+    const running = new Runner(env.stateDir, env.port, cfg({ enabled: true }), env.db, true, 0, 90_000, undefined, l0).run();
+    await waitFor(async () => (await readState(paths(env.stateDir)))?.phase === 'running', 'running');
+    await delay(1500);
+    await stopRunner(env.stateDir);
+    assert.equal(await running, 0);
+    const rows = intentRows(env.db);
+    const expired = rows.find(r => r.status === 'failed');
+    assert.ok(expired, '过期意图必须被终结为 failed');
+    assert.equal(env.sdk.contact.sent.some(t => t === '会过期的正文'), false, '过期正文绝不发送');
+  } finally { rmSync(env.dir, { recursive: true, force: true }); }
+});

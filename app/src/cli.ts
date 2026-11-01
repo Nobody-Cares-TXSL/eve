@@ -108,6 +108,12 @@ async function main():Promise<number> {
         console.error('autoReply 需要真实平台端口；--mock 下不启用');
         return 2;
       }
+      // L0 依赖 T4 对账：没有可信 Coverage 就无法判定消息是否可处理。
+      // 在启动阶段明确报错，而不是等 Runner 构造失败。
+      if(!args.includes('--experimental-reconcile')){
+        console.error('autoReply.enabled=true 必须同时启用 T4 对账：请加 --experimental-reconcile');
+        return 2;
+      }
       const name=process.env['EVE_L0_BACKEND'];
       if(!name){console.error('autoReply.enabled=true 但未指定 EVE_L0_BACKEND；拒绝启动');return 2;}
       const backend=name==='claude_code'?createClaudeBackend():null;
