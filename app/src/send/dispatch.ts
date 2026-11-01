@@ -85,9 +85,11 @@ export interface DispatchInput {
   readonly intentId: string;
   readonly expected: SessionExpectation;
   readonly live: DispatchLiveRefs;
-  readonly transport: SendTransport;
-  /** 只有持有 Port 令牌的出口才能通过；见 outbound-transport.ts。 */
-  readonly trustedPort?: unknown;
+  /**
+   * **唯一**发送出口。校验的与被调用的必须是同一个对象——
+   * 不能出现「验证 A、发送 B」的分离。
+   */
+  readonly trustedPort: unknown;
   /**
    * 发送模式：
    *   'l0_auto'   —— 正常自动回复（D-019）。不要求审批记录，完全由程序 Gate 决定。
@@ -171,7 +173,7 @@ export async function dispatchOnce(archive: EveArchive, input: DispatchInput): P
       input.maxTextLength < 1 || input.maxTextLength > 500 ||
       !Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1 || input.timeoutMs > 30_000 ||
       (input.mode !== 'l0_auto' && input.mode !== 'l1_review') ||
-      !input.live || !input.transport || typeof input.transport.sendText !== 'function')
+      !input.live)
     return rejected('invalid_input');
   if (input.mode === 'l1_review' && !/^[A-Za-z0-9_-]{8,64}$/.test(input.approvalId ?? ''))
     return rejected('invalid_input');
@@ -275,7 +277,7 @@ export async function dispatchOnce(archive: EveArchive, input: DispatchInput): P
     const timed = new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new Error('dispatch_timeout')), input.timeoutMs);
     });
-    response = await Promise.race([input.transport.sendText(draft.draft.message), timed]);
+    response = await Promise.race([port.sendText(draft.draft.message), timed]) as SendResponseLike;
   } catch (e) {
     const fromError = responseFromError(e);
     if (fromError) {

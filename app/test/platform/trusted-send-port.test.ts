@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Client } from 'douyin-im';
 import { DouyinReadOnlyPort } from '../../src/platform/douyin.ts';
-import { assertTrustedSendPort } from '../../src/platform/outbound-transport.ts';
+import { claimPortIdentity, registerSendPortIssuer, assertTrustedSendPort, type TrustedSendPort } from '../../src/platform/outbound-transport.ts';
 
 const THREAD = '0:1:222:333';
 
@@ -159,5 +159,46 @@ test('出口只允许一个目标：无法为其他 UID 创建', async () => {
     await port.start();
     // 即使联系人对象存在，会话白名单也不允许
     assert.equal(port.createTrustedSendPort('0:1:222:999'), null);
+  });
+});
+
+test('P0-1：普通模块无法签发可信出口（无 Port 身份即被拒）', () => {
+  const fakeIdentity = {};
+  // 未通过 claimPortIdentity 登记的对象不能注册签发器
+  assert.throws(() => registerSendPortIssuer({}, fakeIdentity), /send_port_issuer_not_authorized/);
+  // 即便传入自己构造的对象，只要没登记过身份就不行
+  assert.throws(() => registerSendPortIssuer({}, {}), /send_port_issuer_not_authorized/);
+});
+
+test('P0-1：签发器撤销后，已签出的出口全部失效', () => {
+  const identity = {};
+  claimPortIdentity(identity);
+  const issuer = registerSendPortIssuer({}, identity);
+  const port = issuer.issue('0:1:222:333', '333', async () => ({ statusCode: 0 }));
+  assert.equal(assertTrustedSendPort(port), true);
+  issuer.revokeAll();
+  assert.equal(assertTrustedSendPort(port), false, 'revokeAll 后必须失效');
+  // 撤销后签发器也不能再签发
+  assert.throws(() => issuer.issue('0:1:222:333', '333', async () => ({ statusCode: 0 })),
+    /send_port_issuer_revoked/);
+});
+
+test('P0-1：签出的出口被冻结，无法改写会话或收件人', () => {
+  const identity = {};
+  claimPortIdentity(identity);
+  const issuer = registerSendPortIssuer({}, identity);
+  const port = issuer.issue('0:1:222:333', '333', async () => ({ statusCode: 0 }));
+  assert.throws(() => { (port as { conversationId: string }).conversationId = '0:1:222:999'; }, TypeError);
+  assert.equal(port.conversationId, '0:1:222:333');
+});
+
+test('P0-1：Port 通过签发器签出的出口可通过校验，且 stop 后失效', async () => {
+  await withPort(async ({ port }) => {
+    await port.start();
+    const outlet = port.createTrustedSendPort(THREAD);
+    assert.ok(outlet);
+    assert.equal(assertTrustedSendPort(outlet), true);
+    await port.stop();
+    assert.equal(assertTrustedSendPort(outlet), false);
   });
 });

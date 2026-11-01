@@ -11,7 +11,7 @@ import { LocalQrFile } from './qr.ts';
 import { normalizeInboundMessage } from './normalize.ts';
 import { projectHistoryPage } from './history.ts';
 import {
-  issueTrustedSendPort, revokeTrustedSendPort, type TrustedSendPort,
+  claimPortIdentity, registerSendPortIssuer, type TrustedSendPort,
 } from './outbound-transport.ts';
 import type { HistoryPage, PlatformPort, PlatformSink, PlatformStatus } from './types.ts';
 
@@ -68,8 +68,12 @@ export class DouyinReadOnlyPort implements PlatformPort {
   private blocked = false;
   private started = false;
   private readonly contacts = new Map<string, Contact>();
-  /** 由本 Port 发出的可信出口，stop() 时全部撤销。 */
-  private readonly sendPorts = new Set<object>();
+  /** 本 Port 的签发器；stop() 时 revokeAll。 */
+  private readonly portIdentity: object = {};
+  private readonly sendIssuer = (() => {
+    claimPortIdentity(this.portIdentity);
+    return registerSendPortIssuer(this, this.portIdentity);
+  })();
   private readonly recentIds = new Set<string>();
   private readonly recentQueue: string[] = [];
 
@@ -239,8 +243,7 @@ export class DouyinReadOnlyPort implements PlatformPort {
     this.verified = false;
     this.started = false;
     // 出口必须先失效，避免关停过程中仍有发送路径
-    for (const p of this.sendPorts) revokeTrustedSendPort(p);
-    this.sendPorts.clear();
+    this.sendIssuer.revokeAll();
     this.contacts.clear();
     this.recentIds.clear();
     this.recentQueue.length = 0;
@@ -277,20 +280,14 @@ export class DouyinReadOnlyPort implements PlatformPort {
         .find((c): c is Contact => !!c && c.threadId === conversationId);
     if (!contact || contact.uid !== this.targetUid) return null;
 
-    const port: TrustedSendPort = {
-      conversationId,
-      recipientUid: this.targetUid,
-      sendText: async (message: string) => {
-        // 发送前最后一道：会话必须仍然有效，否则拒绝
-        if (!this.started || !this.verified || this.active !== account || !account.online) {
-          throw new Error('send_session_changed');
-        }
-        // 唯一真实发送调用点。上层（dispatchOnce）已完成账本、审批、Proof 与实例复核。
-        return contact.sendMsg(message);
-      },
-    };
-    this.sendPorts.add(port);
-    return issueTrustedSendPort(port);
+    return this.sendIssuer.issue(conversationId, this.targetUid, async (message: string) => {
+      // 发送前最后一道：会话必须仍然有效，否则拒绝
+      if (!this.started || !this.verified || this.active !== account || !account.online) {
+        throw new Error('send_session_changed');
+      }
+      // 唯一真实发送调用点。上层（dispatchOnce）已完成账本、审批、Proof 与实例复核。
+      return contact.sendMsg(message);
+    });
   }
 
   async readHistory(conversationId: string, cursor?: string | null): Promise<HistoryPage> {

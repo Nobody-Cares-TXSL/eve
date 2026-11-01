@@ -14,7 +14,7 @@
 import type { EveArchive } from '../archive/store.ts';
 import type { AiBackend } from '../ai/contracts.ts';
 import { durableDecisionWithSend, type SendHandoffOptions } from '../ai/engine.ts';
-import { dispatchOnce, type DispatchResult, type DispatchSession, type SendTransport } from './dispatch.ts';
+import { dispatchOnce, type DispatchResult, type DispatchSession } from './dispatch.ts';
 import type { TrustedSendPort } from '../platform/outbound-transport.ts';
 import type { LiveAccountRef, LiveClientRef, LiveContactRef } from '../platform/outbound-session.ts';
 
@@ -82,7 +82,6 @@ export async function runL0Once(input: L0LoopInput): Promise<L0Outcome> {
       conversationId: expected.conversationId,
     },
     live,
-    transport: transport as unknown as SendTransport,
     trustedPort: transport,
     mode: 'l0_auto',
     nowMs: input.dispatch.nowMs,
