@@ -88,7 +88,8 @@
 - [x] T6-3c-real-B1 前置（离线）：迁移演练（副本上 v2→v6 全链通过）+ 真实 SDK 出口 `createTrustedSendPort`（唯一 sendMsg 点，8 条零发送测试）+ doctor D10 语义演进。
 - [x] T6-3c-real-B1 迁移部分：正式库已从 v2 **逐级**升级至 v6（四次独立事务），备份/完整性/外键/计数全部核验通过。
 - [x] T6-3c-real-B1 交接通道：`durableDecisionWithSend()` 打通真实 T5→T6（模型产生正文 → 单事务落 pending 意图），9 条测试。**不发送**。
-- [ ] T6-3c-real-B1 发送部分：Runner 接线 + L1 审批 + 派发器 + 指定接收方与内容的**单次** `sendMsg`——需操作者单独授权。
+- [ ] T6-3c-real-B1 发送部分（方案已修订）：Runner 接线 + TTY 审批接入 + 派发器；接收方由 SDK 从真实私信识别、正文由 AI 生成，操作者只需 `CONFIRM`，最多发送一次。需操作者单独授权。
+- [ ] 多会话准入（后续独立扩展）：单目标白名单 → 多会话准入 + 分会话限流；不在首次发送范围内。
 - [ ] T6-2：pending 落盘成功后、**真正调用 SDK 前**必须持久化 dispatching；重启遗留 dispatching 保守进入 unknown，绝不盲目重发。
 - [ ] T6-3：调用 douyin-im Friend/ChatContact.sendMsg，按符合契约的服务端成功回执判 sent；不得宣称对端已显示或已读。
 - [ ] T6-4：在程序侧强制执行唯一白名单、频率/静默、消息长度、暂停、身份复核，AI 无权改写；发送前重新验一次。

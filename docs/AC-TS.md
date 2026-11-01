@@ -319,3 +319,14 @@
 - [x] AC-Handoff.6 `durableDryRunOne()` 行为不变，既有 T5 测试全部保持通过。
 - [x] AC-Handoff.7 `engine.ts` 不导入 `douyin-im`、不调用 `sendMsg`、不引用 `src/send/`。
 - [ ] AC-Handoff.8 Runner 接线：需要授权的启用路径 + L1 审批 + 派发器，未开始。
+
+### AC-T6.B1 · 首次发送验收（修订版，未开始）
+
+契约：`docs/contracts/send.md §18`。**未授权执行。**
+
+- [ ] AC-B1.1 接收方由 SDK 从真实入站事件识别（`event.senderUid` + `threadId` + 真实 `Contact`），**不要求人工输入 UID**；并通过 §13.1 的实例引用与绑定校验。
+- [ ] AC-B1.2 回复正文由 AI 生成，**不预先指定**；操作者在 TTY 看到的是最终待发内容。
+- [ ] AC-B1.3 AI 可选择 skip/defer，此时本次验收不产生发送；重试必须用**新的真实私信**，不得重发同一条。
+- [ ] AC-B1.4 TTY 展示实际接收方与完整正文，输入精确 `CONFIRM` 后才发送；最多一次 `sendMsg()`，禁止重试与补发。
+- [ ] AC-B1.5 L1 通过不等于开放 L0；L0 需单独 Gate。
+- [ ] AC-B1.6 多会话准入不在本次范围；单目标白名单保持不变。
