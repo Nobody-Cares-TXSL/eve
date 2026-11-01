@@ -110,7 +110,13 @@ test('请求文件名与内部 id 不一致时被拒绝，防止伪造实例身�
     // 文件名是 fileId，内容 id 是 otherId → validControl 的 id+'.json'!==name 检查应拒绝
     await atomicJson(join(p.requests, fileId + '.json'),
       { id: otherId, instanceId: state?.instanceId ?? '', action: 'stop', at: Date.now() });
-    await delay(500);
+    // 轮询：等伪造请求被处理（文件消失）或超时，而不是固定等待
+    let rejected = false;
+    for (let i = 0; i < 60; i++) {
+      if (await lstat(join(p.requests, fileId + '.json')).then(() => false, () => true)) { rejected = true; break; }
+      await delay(30);
+    }
+    assert.equal(rejected, true, '伪造请求应被丢弃');
     assert.equal((await readState(p))?.phase, 'running', '伪造请求不得生效');
     const stopId = randomUUID();
     await atomicJson(join(p.requests, stopId + '.json'),
@@ -126,7 +132,7 @@ test('目录中的非法 JSON 请求被丢弃，不阻塞后续合法请求', as
     await initDirs(p);
     const runner = new Runner(dir, new QuietPort(), cfg);
     const running = runner.run();
-    await delay(400);
+    await waitRunning(p);
     const badId = randomUUID();
     await writeFile(join(p.requests, badId + '.json'), '{ not json');
     // 轮询等待而非固定延迟：全套并行时扫描周期会被拉长

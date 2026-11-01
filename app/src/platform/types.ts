@@ -4,6 +4,7 @@
  * 本文件是 core/ 能看见的**全部**平台面：纯数据 + 接口。
  * 禁止在此 import 'douyin-im' 的运行时值（type-only 也仅限本目录内允许）。
  */
+import type { TrustedSendPort } from './outbound-transport.ts';
 
 /** 归一化后的入站私信事件。字段全部为 Eve 拥有的类型，SDK 对象不越过 platform/ 边界。 */
 export interface InboundMessage {
@@ -79,4 +80,12 @@ export interface PlatformPort {
   subscribe(sink: PlatformSink): void;
   /** 只读拉取历史；保留分页水位，不能丢失 hasMore/cursor/statusCode。 */
   readHistory(conversationId: string, cursor?: string | null): Promise<HistoryPage>;
+  /**
+   * 取一个绑定到该会话的可信发送出口（L0 专用）。
+   * 返回 null 表示当前不可发送（未上线、会话不符、联系人未绑定）。
+   * 仅 `DouyinReadOnlyPort` 实现；其他 Port 返回 null。
+   */
+  createTrustedSendPort?(conversationId: string): TrustedSendPort | null;
+  /** 取当前认证的会话身份快照；无则 null。 */
+  liveRefs?(conversationId: string): unknown;
 }

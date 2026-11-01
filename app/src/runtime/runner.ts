@@ -9,6 +9,8 @@ import type {InboundMessage} from '../platform/types.ts';
 import type {PlatformPort,PlatformSink} from '../platform/types.ts';
 import type {RuntimeConfig} from './config.ts';
 import {durableDryRunOne} from '../ai/engine.ts';
+import {decideOnce, dispatchPendingOnce, type AutoReplyDeps} from './auto-reply.ts';
+import type {TrustedSendPort} from '../platform/outbound-transport.ts';
 import type {AiBackend} from '../ai/contracts.ts';
 
 /**
@@ -26,6 +28,25 @@ export interface AiDryRunSlot {
  readonly quietPeriodMs?:number;
  readonly policy?:AiCallPolicy;
 }
+/**
+ * T6-L0：自动回复运行时槽。**默认不注入**；只有配置 `autoReply.enabled=true`
+ * 且操作者显式启用时，组合根才创建它。
+ */
+export interface L0Slot {
+  readonly backend:AiBackend;
+  /** 取当前有效的发送出口；Runner 在断线/暂停时撤销，因此必须每轮重新取。 */
+  readonly getOutlet:(conversationId:string)=>TrustedSendPort|null;
+  /** 取当前认证的实例快照；会话未绑定/已下线时返回 null。 */
+  readonly getLive:(conversationId:string)=>unknown;
+  readonly timeoutMs:number;
+  readonly maxBatchEvents:number;
+  readonly bodyRetentionMs:number;
+  readonly policy:AutoReplyDeps['policy'];
+  readonly quietPeriodMs:number;
+  /** 单次运行最多决策几次，防止测试/异常场景下无限调用模型。 */
+  readonly maxDecisions:number;
+}
+
 export type Action = 'pause'|'resume'|'stop';
 export interface ControlRequest { readonly id:string; readonly instanceId:string; readonly action:Action; readonly at:number; }
 const actions = new Set(['pause','resume','stop']);
@@ -51,6 +72,11 @@ export class Runner {
   private readonly historyPageGapMs:number;
   private readonly coverageMaxAgeMs:number;
   private readonly aiDryRun:AiDryRunSlot|undefined;
+  private readonly l0:L0Slot|undefined;
+  private l0Running:Promise<void>|undefined;
+  private l0Decisions=0;
+  private l0NextCheck=0;
+  private pendingIntentId:string|undefined;
   private aiRunning:Promise<void>|undefined;
   private aiAbort:AbortController|undefined;
   private aiAttempts=0;
@@ -75,7 +101,17 @@ export class Runner {
   private readonly config:RuntimeConfig;
   constructor(root:string, port:PlatformPort, config:RuntimeConfig, archivePath?:string,
               reconcileEnabled=false, historyPageGapMs=0, coverageMaxAgeMs=COVERAGE_MAX_AGE_MS,
-              aiDryRun?:AiDryRunSlot) {
+              aiDryRun?:AiDryRunSlot, l0?:L0Slot) {
+    if(l0 && aiDryRun) throw new Error('ai_dry_run_and_l0_are_mutually_exclusive');
+    if(l0 && (!archivePath || !reconcileEnabled))
+      throw new Error('l0_requires_archive_and_reconcile');
+    if(l0 && (!Number.isSafeInteger(l0.timeoutMs)||l0.timeoutMs<1||l0.timeoutMs>30_000||
+      !Number.isSafeInteger(l0.maxBatchEvents)||l0.maxBatchEvents<1||l0.maxBatchEvents>3||
+      !Number.isSafeInteger(l0.bodyRetentionMs)||l0.bodyRetentionMs<1||l0.bodyRetentionMs>3_600_000||
+      !Number.isSafeInteger(l0.quietPeriodMs)||l0.quietPeriodMs<0||l0.quietPeriodMs>60_000||
+      !Number.isSafeInteger(l0.maxDecisions)||l0.maxDecisions<1||l0.maxDecisions>100))
+      throw new Error('l0_invalid_options');
+    this.l0=l0;
     if(aiDryRun && (!archivePath || !reconcileEnabled ||
       !Number.isSafeInteger(aiDryRun.maxAttempts)||aiDryRun.maxAttempts<1||aiDryRun.maxAttempts>10 ||
       !Number.isSafeInteger(aiDryRun.timeoutMs??10_000) ||
@@ -170,6 +206,8 @@ export class Runner {
       }
       if((status.type==='offline'||status.type==='reconnecting')&&this.reconcileEnabled){
         this.platformOnline=false;
+        // 断线：撤销待派发资格，重连后需重新通过 Gate 才可派发
+        this.pendingIntentId=undefined;
         this.reconciliationGeneration++;
         this.reconciliationAbort?.abort();
         this.aiAbort?.abort();
@@ -222,7 +260,9 @@ export class Runner {
         await this.ack(req,true);this.wake?.();
       } else if (this.faulted) await this.ack(req,false,'blocked');
       else if (req.action==='pause') {
-        this.q.pause();this.reconciliationGeneration++;this.reconciliationAbort?.abort();this.aiAbort?.abort();
+        this.q.pause();this.reconciliationGeneration++;this.reconciliationAbort?.abort();
+        // 暂停即撤销待派发意图的自动派发资格（意图本身留在账本，由人工/后续处理）
+        this.pendingIntentId=undefined;this.aiAbort?.abort();
         // A paused runtime must not retain an old current-coverage gate.
         // Persist gate invalidation before returning the pause acknowledgement.
         if(this.reconcileEnabled&&this.archive){
@@ -277,6 +317,18 @@ export class Runner {
             }
           }
           catch{await this.block('paused_env','archive_open_failed');}
+        }
+      }
+      // 崩溃恢复必须在建库之后、开始处理新事件之前。
+      // dispatching → unknown，绝不自动重试；遗留 pending 只在重新通过 Gate 后派发。
+      if(this.reconcileEnabled&&this.archive&&!this.faulted&&!this.stopping){
+        try{this.archive.recoverInterruptedSends(Date.now());}
+        catch(e){
+          // 只有 v6 才有 send_intents 表。低版本库（v3~v5）不承载发送账本，
+          // 恢复无意义但也无害；只有真正的恢复失败才阻塞。
+          const code=e instanceof Error?e.message:'';
+          if(code!=='approval_requires_v6'&&code!=='send_requires_v4'&&code!=='handoff_requires_v5')
+            await this.block('paused_env','send_recovery_failed');
         }
       }
       if (!this.stopping && !this.faulted) {await this.set('running');this.q.resume();}
@@ -359,6 +411,60 @@ export class Runner {
               });
           }
         }
+        // T6-L0 两阶段自动回复（仅当组合根注入了 L0Slot）。
+        // 阶段 1 生成一次 pending；阶段 2 到期后派发同一条，绝不重新调 AI。
+        if(this.l0&&this.archive&&this.confirmedConversationId&&this.trustedIdentity&&
+           this.platformOnline&&!this.stopping&&!this.faulted&&this.s.phase==='running'&&
+           !this.reconciliationRunning&&!this.reconciliationRequested&&!this.l0Running){
+          const slot=this.l0,archive=this.archive,thread=this.confirmedConversationId;
+          const own=this.trustedIdentity.ownUids.at(-1)!;
+          const deps:AutoReplyDeps={
+            archive,backend:slot.backend,
+            identity:{ownerUid:this.config.selfUid,ownImUid:own,targetUid:this.config.targetUid,
+              conversationId:thread},
+            // 每轮重新取实例快照与出口：断线/暂停后旧引用必须失效
+            live:slot.getLive(thread) as AutoReplyDeps['live'],
+            getOutlet:()=>slot.getOutlet(thread),
+            now:()=>Date.now(),
+            timeoutMs:slot.timeoutMs,maxBatchEvents:slot.maxBatchEvents,
+            bodyRetentionMs:slot.bodyRetentionMs,policy:slot.policy,
+            coverageMaxAgeMs:this.coverageMaxAgeMs,
+            // 每次 await 之后都必须重新确认：AI 生成不等于必须发送
+            stillAuthorized:()=>!this.stopping&&!this.faulted&&this.s.phase==='running'&&
+              this.platformOnline&&this.s.phase==='running',
+          };
+          const work=(async()=>{
+            // 阶段 2 优先：已有一条待派发意图时，先看是否到期
+            if(this.pendingIntentId){
+              const due=await dispatchPendingOnce(deps,this.pendingIntentId);
+              if(due.kind==='not_due'){this.l0NextCheck=Date.now()+Math.min(slot.quietPeriodMs||500,2000);return;}
+              // 已结算（sent/failed/unknown）或不再 pending：清除待派发标记
+              if(due.kind!=='unauthorized')this.pendingIntentId=undefined;
+              if(due.kind==='unauthorized'){this.l0NextCheck=Date.now()+1000;return;}
+              this.l0NextCheck=Date.now()+1000;return;
+            }
+            // 阶段 1：满足静默期与决策次数上限才发起决策
+            if(this.l0Decisions>=slot.maxDecisions)return;
+            if(Date.now()<this.l0NextCheck)return;
+            if(Date.now()-this.lastInboundAt<slot.quietPeriodMs)return;
+            const available=archive.coverageEpoch(thread,this.coverageMaxAgeMs);
+            if(!available){this.l0NextCheck=Date.now()+1000;return;}
+            this.l0NextCheck=Date.now()+Math.max(500,slot.quietPeriodMs);
+            const decision=await decideOnce(deps);
+            if(decision.kind==='decided_pending'){
+              this.l0Decisions++;
+              this.pendingIntentId=decision.intentId;
+              this.wake?.();
+            }else if(decision.kind==='decided_no_intent'||decision.kind==='no_pending_event'){
+              this.l0Decisions++;
+            }else if(decision.kind==='blocked'&&
+              ['audit_persist_failed','ledger_unavailable'].includes(decision.reasonCode)){
+              void this.block('paused_env','l0_decision_ledger_failed');
+            }
+          })().catch(()=>{void this.block('paused_env','l0_runtime_failed');})
+            .finally(()=>{this.l0Running=undefined;this.wake?.();});
+          this.l0Running=work;
+        }
         // An async Agent failure can set faulted while this iteration is
         // finishing. Never overwrite its paused_env state with a running pulse.
         if(this.stopping||this.faulted)break;
@@ -384,6 +490,7 @@ export class Runner {
       await this.reconciliationRunning?.catch(()=>undefined);
       this.aiAbort?.abort();
       await this.aiRunning?.catch(()=>undefined);
+      await this.l0Running?.catch(()=>undefined);
       await this.q.stop();
       if(this.reconcileEnabled&&this.archive){
         try{this.archive.invalidateCurrentCoverage();}catch{closeFail=true;}

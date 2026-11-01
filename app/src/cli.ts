@@ -10,6 +10,8 @@ import type {ControlRequest,Action} from './runtime/runner.ts';
 import type {PlatformPort} from './platform/types.ts';
 import {MockPlatformPort} from './platform/mock.ts';
 import {DouyinReadOnlyPort} from './platform/douyin.ts';
+import {COVERAGE_MAX_AGE_MS,type L0Slot} from './runtime/runner.ts';
+import {createClaudeBackend} from './ai/agent-registry.ts';
 
 const args=process.argv.slice(2);
 const cmd=args[0]??'help';
@@ -98,7 +100,32 @@ async function main():Promise<number> {
       allowLocalVerification:config.allowLocalVerification,
       notifyQrPath:path=>console.log('本机扫码文件：'+path),
     });
-    return new Runner(stateDir,port,config,mock?undefined:join(dataDir,'eve.sqlite'),args.includes('--experimental-reconcile'),mock?0:850).run();
+    // T6-L0：只有配置显式启用 autoReply 且给出后端时才注入 L0 槽。
+    // 默认（缺失 / enabled:false）不注入 —— Runner 既不决策也不发送。
+    let l0: L0Slot|undefined;
+    if(config.autoReply.enabled){
+      if(mock){
+        console.error('autoReply 需要真实平台端口；--mock 下不启用');
+        return 2;
+      }
+      const name=process.env['EVE_L0_BACKEND'];
+      if(!name){console.error('autoReply.enabled=true 但未指定 EVE_L0_BACKEND；拒绝启动');return 2;}
+      const backend=name==='claude_code'?createClaudeBackend():null;
+      if(!backend){console.error('未知的 EVE_L0_BACKEND：'+name);return 2;}
+      l0={
+        backend,
+        getOutlet:(conv)=>port.createTrustedSendPort?.(conv)??null,
+        getLive:(conv)=>port.liveRefs?.(conv)??null,
+        timeoutMs:config.autoReply.timeoutMs,
+        maxBatchEvents:config.autoReply.maxBatchEvents,
+        bodyRetentionMs:config.autoReply.bodyRetentionMs,
+        policy:config.autoReply.policy,
+        quietPeriodMs:config.autoReply.quietPeriodMs,
+        maxDecisions:5,
+      };
+    }
+    return new Runner(stateDir,port,config,mock?undefined:join(dataDir,'eve.sqlite'),
+      args.includes('--experimental-reconcile'),mock?0:850,COVERAGE_MAX_AGE_MS,undefined,l0).run();
   }
   console.log('dac: doctor [--json], status [--json], run [--mock] [--experimental-reconcile], pause, resume, stop, unblock --reason <说明>');
   return cmd==='help'?0:2;
