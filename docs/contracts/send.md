@@ -694,3 +694,53 @@ dispatchOnce({ trustedPort: port, outlets: mine });  // 自建验证器证明自
 
 - Runner 本身不持有 flock；单实例互斥在 CLI 组合根（`flock --no-fork`）。
 - `maxDecisions` 上限用于防止测试/异常场景无限调用模型。
+
+## 24. T6-L0 补充 Gate：四个启动路径缺口（2026-11-02）
+
+操作者复核 `2d50e0a` 后在正式启动路径发现四处缺口。全部为接线问题，不新增架构。
+
+### 24.1 真实 Port 缺少 `liveRefs()`
+
+`cli.ts` 调用 `port.liveRefs?.(conv)`，但真实 `DouyinReadOnlyPort` 未实现该方法——运行时只能返回 `null`，派发器拿不到实例引用，**真实路径实际不可用**（Fake SDK 测试掩盖了这一点）。
+
+补齐：`liveRefs(conversationId)` 返回 `{client, account, contact}` **真实对象引用**，并同样要求单账号、在线、会话属于白名单、联系人已绑定；未上线/不符时返回 `null`（fail-closed）。
+
+### 24.2 L0 与 T4 对账未联动
+
+`--experimental-reconcile` 决定对账开关，而 Runner 构造要求 L0 必须启用对账。只把 `autoReply.enabled` 设为 true 会在构造阶段失败。
+
+补齐：CLI 在启动阶段先校验，缺 `--experimental-reconcile` 时明确报错并返回码 2，而不是等到 Runner 构造失败。
+
+### 24.3 L0 未执行遗留 AI Claim 恢复
+
+`recoverAbandonedAiClaims()` 原先只在 `if (this.aiDryRun)` 分支。L0 用独立槽位，启动时不会经过该路径。
+
+补齐：条件改为 `if (this.aiDryRun || this.l0)`——两者共用同一 T5 claim 账本。
+
+### 24.4 重启后的 pending 意图没有恢复路径
+
+`pendingIntentId` 只存在于内存。启动时虽调用 `recoverInterruptedSends()`，但没有从数据库重新接管的逻辑；且派发返回 `rejected` 后清掉内存标记，数据库里可能永久遗留一条 pending。
+
+补齐三件事：
+
+1. **重启扫描**：`listPendingSendIntents(conversationId)` 按创建时间升序取遗留 pending，接管第一条。
+2. **拒绝分类**（`dispatchPendingOnce`）：
+   - `not_due` → 保留，稍后重试；
+   - `unauthorized`（运行态失效）→ 保留，等恢复；
+   - **证明/身份已失效**（`proof_changed`、`contact_unverified`、`content_digest_mismatch` 等）→ `terminateSendIntent(..., 'coverage_lost')` **安全终结**，绝不绕过证明强行发送；
+   - 正文过期 → `terminateSendIntent(..., 'content_expired')`。
+3. **不留永久 pending**：任何终态路径都必须让意图落到 `sent/failed/unknown`。
+
+### 24.5 端到端证据
+
+新增 4 条测试，其中两条用**真实 `DouyinReadOnlyPort` + 注入 FakeClient**（非 MockPlatformPort、非自行拼装的 SDK 引用）：
+
+- Runner → `liveRefs` → `createTrustedSendPort` → 真实 `contact.sendMsg`
+- 真实 Port `stop()` 后 `liveRefs` 与出口都失效
+- 重启接管：遗留 pending 因 Proof 换代被安全终结为 `failed`，**不重新调用 AI、不发送旧正文、不留永久 pending**
+- 正文过期：遗留 pending 终结为 `failed`，不发送
+
+### 24.6 仍未关闭
+
+- **真实平台 L0**：`autoReply.enabled` 正式配置仍为 false。
+- 长期稳定性（T9）、多会话准入、`defer` 的「稍后重新判断」语义。

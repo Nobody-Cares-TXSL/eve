@@ -389,3 +389,13 @@
 - [x] AC-L0RT.9 `runner.ts` 与 `auto-reply.ts` 不 import `douyin-im`、不直接调用 `sendMsg`。
 - [ ] AC-L0RT.10 真实平台 L0 未启用：`autoReply.enabled` 在正式配置中仍为 false，真实发送 0 次。
 - [ ] AC-L0RT.11 长期运行下的限流退避、费用观测与 7×24 稳定性未验收（T9）。
+
+### AC-T6.L0Gaps · 启动路径四处缺口（2026-11-02）
+
+- [x] AC-L0Gap.1 真实 `DouyinReadOnlyPort` 实现 `liveRefs()`，返回真实 `client/account/contact` 引用；未上线/不符时 `null`。
+- [x] AC-L0Gap.2 CLI 在 `autoReply.enabled=true` 且缺 `--experimental-reconcile` 时启动阶段报错（码 2），不等 Runner 构造失败。
+- [x] AC-L0Gap.3 L0 启动时执行 `recoverAbandonedAiClaims()`（与 dry-run 共用账本）。
+- [x] AC-L0Gap.4 重启时从数据库接管遗留 pending；`not_due`/`unauthorized` 保留，证明失效与正文过期**安全终结**，不留永久 pending。
+- [x] AC-L0Gap.5 真实适配器端到端：注入 FakeClient 到真实 Port，Runner → liveRefs → 出口 → `contact.sendMsg` 一次成功。
+- [x] AC-L0Gap.6 真实 Port `stop()` 后 `liveRefs` 与出口均失效。
+- [ ] AC-L0Gap.7 真实平台 L0 启用：正式配置仍 false，需操作者单独授权。

@@ -1474,3 +1474,49 @@ Runner 的 AI 槽仍是 test-only，CLI 对 `--experimental-ai-dry-run` 直接�
 - **`defer` 语义**：当前 `defer` 只记录「不生成意图」，并不真正安排稍后重新判断——不伪装成已实现，属后续调度阶段。
 
 **判定：L0 Runtime 离线闭环通过；真实发送仍未授权。**
+
+### T6-L0 补充 Gate：四个启动路径缺口（2026-11-02）
+
+操作者复核 `2d50e0a` 后指出四处缺口。全部为接线问题，未新增架构。
+
+| # | 缺口 | 修复 |
+|---|---|---|
+| 1 | 真实 Port 缺 `liveRefs()` | 补齐方法，返回真实 `client/account/contact` 引用，fail-closed |
+| 2 | L0 与 T4 对账未联动 | CLI 启动阶段校验，缺 `--experimental-reconcile` 报错码 2 |
+| 3 | L0 未执行遗留 AI Claim 恢复 | 条件改为 `aiDryRun \|\| l0` |
+| 4 | 重启后 pending 无恢复路径 | 新增 `listPendingSendIntents` 接管 + 拒绝分类 + 安全终结 |
+
+#### 缺口 4 的细节（最值得注意）
+
+`pendingIntentId` 只存在于内存；派发返回 `rejected` 后清掉内存标记，数据库可能永久遗留 pending。
+
+修复后分类：
+
+| 结果 | 处理 |
+|---|---|
+| `not_due` | 保留，稍后重试 |
+| `unauthorized`（运行态失效） | 保留，等恢复 |
+| **证明/身份已失效** | `terminateSendIntent('coverage_lost')` **安全终结** |
+| 正文过期 | `terminateSendIntent('content_expired')` |
+
+关键判断：**重启后 Coverage 会换成新 epoch，遗留意图绑定的是旧 epoch**。测试中观察到 `proof_changed`——这是**正确的安全行为**，旧意图必须终结而非绕过证明发送。我最初把测试预期写成「成功派发」，是错的，已改为断言「安全终结」。
+
+#### 新增测试（4 条）
+
+其中两条用**真实 `DouyinReadOnlyPort` + 注入 FakeClient**（非 MockPlatformPort、非拼装引用）：
+
+- Runner → `liveRefs` → `createTrustedSendPort` → 真实 `contact.sendMsg` 一次成功
+- 真实 Port `stop()` 后 `liveRefs` 与出口都失效
+- 重启接管：Proof 换代 → 终结为 `failed`，不重调 AI、不发旧正文、不留永久 pending
+- 正文过期 → 终结为 `failed`，不发送
+
+#### 验证
+
+`pnpm typecheck` 0 错；`pnpm test` **386/386**，连续 3 轮全绿。正式库 v6 未改动、`send_intents=0`；真实 `sendMsg` 调用 0 次。
+
+#### 仍未关闭
+
+- 真实平台 L0：正式配置 `autoReply.enabled=false`
+- 长期稳定性（T9）、多会话准入、`defer` 的稍后重判语义
+
+**判定：四个启动路径缺口已补；真实 L0 仍需操作者单独授权。**
